@@ -1,0 +1,6 @@
+# 构建产物与自检输出
+app/build/
+app/preview/
+# dmg 安装包（app/package-dmg.sh 的输出）
+dist/
+.DS_Store

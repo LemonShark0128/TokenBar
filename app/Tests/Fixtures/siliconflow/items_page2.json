@@ -1,0 +1,34 @@
+{
+  "code": 20000,
+  "message": "OK",
+  "data": {
+    "list": [
+      {
+        "id": "test-bill-0003",
+        "objectName": "{\"zh-CN\": \"test-model-a.输入\", \"en-US\": \"test-model-a.input\"}",
+        "productName": "{\"zh-CN\": \"测试产品\", \"en-US\": \"Test product\"}",
+        "objectUnit": "{\"zh-CN\": \"千 Tokens\", \"en-US\": \"K Tokens\"}",
+        "grossUsage": "200000",
+        "unitPrice": "0.01",
+        "netAmount": "2.00",
+        "incurredAt": 1791957600000
+      },
+      {
+        "id": "test-bill-0004",
+        "objectName": "test-model-b.输出",
+        "productName": "{\"zh-CN\": \"测试产品\", \"en-US\": \"Test product\"}",
+        "objectUnit": "{\"zh-CN\": \"千 Tokens\", \"en-US\": \"K Tokens\"}",
+        "grossUsage": "150000",
+        "unitPrice": "0.01",
+        "netAmount": "1.50",
+        "incurredAt": 1791612000000
+      }
+    ],
+    "pagination": {
+      "current": 2,
+      "pageSize": 2,
+      "pages": 2,
+      "total": 4
+    }
+  }
+}

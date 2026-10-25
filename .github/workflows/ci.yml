@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    # macOS 26 镜像带完整 Xcode 26（Swift 6.2+）；这个标签不可用时改成 macos-latest
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # app/sdk.sh 的顺序是 SDKROOT → 作者本机的 CommandLineTools 26.5 → xcrun。
+      # 这里显式用当前 Xcode 的 SDK，免得镜像里恰好有 CLT 26.5 SDK 却和 Xcode 的编译器不匹配。
+      - name: 选 SDK
+        run: |
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          xcode-select -p
+          /usr/bin/swiftc --version
+
+      - name: 测试
+        run: bash app/test.sh
+
+      # --no-install 只编到 app/build/，不碰 ~/Applications；--universal 同时编 arm64 和 x86_64
+      - name: 编译通用版
+        run: bash app/build.sh --no-install --universal

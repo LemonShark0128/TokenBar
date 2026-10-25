@@ -1,0 +1,15 @@
+{
+  "code": 20000,
+  "data": {
+    "financialInfo": {
+      "balance": "9981520000000",
+      "available": "9981520000000",
+      "recharged": "10000000000000",
+      "used": "18480000000",
+      "lineOfCredit": "0",
+      "remainingCreditLine": "0",
+      "cumulativeInvoiced": "0",
+      "availableInvoice": "18480000000"
+    }
+  }
+}

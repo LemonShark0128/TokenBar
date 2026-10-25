@@ -1,0 +1,56 @@
+{
+ "code": 0,
+ "data": {
+  "biz_code": 0,
+  "biz_data": {
+   "series": [
+    {
+     "model": "deepseek-flash",
+     "buckets": [
+      {
+       "time": 1791993600,
+       "usage": {
+        "REQUEST": "138",
+        "PROMPT_CACHE_HIT_TOKEN": "27591488",
+        "PROMPT_CACHE_MISS_TOKEN": "349213",
+        "RESPONSE_TOKEN": "103208"
+       }
+      },
+      {
+       "time": 1791997200,
+       "usage": {
+        "REQUEST": "138",
+        "PROMPT_CACHE_HIT_TOKEN": "27591488",
+        "PROMPT_CACHE_MISS_TOKEN": "349212",
+        "RESPONSE_TOKEN": "103208"
+       }
+      }
+     ]
+    },
+    {
+     "model": "deepseek-v4-pro",
+     "buckets": [
+      {
+       "time": 1791993600,
+       "usage": {
+        "REQUEST": "17",
+        "PROMPT_CACHE_HIT_TOKEN": "3250000",
+        "PROMPT_CACHE_MISS_TOKEN": "300000",
+        "RESPONSE_TOKEN": "51496"
+       }
+      },
+      {
+       "time": 1791997200,
+       "usage": {
+        "REQUEST": "17",
+        "PROMPT_CACHE_HIT_TOKEN": "3250000",
+        "PROMPT_CACHE_MISS_TOKEN": "300000",
+        "RESPONSE_TOKEN": "51495"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

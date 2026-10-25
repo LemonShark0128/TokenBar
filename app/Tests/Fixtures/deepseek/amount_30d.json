@@ -1,0 +1,285 @@
+{
+ "code": 0,
+ "data": {
+  "biz_code": 0,
+  "biz_data": {
+   "series": [
+    {
+     "model": "deepseek-flash",
+     "buckets": [
+      {
+       "time": 1789488000,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1789574400,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1789660800,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1789747200,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1789833600,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1789920000,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790006400,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790092800,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790179200,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790265600,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790352000,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790438400,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790524800,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790611200,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790697600,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790784000,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790870400,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1790956800,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791043200,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791129600,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791216000,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791302400,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791388800,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791475200,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791561600,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791648000,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791734400,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791820800,
+       "usage": {
+        "REQUEST": "0",
+        "PROMPT_CACHE_HIT_TOKEN": "0",
+        "PROMPT_CACHE_MISS_TOKEN": "0",
+        "RESPONSE_TOKEN": "0"
+       }
+      },
+      {
+       "time": 1791907200,
+       "usage": {
+        "REQUEST": "900",
+        "PROMPT_CACHE_HIT_TOKEN": "384801407",
+        "PROMPT_CACHE_MISS_TOKEN": "6513656",
+        "RESPONSE_TOKEN": "3352475"
+       }
+      },
+      {
+       "time": 1791993600,
+       "usage": {
+        "REQUEST": "310",
+        "PROMPT_CACHE_HIT_TOKEN": "61682976",
+        "PROMPT_CACHE_MISS_TOKEN": "1298425",
+        "RESPONSE_TOKEN": "309407"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

@@ -1,0 +1,10 @@
+{
+  "code": 20000,
+  "data": {
+    "netAmount": "0.02",
+    "reduceAmount": "0.00",
+    "deductUsage": "0.00",
+    "redeemAmount": "0.00",
+    "grossAmount": "0.02"
+  }
+}

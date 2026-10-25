@@ -1,0 +1,9 @@
+{
+  "code": 20000,
+  "message": "OK",
+  "data": {
+    "financialInfo": {
+      "balance": "27070000000000"
+    }
+  }
+}

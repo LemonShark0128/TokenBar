@@ -1,0 +1,37 @@
+{
+  "code": 20000,
+  "data": {
+    "list": [
+      {
+        "billingId": "test-billing-0001",
+        "tags": [
+          100,
+          1315,
+          564,
+          99,
+          1316
+        ],
+        "objectId": 27244,
+        "objectName": "qwen/qwen3-asr-1.7b.online.input-audio-seconds",
+        "objectUnit": "{\"zh-CN\":\"秒\",\"en-US\":\"Second(s)\"}",
+        "unitPrice": "0.000220000000",
+        "grossUsage": "84.000000000000",
+        "deductUsage": "0.000000000000",
+        "netUsage": "84.000000000000",
+        "reduceAmount": "0.000000000000",
+        "deductAmount": "0.000000000000",
+        "netAmount": "0.018480000000",
+        "grossAmount": "0.018480000000",
+        "incurredAt": 1792043700000,
+        "createdAt": 1792043771000,
+        "uId": "uid-test-0001",
+        "productName": "{\"zh-CN\":\"语音模型 · 在线推理\",\"en-US\":\"Online service for speech models\"}"
+      }
+    ],
+    "pagination": {
+      "current": 1,
+      "pageSize": 100,
+      "total": 1
+    }
+  }
+}

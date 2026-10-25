@@ -1,0 +1,51 @@
+{
+ "code": 0,
+ "data": {
+  "biz_code": 0,
+  "biz_data": {
+   "data": [
+    {
+     "currency": "CNY",
+     "series": [
+      {
+       "model": "deepseek-flash",
+       "buckets": [
+        {
+         "time": 1791993600,
+         "cost": "1.50"
+        },
+        {
+         "time": 1791997200,
+         "cost": "1.18"
+        }
+       ]
+      },
+      {
+       "model": "deepseek-v4-pro",
+       "buckets": [
+        {
+         "time": 1791993600,
+         "cost": "3.59"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "currency": "USD",
+     "series": [
+      {
+       "model": "deepseek-flash",
+       "buckets": [
+        {
+         "time": 1791993600,
+         "cost": "9.99"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ }
+}
