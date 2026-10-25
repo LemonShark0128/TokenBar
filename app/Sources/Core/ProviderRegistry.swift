@@ -14,7 +14,8 @@ enum ProviderRegistry {
             let installer = ClaudeStatusLineInstaller.standard
             return ClaudePlanProvider(quotaFile: installer.quotaFileURL, desktopFile: ClaudeAppUsageSource.standardURL,
                                       source: { ClaudePlanSource.load(.standard, hookInstalled: { ClaudeStatusLineInstaller.standard.state() == .installed }) },
-                                      cli: { await ClaudeCLIUsage.standard(now: $0, log: log) })
+                                      cli: { await ClaudeCLIUsage.standard(now: $0, log: log) },
+                                      desktopInstalled: { ClaudeAppUsageSource.isInstalled() })
         }
     }
 

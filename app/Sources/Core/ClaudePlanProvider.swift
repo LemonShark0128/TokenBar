@@ -52,7 +52,7 @@ struct ClaudePlanProvider: UsageProvider {
     init(quotaFile: URL, desktopFile: URL = ClaudeAppUsageSource.standardURL,
          source: @escaping @Sendable () -> ClaudePlanSource = { .terminal },
          cli: @escaping @Sendable (Date) async throws -> ClaudeCLIUsage.Outcome = { _ in .notInstalled },
-         desktopInstalled: @escaping @Sendable () -> Bool = { ClaudeAppUsageSource.isInstalled() },
+         desktopInstalled: @escaping @Sendable () -> Bool = { true },   // 测试默认当作装了，不看本机；真 App 由 ProviderRegistry 传实际检查
          retryDelays: [TimeInterval] = [5, 25],
          sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }) {
         self.quotaFile = quotaFile
