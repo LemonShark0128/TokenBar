@@ -77,7 +77,7 @@ final class AppLogger: @unchecked Sendable {
 
 /// 写操作失败留痕（采样库、快照、钥匙串等）：记一行「写入失败（什么）：原因」。
 /// 同一处连续失败、原因不变只记第一次（每次刷新都写，免得刷屏）；成功一次后再失败会重新记。不改变调用方的行为
-/// @unchecked Sendable：last 只在 lock 里读写，sink 是 @Sendable
+/// @unchecked Sendable：last 和 failures 只在 lock 里读写，sink 是 @Sendable
 final class WriteFailureLog: @unchecked Sendable {
     /// 写进 app.log；测试启动时换成不落盘的（免得故意制造的失败写进真实日志）。
     /// nonisolated(unsafe)：只在测试启动、还没有任何后台任务时换一次，之后只读
@@ -86,10 +86,11 @@ final class WriteFailureLog: @unchecked Sendable {
     private let sink: @Sendable (String) -> Void
     private let lock = NSLock()
     private var last: [String: String] = [:]
+    private var failures: [String: (at: Date, line: String)] = [:]
 
     init(sink: @escaping @Sendable (String) -> Void) { self.sink = sink }
 
-    func failed(_ what: String, _ error: Error) {
+    func failed(_ what: String, _ error: Error, now: Date = Date()) {
         // 系统文件错误用本地化说明（含文件名和原因）；自己的错误类型用 description
         let ns = error as NSError
         let reason = [NSCocoaErrorDomain, NSPOSIXErrorDomain].contains(ns.domain) ? ns.localizedDescription : "\(error)"
@@ -97,8 +98,18 @@ final class WriteFailureLog: @unchecked Sendable {
         lock.lock()
         let fresh = last[what] != line
         last[what] = line
+        failures[what] = (at: now, line: line)
+        if failures.count > 20, let oldest = failures.min(by: { $0.value.at < $1.value.at })?.key {
+            failures[oldest] = nil
+        }
         lock.unlock()
         if fresh { sink(line) }
+    }
+
+    /// 本次运行各处最近一次失败；成功和日志去重都不清除此记录。
+    func recent() -> [(at: Date, line: String)] {
+        lock.lock(); defer { lock.unlock() }
+        return failures.values.sorted { $0.at < $1.at }
     }
 
     func succeeded(_ what: String) {

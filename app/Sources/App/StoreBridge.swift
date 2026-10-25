@@ -120,13 +120,13 @@ extension UsageModel {
             retuneRunningTimer()
             return
         }
-        let home = URL(fileURLWithPath: NSHomeDirectory())
+        let dirs = AgentDirs.current
         let cache = runningCache
         let probe = desktopProbe
         Task { @MainActor [weak self] in
             let (r, activity) = await Task.detached(priority: .utility) { () -> ([RunningTask], [ProviderID: Date]) in
-                let s = RunningTasks.scanDetailed(enabled: enabled, claudeDir: home.appendingPathComponent(".claude"),
-                                                  codexSessions: home.appendingPathComponent(".codex/sessions"), now: Date(), cache: cache)
+                let s = RunningTasks.scanDetailed(enabled: enabled, claudeDir: dirs.claudeConfig,
+                                                  codexSessions: dirs.codexSessions, now: Date(), cache: cache)
                 // 刷新频率用的「有没有在用」：会话日志最近修改 + 在跑的任务 + 桌面 App 记到的额度变化
                 var activity = s.lastChange
                 for t in s.tasks { activity[t.provider] = max(activity[t.provider] ?? t.lastActivity, t.lastActivity) }
@@ -176,13 +176,13 @@ extension UsageModel {
         if enabled.isEmpty { localCache.clear(.claude); localCache.clear(.codex) }
         let now = Date()
         guard let gen = localThrottle.begin(enabled: enabled, now: now) else { return }
-        let home = URL(fileURLWithPath: NSHomeDirectory())
+        let dirs = AgentDirs.current
         let tz = TimeZone.autoupdatingCurrent
         let cache = localCache
         Task { @MainActor [weak self] in
             let r = await Task.detached(priority: .utility) {
-                LocalAgentUsage.read(enabled: enabled, claudeDir: home.appendingPathComponent(".claude"),
-                                     codexSessions: home.appendingPathComponent(".codex/sessions"), now: now, timeZone: tz, cache: cache)
+                LocalAgentUsage.read(enabled: enabled, claudeDir: dirs.claudeConfig,
+                                     codexSessions: dirs.codexSessions, now: now, timeZone: tz, cache: cache)
             }.value
             guard let self, self.localThrottle.finish(gen) else { return }   // 晚结束的旧读取丢掉
             let changed = r != self.localUsage

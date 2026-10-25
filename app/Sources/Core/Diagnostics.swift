@@ -50,12 +50,18 @@ enum Diagnostics {
         return Array(reports.sorted { $0.date > $1.date }.prefix(limit))
     }
 
-    static func report(appVersion: String, osVersion: String, now: Date, timeZone: TimeZone,
-                       platforms: [PlatformState], logLines: [String], crashReports: [CrashReport] = []) -> String {
+    static func dateFormatter(timeZone: TimeZone) -> DateFormatter {
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.timeZone = timeZone
         fmt.dateFormat = "yyyy-MM-dd HH:mm:ss ZZZZZ"
+        return fmt
+    }
+
+    static func report(appVersion: String, osVersion: String, now: Date, timeZone: TimeZone,
+                       platforms: [PlatformState], logLines: [String], crashReports: [CrashReport] = [],
+                       writeFailures: [String] = []) -> String {
+        let fmt = dateFormatter(timeZone: timeZone)
         func t(_ d: Date?) -> String { d.map { fmt.string(from: $0) } ?? "—" }
 
         var lines = ["\(AppName.display) 诊断信息",
@@ -82,6 +88,10 @@ enum Diagnostics {
         } else {
             lines.append("最近崩溃报告（\(crashReports.count) 份）：")
             lines.append(contentsOf: crashReports.map { "- \($0.name)（\(t($0.date))）" })
+        }
+        if !writeFailures.isEmpty {
+            lines.append("本次运行的写入失败（\(writeFailures.count) 处）：")
+            lines.append(contentsOf: writeFailures.map { redact($0) })
         }
         let recent = logLines.suffix(50)
         lines.append("最近 \(recent.count) 行日志：")

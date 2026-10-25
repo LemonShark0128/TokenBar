@@ -6,6 +6,7 @@ func registerAllTests() {
     WriteFailureLog.shared = WriteFailureLog(sink: { _ in })
     registerPanelReminderTests()
     registerColorRotateLogTests()
+    registerV101NewUserTests()
     registerSmokeTests()
     registerL10nTests()
     registerModelTests()

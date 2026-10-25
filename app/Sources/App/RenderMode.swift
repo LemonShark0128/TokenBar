@@ -89,6 +89,14 @@ enum RenderMode {
             renderSettings(model, page: .alerts, input: agent, name: "settings-alerts-agent-\(tag)", p: p, bg: bg, dir: dir)
             renderSettings(model, page: .general, input: settingsInput, name: "settings-general-\(tag)", p: p, bg: bg, dir: dir)
             if !dark {
+                var customDirectory = settingsInput
+                customDirectory.customDirs[.codex] = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Codex Data").path
+                renderSettings(model, page: .platform, input: customDirectory, name: "settings-platform-custom-codex", p: p, bg: bg, dir: dir)
+                let savedLang = L10n.lang
+                L10n.lang = .zh
+                renderFit(WebLoadErrorBar(text: WebLoadFailure.message(domain: NSURLErrorDomain, code: -1001, host: nil), onRetry: {}),
+                          name: "weblogin-error-zh", width: 480, bg: bg, dir: dir)
+                L10n.lang = savedLang
                 // 4 个平台都添加：平台行和菜单栏平台下拉（固定到最长的「Claude 套餐」）都要放得下
                 var four = settingsInput
                 var claude = quotaMainState(now: sampleSnapshot().fetchedAt)

@@ -78,6 +78,46 @@ func registerLogsPolishTests() {
 
     // MARK: B 写操作失败留痕
 
+    test("writeFailureRecentKeepsLatestEvenWhenDeduplicatedOrSucceeded") {
+        let lines = Lines()
+        let log = lines.log()
+        try check(log.recent().isEmpty, "新运行没有失败")
+        log.failed("快照", Boom(description: "只读"), now: now)
+        log.failed("快照", Boom(description: "只读"), now: now.addingTimeInterval(60))
+        try checkEqual(lines.all.count, 1)
+        try checkEqual(log.recent().map(\.at), [now.addingTimeInterval(60)])
+        log.failed("快照", Boom(description: "磁盘满"), now: now.addingTimeInterval(120))
+        log.succeeded("快照")
+        try checkEqual(log.recent().map(\.at), [now.addingTimeInterval(120)])
+        try checkEqual(log.recent().map(\.line), ["写入失败（快照）：磁盘满"])
+    }
+    test("writeFailureRecentSortsByTimeAndEvictsOldestOfTwentyPlaces") {
+        let log = WriteFailureLog(sink: { _ in })
+        for i in (0..<20).reversed() {
+            log.failed("位置\(i)", Boom(description: "只读"), now: now.addingTimeInterval(Double(i)))
+        }
+        log.failed("位置0", Boom(description: "只读"), now: now.addingTimeInterval(30))
+        log.failed("新增", Boom(description: "只读"), now: now.addingTimeInterval(20))
+        let recent = log.recent()
+        try checkEqual(recent.count, 20)
+        try checkEqual(recent.map(\.at), (2...20).map { now.addingTimeInterval(Double($0)) } + [now.addingTimeInterval(30)])
+        try checkEqual(recent.first?.line, "写入失败（位置2）：只读")
+        try checkEqual(recent.last?.line, "写入失败（位置0）：只读")
+    }
+    test("reportListsAndRedactsWriteFailuresBeforeRecentLogs") {
+        let failures = ["[2026-10-15 08:00:00 +08:00] 写入失败（快照）：sk-fake-secret-123",
+                        "[2026-10-15 08:01:00 +08:00] 写入失败（采样库）：只读"]
+        let r = Diagnostics.report(appVersion: "1", osVersion: "26", now: now, timeZone: tz,
+                                   platforms: [], logLines: (1...60).map { "日志\($0)" }, writeFailures: failures)
+        let section = "本次运行的写入失败（2 处）：\n[2026-10-15 08:00:00 +08:00] 写入失败（快照）：sk-***\n[2026-10-15 08:01:00 +08:00] 写入失败（采样库）：只读\n最近 50 行日志：\n日志11\n"
+        try check(r.contains(section), r)
+        try check(!r.contains("sk-fake-secret-123"), "写入失败必须打码")
+        let none = Diagnostics.report(appVersion: "1", osVersion: "26", now: now, timeZone: tz,
+                                      platforms: [], logLines: [])
+        try check(!none.contains("本次运行的写入失败"), none)
+        try check(none.contains("最近 0 行日志："), none)
+    }
+
     test("writeFailureLogOncePerStreak") {
         let lines = Lines()
         let log = lines.log()

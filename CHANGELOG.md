@@ -2,6 +2,18 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.1] - 2026-10-25
+
+### 新增
+
+- **自定义数据目录**：设置 → 平台里 Codex 套餐、Claude 套餐的「…」菜单加了「数据目录…」，用 `CODEX_HOME` / `CLAUDE_CONFIG_DIR` 把数据放在别处的也能用；选错文件夹会提示，可随时恢复默认。没在设置里选时也认这两个环境变量。
+- **复制诊断信息**单独列出本次运行里写入失败过的地方（采样库、快照、钥匙串、开机自启、Claude 状态栏设置等），不会被最近日志挤掉。
+
+### 改进
+
+- 网页登录窗（DeepSeek 控制台、硅基流动）打不开时，顶部写明原因（没有网络 / 连接超时 / 连不上 / 安全连接失败）并给「重试」按钮，不再只是一片空白。
+- Claude 套餐选「桌面 App」来源时，本机既没有 Claude 桌面 App 也没有 Claude Code 命令行，直接说两样都没找到，而不是让你等桌面 App 记录。
+
 ## [1.0.0] - 2026-10-24
 
 第一个公开版本。
@@ -29,6 +41,6 @@
 ### 已知限制
 
 - 没有 Apple 开发者签名和公证：第一次打开要在「系统设置 → 隐私与安全性」点「仍要打开」；每次升级后钥匙串会再问一次授权。
-- 不支持自定义 Claude / Codex 数据目录（如 `CODEX_HOME`）。
 
+[1.0.1]: https://github.com/LemonShark0128/TokenBar/releases/tag/v1.0.1
 [1.0.0]: https://github.com/LemonShark0128/TokenBar/releases/tag/v1.0.0

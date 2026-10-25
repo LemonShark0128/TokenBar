@@ -256,11 +256,14 @@ extension UsageModel {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = "\(info["CFBundleShortVersionString"] as? String ?? "—") (\(info["CFBundleVersion"] as? String ?? "—"))"
         AppLogger.shared.flush()        // 后台队列里还没写的几行也要带上
+        let timeZone = TimeZone.autoupdatingCurrent
+        let fmt = Diagnostics.dateFormatter(timeZone: timeZone)
+        let writeFailures = WriteFailureLog.shared.recent().map { "[\(fmt.string(from: $0.at))] \($0.line)" }
         let text = Diagnostics.report(appVersion: version,
                                       osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
-                                      now: Date(), timeZone: .autoupdatingCurrent,
+                                      now: Date(), timeZone: timeZone,
                                       platforms: usageStore?.platforms ?? [], logLines: kLogFile.tail(50),
-                                      crashReports: Diagnostics.crashReports())
+                                      crashReports: Diagnostics.crashReports(), writeFailures: writeFailures)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         logLine("已复制诊断信息到剪贴板")

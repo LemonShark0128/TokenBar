@@ -9,11 +9,11 @@ enum ProviderRegistry {
         switch id {
         case .deepseek: return DeepSeekProvider(http: http)
         case .siliconflow: return SiliconFlowProvider(http: http)
-        case .codexPlan: return CodexPlanProvider()
+        case .codexPlan: return CodexPlanProvider(root: { AgentDirs.current.codexSessions })
         case .claudePlan:
             let installer = ClaudeStatusLineInstaller.standard
             return ClaudePlanProvider(quotaFile: installer.quotaFileURL, desktopFile: ClaudeAppUsageSource.standardURL,
-                                      source: { ClaudePlanSource.load(.standard, hookInstalled: { installer.state() == .installed }) },
+                                      source: { ClaudePlanSource.load(.standard, hookInstalled: { ClaudeStatusLineInstaller.standard.state() == .installed }) },
                                       cli: { await ClaudeCLIUsage.standard(now: $0, log: log) })
         }
     }

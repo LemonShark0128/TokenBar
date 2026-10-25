@@ -23,10 +23,16 @@ extension SettingsView {
         let snap = c.inp.platforms.first { $0.id == id }?.snapshot
         let reading = AccountReading.from(balance: snap?.balance, quota: snap?.quota, meter: ProviderRegistry.meter(id),
                                           now: model.fixedNow ?? Date())
-        let detail = SettingsLayout.accountDetail(id, state: st, reading: reading, stale: hookGone, claudeSource: model.claudeSource)
+        let kind = agentKind(id)
+        let custom = kind.flatMap { (input?.customDirs ?? AgentDirs.custom(.standard))[$0] }
+        let customPath = custom.map {
+            AgentDirs.displayPath(URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath),
+                                  home: URL(fileURLWithPath: NSHomeDirectory()))
+        }
+        let detail = SettingsLayout.accountDetail(id, state: st, reading: reading, stale: hookGone, claudeSource: model.claudeSource, customDir: customPath)
         let urgent = SettingsLayout.urgentAction(id, state: st, hookGone: hookGone)
         let actions = SettingsLayout.menuActions(id, state: st, isMain: c.main == id,
-                                                 claudeSource: model.claudeSource, hookGone: hookGone)
+                                                 claudeSource: model.claudeSource, hookGone: hookGone, customDir: custom != nil)
         let items: () -> [PopMenu.Item] = {
             actions.map { a in
                 PopMenu.Item(title: a.title, destructive: a.destructive, separatorBefore: a.destructive) { perform(a.kind, id) }
@@ -68,8 +74,47 @@ extension SettingsView {
         case .console, .webRelogin: webRelogin(id)
         case .reinstallHook: model.reinstallClaudeHook()
         case .switchClaudeSource: model.switchClaudeSource()
+        case .dataDir: chooseDataDir(id)
+        case .resetDataDir:
+            guard let kind = agentKind(id) else { return }
+            AgentDirs.setCustom(kind, nil, .standard)
+            refreshDataDir(id)
         case .remove: model.removeAccount(id)
         }
+    }
+
+    private func agentKind(_ id: ProviderID) -> AgentDirKind? {
+        switch id {
+        case .codexPlan: return .codex
+        case .claudePlan: return .claude
+        default: return nil
+        }
+    }
+
+    private func chooseDataDir(_ id: ProviderID) {
+        guard let kind = agentKind(id) else { return }
+        let dirs = AgentDirs.current
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = kind == .codex ? dirs.codexHome : dirs.claudeConfig
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if let reason = AgentDirs.validate(kind, url) {
+            model.reloginNotes[id] = ReloginNote(text: reason, isError: true)
+            return
+        }
+        AgentDirs.setCustom(kind, url, .standard)
+        refreshDataDir(id)
+    }
+
+    private func refreshDataDir(_ id: ProviderID) {
+        model.reloginNotes[id] = nil
+        if id == .claudePlan { model.refreshClaudeHookState() }
+        model.objectWillChange.send()
+        model.reloadRunningTasks()
+        Task { @MainActor in await model.usageStore?.refresh(id) }
     }
 
     /// 网页重新登录：结果（含验证没通过、存钥匙串失败）写在账号行下

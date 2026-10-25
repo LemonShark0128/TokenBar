@@ -124,7 +124,7 @@ extension UsageModel {
                                    .frame(maxWidth: .infinity, alignment: .leading)
                                    .padding(.horizontal, 12).padding(.vertical, 6)
                            }
-                           WebLoginSheet(controller: controller).frame(maxHeight: .infinity)
+                           WebLoginContent(controller: controller).frame(maxHeight: .infinity)
                        }.frame(width: 480, height: 680)))
     }
 
@@ -229,6 +229,7 @@ struct AccountsInput {
     var settings: ProviderSettings
     /// 旧的离屏预览还会设置它；菜单栏不再单独选平台，这个值不再影响任何界面
     var menuBarAuto = true
+    var customDirs: [AgentDirKind: String] = [:]
 }
 
 /// 金额输入框：只接受正数，空 = 清除；停手 0.8 秒后才提交，避免每敲一个字就存一次

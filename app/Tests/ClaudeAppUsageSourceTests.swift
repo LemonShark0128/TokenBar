@@ -313,7 +313,7 @@ func registerClaudeAppUsageSourceTests() {
         let dir = try tmpDir()
         let hook = try writeHookFile(dir)
         let app = dir.appendingPathComponent("plan-usage-history.json")
-        let p = ClaudePlanProvider(quotaFile: hook, desktopFile: app, source: { .desktop })
+        let p = ClaudePlanProvider(quotaFile: hook, desktopFile: app, source: { .desktop }, desktopInstalled: { true })
         // 桌面 App 的文件还没有：不回落到钩子文件
         guard case .success(let s0) = await fetch(p) else { throw TestFailure(description: "应为 success") }
         try checkEqual(s0.quota, nil)
@@ -364,15 +364,15 @@ func registerClaudeAppUsageSourceTests() {
         func titles(_ src: ClaudePlanSource, main: Bool) -> [String] {
             SettingsLayout.accountActions(.claudePlan, state: .ok, isMain: main, claudeSource: src).map(\.title)
         }
-        try checkEqual(titles(.terminal, main: true), ["重装状态栏钩子", "改用 Claude 桌面 App", "移除…"])
-        try checkEqual(titles(.desktop, main: true), ["改用终端版 Claude Code", "移除…"])
-        try checkEqual(titles(.desktop, main: false), ["固定显示它", "改用终端版 Claude Code", "移除…"])
+        try checkEqual(titles(.terminal, main: true), ["重装状态栏钩子", "改用 Claude 桌面 App", "数据目录…", "移除…"])
+        try checkEqual(titles(.desktop, main: true), ["改用终端版 Claude Code", "数据目录…", "移除…"])
+        try checkEqual(titles(.desktop, main: false), ["固定显示它", "改用终端版 Claude Code", "数据目录…", "移除…"])
         let t = SettingsLayout.menuActions(.claudePlan, state: .ok, isMain: false, claudeSource: .terminal, hookGone: true)
-        try checkEqual(t.map(\.title), ["固定显示它", "改用 Claude 桌面 App", "移除…"])
+        try checkEqual(t.map(\.title), ["固定显示它", "改用 Claude 桌面 App", "数据目录…", "移除…"])
         let active = SettingsLayout.menuActions(.claudePlan, state: .ok, isMain: true, claudeSource: .terminal, hookGone: false)
-        try checkEqual(active.map(\.kind), [.reinstallHook, .switchClaudeSource, .remove])
+        try checkEqual(active.map(\.kind), [.reinstallHook, .switchClaudeSource, .dataDir, .remove])
         let d = SettingsLayout.menuActions(.claudePlan, state: .ok, isMain: false, claudeSource: .desktop, hookGone: false)
-        try checkEqual(d.map(\.title), ["固定显示它", "改用终端版 Claude Code", "移除…"])
+        try checkEqual(d.map(\.title), ["固定显示它", "改用终端版 Claude Code", "数据目录…", "移除…"])
     }
 
     test("claudeSourceAccountDetail") {

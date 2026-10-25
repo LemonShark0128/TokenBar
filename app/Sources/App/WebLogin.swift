@@ -7,7 +7,9 @@ import WebKit
 /// 内嵌 WKWebView 登录窗的控制器：每秒轮询一次，取到登录凭证就回调一次。
 /// 日志里只写「已取到登录凭证」，不写任何 token / cookie / subject id 的值
 @MainActor
-final class WebLoginController: NSObject {
+final class WebLoginController: NSObject, ObservableObject, WKNavigationDelegate {
+    @Published var loadError: String?
+    private let initialURL: URL
     enum Capture {
         /// 从页面 localStorage 读一项（DeepSeek 的 userToken）→ ["webToken": …]
         case localStorage(key: String)
@@ -44,9 +46,11 @@ final class WebLoginController: NSObject {
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .nonPersistent()      // 不在 App 里留下网页登录态；需要的只有凭证（进钥匙串）
         webView = WKWebView(frame: .zero, configuration: cfg)
+        self.initialURL = url
         self.capture = capture
         self.onCaptured = onCaptured
         super.init()
+        webView.navigationDelegate = self
         webView.load(URLRequest(url: url))
         // 定时器挂在主 RunLoop 上，但回调被声明成 @Sendable：用 Task { @MainActor } 让编译器检查；
         // 晚一拍执行时 stop() 可能已经停了定时器，那就不再轮询
@@ -54,6 +58,28 @@ final class WebLoginController: NSObject {
             Task { @MainActor in if self?.timer != nil { self?.poll() } }
         }
     }
+
+    func retry() {
+        loadError = nil
+        webView.load(URLRequest(url: initialURL))
+    }
+
+    private func failed(_ error: Error) {
+        let error = error as NSError
+        guard !WebLoadFailure.shouldIgnore(domain: error.domain, code: error.code) else { return }
+        loadError = WebLoadFailure.message(domain: error.domain, code: error.code, host: initialURL.host)
+        logLine("登录页加载失败（错误码 \(error.code)）")
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        failed(error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        failed(error)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { loadError = nil }
 
     func stop() {
         timer?.invalidate()
@@ -127,4 +153,33 @@ struct WebLoginSheet: NSViewRepresentable {
     let controller: WebLoginController
     func makeNSView(context: Context) -> WKWebView { controller.webView }
     func updateNSView(_ v: WKWebView, context: Context) {}
+}
+
+/// 只观察加载状态；错误条和网页一起占用原登录窗的固定高度。
+struct WebLoginContent: View {
+    @ObservedObject var controller: WebLoginController
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let error = controller.loadError {
+                WebLoadErrorBar(text: error, onRetry: controller.retry)
+            }
+            WebLoginSheet(controller: controller).frame(maxHeight: .infinity)
+        }
+    }
+}
+
+struct WebLoadErrorBar: View {
+    let text: String
+    let onRetry: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(text).font(.system(size: 11)).foregroundColor(Accent.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(L("webLoad.retry"), action: onRetry).controlSize(.small).fixedSize()
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+    }
 }

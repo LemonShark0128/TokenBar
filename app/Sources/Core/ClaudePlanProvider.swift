@@ -44,18 +44,22 @@ struct ClaudePlanProvider: UsageProvider {
     /// 桌面来源先问命令行（测试里替换；默认当作没装）
     let cli: @Sendable (Date) async throws -> ClaudeCLIUsage.Outcome
 
+    let desktopInstalled: @Sendable () -> Bool
+
     let retryDelays: [TimeInterval]
     let sleep: @Sendable (TimeInterval) async -> Void
 
     init(quotaFile: URL, desktopFile: URL = ClaudeAppUsageSource.standardURL,
          source: @escaping @Sendable () -> ClaudePlanSource = { .terminal },
          cli: @escaping @Sendable (Date) async throws -> ClaudeCLIUsage.Outcome = { _ in .notInstalled },
+         desktopInstalled: @escaping @Sendable () -> Bool = { ClaudeAppUsageSource.isInstalled() },
          retryDelays: [TimeInterval] = [5, 25],
          sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }) {
         self.quotaFile = quotaFile
         self.desktopFile = desktopFile
         self.source = source
         self.cli = cli
+        self.desktopInstalled = desktopInstalled
         self.retryDelays = retryDelays
         self.sleep = sleep
     }
@@ -124,7 +128,9 @@ struct ClaudePlanProvider: UsageProvider {
             let hint: String? = Self.cliMissingHint
             func note(_ base: String) -> String { [base, hint].compactMap { $0 }.joined(separator: L("common.sentenceSep")) }
             switch ClaudeAppUsageSource.read(desktopFile, now: now) {
-            case .missing, .noRecentData: s.quotaNote = note(Self.desktopWaitingNote)
+            case .missing:
+                s.quotaNote = desktopInstalled() ? note(Self.desktopWaitingNote) : L("claude.nothingInstalled")
+            case .noRecentData: s.quotaNote = note(Self.desktopWaitingNote)
             case .stale(let t): s.quotaNote = note(Self.staleNote(t, now: now, timeZone: timeZone))
             case .quota(var q):
                 q.estimated = true
@@ -190,7 +196,7 @@ extension ClaudeStatusLineInstaller {
     /// 真 App 用的默认路径：~/.claude/settings.json 与 ~/Library/Application Support/TokenBar
     static var standard: ClaudeStatusLineInstaller {
         let home = URL(fileURLWithPath: NSHomeDirectory())
-        return ClaudeStatusLineInstaller(settingsURL: home.appendingPathComponent(".claude/settings.json"),
+        return ClaudeStatusLineInstaller(settingsURL: AgentDirs.current.claudeConfig.appendingPathComponent("settings.json"),
                                          supportDir: home.appendingPathComponent("Library/Application Support/TokenBar", isDirectory: true))
     }
 }

@@ -12,6 +12,12 @@ enum ClaudeAppUsageSource {
             .appendingPathComponent("Library/Application Support/Claude/plan-usage-history.json")
     }
 
+    static func isInstalled(supportDir: URL = standardURL.deletingLastPathComponent(),
+                            appPaths: [URL] = [URL(fileURLWithPath: "/Applications/Claude.app"),
+                                               URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Applications/Claude.app")]) -> Bool {
+        ([supportDir] + appPaths).contains { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
     /// 一条读数：fh = 5 小时窗口已用 %，sd = 7 天已用 %，so / sn = 7 天 Opus / Sonnet 已用 %（键可能缺）
     struct Sample: Equatable {
         var t: Date

@@ -132,7 +132,7 @@ struct SettingsSection: Equatable {
 
 /// 「···」菜单里的一项
 struct AccountAction: Equatable {
-    enum Kind: Equatable { case setMain, apiKey, console, webRelogin, reinstallHook, switchClaudeSource, remove }
+    enum Kind: Equatable { case setMain, apiKey, console, webRelogin, reinstallHook, switchClaudeSource, dataDir, resetDataDir, remove }
     let kind: Kind
     let title: String
     var destructive: Bool { kind == .remove }
@@ -203,7 +203,7 @@ enum SettingsLayout {
     /// 「···」菜单：按平台原有能力给操作，最后一项总是「移除…」。
     /// Claude 套餐按来源：终端有「重装状态栏钩子」；两种来源都能切换到另一种
     static func accountActions(_ id: ProviderID, state: AccountState, isMain: Bool,
-                               claudeSource: ClaudePlanSource = .terminal) -> [AccountAction] {
+                               claudeSource: ClaudePlanSource = .terminal, customDir: Bool = false) -> [AccountAction] {
         var out: [AccountAction] = []
         if !isMain { out.append(AccountAction(kind: .setMain, title: L("action.pinIt"))) }
         switch id {
@@ -217,6 +217,10 @@ enum SettingsLayout {
         case .claudePlan:
             if claudeSource == .terminal { out.append(AccountAction(kind: .reinstallHook, title: L("action.reinstallHook"))) }
             out.append(AccountAction(kind: .switchClaudeSource, title: claudeSource.switchTitle))
+        }
+        if id == .codexPlan || id == .claudePlan {
+            out.append(AccountAction(kind: .dataDir, title: L("action.dataDir")))
+            if customDir { out.append(AccountAction(kind: .resetDataDir, title: L("action.resetDataDir"))) }
         }
         out.append(AccountAction(kind: .remove, title: L("action.remove")))
         return out
@@ -238,9 +242,9 @@ enum SettingsLayout {
 
     /// 菜单按操作类型排除行内紧急操作，保持其余顺序，「移除…」始终在最后。
     static func menuActions(_ id: ProviderID, state: AccountState, isMain: Bool,
-                            claudeSource: ClaudePlanSource, hookGone: Bool) -> [AccountAction] {
+                            claudeSource: ClaudePlanSource, hookGone: Bool, customDir: Bool = false) -> [AccountAction] {
         let urgent = urgentAction(id, state: state, hookGone: hookGone)
-        return accountActions(id, state: state, isMain: isMain, claudeSource: claudeSource)
+        return accountActions(id, state: state, isMain: isMain, claudeSource: claudeSource, customDir: customDir)
             .filter { $0.kind != urgent?.kind }
     }
 
@@ -248,7 +252,7 @@ enum SettingsLayout {
     /// 失效、连不上、正在连接时不写读数（可能是旧数）；stale：数据源已停止更新（Claude 套餐钩子不在了），也不写。
     /// Claude 套餐总写上额度来自哪里
     static func accountDetail(_ id: ProviderID, state: AccountState, reading: AccountReading?, stale: Bool = false,
-                              claudeSource: ClaudePlanSource = .terminal) -> String? {
+                              claudeSource: ClaudePlanSource = .terminal, customDir: String? = nil) -> String? {
         var parts: [String] = []
         var showReading: Bool
         switch state {
@@ -266,6 +270,7 @@ enum SettingsLayout {
             }
         default: break
         }
+        if let customDir { parts.append(L("acct.dataDir", customDir)) }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 

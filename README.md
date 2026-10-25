@@ -85,7 +85,7 @@ Claude、Codex 的额度不由 Token Bar 联网获取，而是读本机文件和
 
 **读本机文件（只读）**
 
-- `~/.claude/projects/` 下 Claude Code 的会话记录、`~/.codex/sessions/` 下 Codex 的会话记录：只取模型名、token 数、时间戳、额度读数，以及会话所在文件夹的名字（显示「正在跑的任务」用）；**对话内容一律不解码、不保存、不写日志**。
+- `~/.claude/projects/` 下 Claude Code 的会话记录、`~/.codex/sessions/` 下 Codex 的会话记录：只取模型名、token 数、时间戳、额度读数，以及会话所在文件夹的名字（显示「正在跑的任务」用）；**对话内容一律不解码、不保存、不写日志**。如果你用 `CODEX_HOME` / `CLAUDE_CONFIG_DIR` 把数据放在别处，在设置 → 平台里对应平台的「…」→「数据目录…」选一下（从菜单栏启动的 App 读不到终端里设的环境变量）。
 - `~/Library/Application Support/Claude/plan-usage-history.json`：Claude 桌面 App 自己记的套餐额度。
 
 **会改动的本机文件**
@@ -203,7 +203,7 @@ Claude and Codex quotas are read from local files and the local CLI, not fetched
 
 **Files read (read-only)**
 
-- Claude Code session logs under `~/.claude/projects/` and Codex session logs under `~/.codex/sessions/`: only model names, token counts, timestamps, quota readings, and the name of the session's folder (for "running tasks"). **Conversation content is never decoded, stored or logged.**
+- Claude Code session logs under `~/.claude/projects/` and Codex session logs under `~/.codex/sessions/`: only model names, token counts, timestamps, quota readings, and the name of the session's folder (for "running tasks"). **Conversation content is never decoded, stored or logged.** If you keep this data elsewhere via `CODEX_HOME` / `CLAUDE_CONFIG_DIR`, pick the folder in Settings → Platforms → "…" → "Data Folder…" (an app launched from the menu bar can't see environment variables set in your shell).
 - `~/Library/Application Support/Claude/plan-usage-history.json`: quota history recorded by the Claude desktop app.
 
 **Files modified**

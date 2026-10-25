@@ -41,7 +41,7 @@ final class UsageModel: ObservableObject {
     /// 设置里重新登录（网页登录）后的结果，显示在该平台的账号行下；再次登录时清掉
     @Published var reloginNotes: [ProviderID: ReloginNote] = [:]
     /// Claude 套餐的状态栏钩子（默认路径）。离屏预览只读它的路径，不调用 install / restore
-    var claudeInstaller = ClaudeStatusLineInstaller.standard
+    var claudeInstaller: ClaudeStatusLineInstaller { .standard }
     /// 状态栏钩子还在不在：打开面板、打开设置时读一次（.replaced = 被别人换掉了）
     @Published var claudeHookState: ClaudeStatusLineInstaller.HookState = .notInstalled
     /// Claude 套餐的额度来源（UserDefaults claudePlan.source 的镜像）：打开面板、打开设置时同步；离屏预览直接设

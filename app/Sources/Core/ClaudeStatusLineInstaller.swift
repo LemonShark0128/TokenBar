@@ -138,7 +138,11 @@ struct ClaudeStatusLineInstaller: Sendable {
         if existed {
             let b = settingsURL.deletingLastPathComponent()
                 .appendingPathComponent("settings.json.tokenbar-backup-\(Self.stamp(now()))")
-            try? fm.removeItem(at: b)
+            // 同一秒的旧备份通常不存在，不存在就不删（否则每次安装都误记一次写入失败）
+            if fm.fileExists(atPath: b.path) {
+                do { try fm.removeItem(at: b) }
+                catch { WriteFailureLog.shared.failed("清理旧备份", error) }
+            }
             // 用读到的字节写成普通文件：settings.json 若是符号链接，copyItem 只会复制出一条链接
             try Data(contentsOf: realSettingsURL).write(to: b, options: .atomic)
             backup = b
@@ -156,8 +160,10 @@ struct ClaudeStatusLineInstaller: Sendable {
             try writeSettings(settings)
         } catch {
             // settings.json 没写进去：original 退回安装前的样子，否则 state() 会把「没装上」误报成「被替换」
-            if let previousOriginal { try? previousOriginal.write(to: originalURL, options: .atomic) }
-            else { try? fm.removeItem(at: originalURL) }
+            do {
+                if let previousOriginal { try previousOriginal.write(to: originalURL, options: .atomic) }
+                else { try fm.removeItem(at: originalURL) }
+            } catch { WriteFailureLog.shared.failed("状态栏设置回滚", error) }
             throw SettingsWriteError(underlying: error)
         }
         return .installed(backup: backup)

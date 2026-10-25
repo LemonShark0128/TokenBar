@@ -69,12 +69,23 @@ enum ClaudeCLIUsage {
     static let timeout: TimeInterval = 25
 
     /// 常见安装位置（GUI App 的 PATH 里没有 ~/.local/bin）
-    static func candidates(home: URL) -> [URL] {
-        [home.appendingPathComponent(".local/bin/claude"),
+    static func candidates(home: URL, claudeConfig: URL? = nil) -> [URL] {
+        let paths = [home.appendingPathComponent(".local/bin/claude"),
          URL(fileURLWithPath: "/opt/homebrew/bin/claude"),
          URL(fileURLWithPath: "/usr/local/bin/claude"),
          home.appendingPathComponent(".claude/local/claude"),
-         home.appendingPathComponent(".npm-global/bin/claude")]
+         home.appendingPathComponent(".npm-global/bin/claude"),
+         (claudeConfig ?? home.appendingPathComponent(".claude")).appendingPathComponent("local/claude")]
+        var seen: Set<URL> = []
+        return paths.filter { seen.insert($0).inserted }
+    }
+
+    static func childEnvironment(base: [String: String], customClaudeDir: String?) -> [String: String] {
+        var env = base
+        if let path = customClaudeDir, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            env["CLAUDE_CONFIG_DIR"] = path
+        }
+        return env
     }
 
     static func locate(_ candidates: [URL]) -> URL? {
@@ -90,7 +101,7 @@ enum ClaudeCLIUsage {
     /// 真 App 用：找命令、在固定目录里跑一次
     static func standard(now: Date, log: @escaping @Sendable (String) -> Void = { _ in }) async -> Outcome {
         guard !(await backoff.blocked(now: now)) else { return throttled }
-        guard let exe = locate(candidates(home: URL(fileURLWithPath: NSHomeDirectory()))) else { return .notInstalled }
+        guard let exe = locate(candidates(home: URL(fileURLWithPath: NSHomeDirectory()), claudeConfig: AgentDirs.current.claudeConfig)) else { return .notInstalled }
         var result = await runControl(executable: exe, cwd: standardWorkDir, timeout: timeout, now: now, log: log)
         if result == outdated {
             result = await run(executable: exe, cwd: standardWorkDir, timeout: timeout, now: now, log: log)
@@ -116,7 +127,9 @@ enum ClaudeCLIUsage {
             p.executableURL = executable
             p.arguments = control ? controlArguments : arguments
             p.currentDirectoryURL = cwd
-            var env = ProcessInfo.processInfo.environment
+            let custom = AgentDirs.custom(.standard)[.claude]
+            var env = childEnvironment(base: ProcessInfo.processInfo.environment,
+                                       customClaudeDir: custom.map { _ in AgentDirs.current.claudeConfig.path })
             let home = NSHomeDirectory()
             env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
             env.removeValue(forKey: "CLAUDECODE")

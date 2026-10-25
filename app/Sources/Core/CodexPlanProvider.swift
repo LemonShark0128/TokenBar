@@ -3,13 +3,15 @@ import Foundation
 /// Codex 套餐：读本地会话日志（~/.codex/sessions/yyyy/MM/dd/*.jsonl）里最近一条 token_count 事件的 rate_limits。
 /// 不联网、不登录，也不碰 auth.json；日志里只解析 rate_limits 与时间戳，其余内容不保存、不写日志。
 struct CodexPlanProvider: UsageProvider {
-    let root: URL
+    private let root: @Sendable () -> URL
     /// 只用共享实例（系统文档：FileManager.default 可以在多个线程上同时用）；不存成属性，provider 才是真正的 Sendable
     private var fileManager: FileManager { .default }
 
-    init(root: URL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".codex/sessions")) {
+    init(root: @escaping @Sendable () -> URL = { AgentDirs.current.codexSessions }) {
         self.root = root
     }
+
+    init(root: URL) { self.root = { root } }
 
     var id: ProviderID { .codexPlan }
     var displayName: String { L("provider.codexPlan") }
@@ -27,6 +29,7 @@ struct CodexPlanProvider: UsageProvider {
     static var noDataNote: String { L("codex.noDataNote") }
 
     func fetch(_ c: Credentials, now: Date, timeZone: TimeZone) async -> Result<ProviderSnapshot, ProviderError> {
+        let root = root()
         var isDir: ObjCBool = false
         guard fileManager.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
             var s = Self.emptySnapshot(now: now)

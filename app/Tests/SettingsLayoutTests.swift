@@ -79,9 +79,9 @@ func registerSettingsLayoutTests() {
         try checkEqual(titles(.deepseek, .balanceOnly, main: true), ["更换 API Key", "登录控制台", "移除…"])
         try checkEqual(titles(.deepseek, .consoleExpired, main: true), ["更换 API Key", "重新登录控制台", "移除…"])
         try checkEqual(titles(.siliconflow, .expiring(days: 3), main: false), ["固定显示它", "重新登录", "移除…"])
-        try checkEqual(titles(.codexPlan, .ok, main: false), ["固定显示它", "移除…"])
-        try checkEqual(titles(.codexPlan, .ok, main: true), ["移除…"])
-        try checkEqual(titles(.claudePlan, .ok, main: true), ["重装状态栏钩子", "改用 Claude 桌面 App", "移除…"])
+        try checkEqual(titles(.codexPlan, .ok, main: false), ["固定显示它", "数据目录…", "移除…"])
+        try checkEqual(titles(.codexPlan, .ok, main: true), ["数据目录…", "移除…"])
+        try checkEqual(titles(.claudePlan, .ok, main: true), ["重装状态栏钩子", "改用 Claude 桌面 App", "数据目录…", "移除…"])
         let last = SettingsLayout.accountActions(.claudePlan, state: .ok, isMain: true).last!
         try check(last.destructive && last.kind == .remove)
     }
@@ -162,7 +162,7 @@ func registerSettingsLayoutTests() {
             (.siliconflow, .expiring(days: 3), false, [.setMain, .remove]),
             (.siliconflow, .invalid, true, [.remove]),
             (.siliconflow, .ok, false, [.setMain, .webRelogin, .remove]),
-            (.codexPlan, .ok, true, [.remove])
+            (.codexPlan, .ok, true, [.dataDir, .remove])
         ]
         for (id, state, main, expected) in cases {
             let actions = SettingsLayout.menuActions(id, state: state, isMain: main, claudeSource: .terminal, hookGone: false)
