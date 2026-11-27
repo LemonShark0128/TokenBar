@@ -1,28 +1,5 @@
 import Foundation
 
-/// 轮流显示用的小工具（纯函数）：主平台「当前使用」轮流（MainSwitcher）用它们。
-/// 用户 10-19：菜单栏不再单独选平台，永远和面板显示同一个（含轮流），所以这里只剩列表工具
-enum MenuBarRotation {
-    /// 任务最后活动在这么久以内算「在跑」
-    static let runningWindow: TimeInterval = 600
-    /// 各平台最近一次任务活动时间 → 10 分钟内在跑的平台
-    static func running(_ lastActivity: [ProviderID: Date], now: Date) -> Set<ProviderID> {
-        Set(lastActivity.filter { now.timeIntervalSince($0.value) <= runningWindow }.keys)
-    }
-
-    /// 列表变了：正在显示的还在就留着，否则从第一个开始
-    static func keep(_ list: [ProviderID], current: ProviderID) -> ProviderID {
-        list.contains(current) ? current : (list.first ?? current)
-    }
-
-    /// 轮到下一个（不在列表里时从第一个开始）
-    static func next(_ list: [ProviderID], after current: ProviderID) -> ProviderID {
-        guard let i = list.firstIndex(of: current) else { return list.first ?? current }
-        return list[(i + 1) % list.count]
-    }
-}
-
-
 /// 菜单栏的文字（纯函数；StatusBarController 和离屏预览共用）
 enum MenuBarText {
     /// 套餐标志和数字只看所显示窗口的剩余；nil 表示按量付费，沿用原有着色规则。
@@ -52,13 +29,11 @@ enum MenuBarText {
     /// 套餐写快用完的那个窗口已用多少（「已用 88%」，与「剩 N%」互补，时长放进悬停提示）。
     /// 只图标、低于预警线、已用完时为 nil（照常显示读数）
     static func riskTitle(_ r: PlatformRisk, mode: String) -> String? {
-        guard mode != "icon", let h = r.hours, h > 0 else { return nil }
-        switch r.kind {
-        case .payg: return Runway.compactText(hours: h)
-        case .quota(let q) where q.state == .runsOut:
+        // 只有套餐快用完才写；按量付费只写余额（用户 10-27：可用时长随任务多少一直跳），时长在悬停提示和面板里
+        if mode != "icon", let h = r.hours, h > 0, case .quota(let q) = r.kind, q.state == .runsOut {
             return L("menuText.used", quotaUsedPercent(remaining: q.remainingPercent))
-        default: return nil
         }
+        return nil
     }
 
     /// 有风险时的悬停提示和读屏：「Claude 套餐 预计可用时间：40 分钟，下次重置：10:00」
@@ -66,7 +41,7 @@ enum MenuBarText {
         switch r.kind {
         case .belowThreshold: return L("menuText.belowLine", name)
         case .payg(let p):
-            return L("menuText.timeLeft", name, p.hours < 1 ? L("common.underOneHour") : Runway.durationText(hours: p.hours))
+            return L("menuText.timeLeft", name, Runway.spanText(hours: p.hours))
         case .quota(let q):
             switch q.state {
             case .exhausted: return L("menuText.exhausted", name)
@@ -87,15 +62,15 @@ enum MenuBarText {
         return r.kind != .belowThreshold
     }
 
-    /// 套餐平台菜单栏读数：优先 5 小时窗口（当前会话），没有时用每周窗口，再取第一个窗口；没有窗口为 nil
+    /// 套餐平台菜单栏读数：按 Quota.displayWindow（用完的窗口优先，其次 5 小时窗口、每周窗口、第一个窗口）；没有窗口为 nil
     static func quotaReading(_ q: Quota?, now: Date, timeZone: TimeZone) -> AppData.MenuQuota? {
-        guard let q, let w = q.displayWindow else { return nil }
-        let reset = w.isReset(at: now) ? nil : QuotaText.resetText(w, now: now, timeZone: timeZone)
+        guard let q, let w = q.displayWindow(at: now) else { return nil }
+        let reset = w.isReset(at: now) ? nil : QuotaText.resetText(w, now: now, timeZone: timeZone, restore: w == q.blockingWindow(at: now))
         var r = AppData.MenuQuota(usedPercent: w.effectiveUsed(at: now), window: windowName(w.kind), reset: reset,
                                   exhausted: QuotaText.exhaustion(q, now: now, timeZone: timeZone))
-        // 读数使用显示窗口；最紧的是别的窗口时，把它的已用也写出来
-        if let t = q.tightest(at: now), t != w {
-            r.tighter = L("quota.windowUsedPct", windowName(t.kind), quotaUsedPercent(remaining: 100 - t.effectiveUsed(at: now)))
+        // 读数使用显示窗口；最紧的是别的窗口时，把它的剩余也写出来
+        if !w.isExhausted(at: now), let t = q.tightest(at: now), t != w {
+            r.tighter = L("quota.windowLeftPct", windowName(t.kind), quotaRemainingPercent(100 - t.effectiveUsed(at: now)))
         }
         return r
     }
@@ -106,16 +81,16 @@ enum MenuBarText {
         return QuotaText.windowName(k)
     }
 
-    /// 「Claude 套餐 当前会话已用 23%」；没有额度数据为「Claude 套餐 额度未知」
-    static func quotaUsedText(provider: String, reading: AppData.MenuQuota?) -> String {
+    /// 「Claude 套餐 当前会话剩 77%」；没有额度数据为「Claude 套餐 额度未知」（用户 11-05：悬停 / 读屏统一写剩余，菜单栏数字仍写已用）
+    static func quotaReadingText(provider: String, reading: AppData.MenuQuota?) -> String {
         guard let r = reading, r.usedPercent.isFinite else { return L("menuText.quotaUnknown", provider) }
-        return L("menuText.providerWindowUsed", provider, r.window, quotaUsedPercent(remaining: 100 - r.usedPercent))
+        return L("menuText.providerWindowLeft", provider, r.window, quotaRemainingPercent(100 - r.usedPercent))
     }
 
-    /// 菜单栏悬停提示：「Claude 套餐 当前会话已用 23% · 2 小时 13 分后重置」；
+    /// 菜单栏悬停提示：「Claude 套餐 当前会话剩 77% · 2 小时 13 分后重置」；
     /// 没有额度数据时带上平台给的说明（如「打开 Claude 桌面 App…」）
     static func quotaTooltip(provider: String, reading: AppData.MenuQuota?, note: String? = nil) -> String {
-        ([quotaUsedText(provider: provider, reading: reading)] + [reading?.tighter, reading?.reset].compactMap { $0 }
+        ([quotaReadingText(provider: provider, reading: reading)] + [reading?.tighter, reading?.reset].compactMap { $0 }
             + (reading == nil ? [note].compactMap { $0 } : []))
             .joined(separator: " · ")
     }

@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 import UserNotifications
 
@@ -14,6 +13,14 @@ extension UsageModel {
             if platformAlerts != previous { platformAlerts.save(.standard) }
         }
         let now = Date()
+        for alert in platformAlerts.claudeLoginAlerts(store.platforms, now: now, cliSource: claudeSource != .web) {
+            logLine("Claude 登录提醒：\(alert.title)")
+            deliverAlert(title: alert.title, body: alert.body, provider: .claudePlan)
+        }
+        for alert in platformAlerts.geminiLoginAlerts(store.platforms) {
+            logLine("Gemini 登录提醒：\(alert.title)")
+            deliverAlert(title: alert.title, body: alert.body, provider: .geminiPlan)
+        }
         let anomalies = store.anomalies()
         let th = ProviderSettings.load(.standard).lowAlerts
         // 先算出这一轮能发的内容；缺数据发不出就不记成已提醒（评审 I4）
@@ -28,7 +35,7 @@ extension UsageModel {
             guard let b = st.snapshot?.balance else { return nil }
             let (title, body) = StatusPresenter.lowTankNotification(
                 name: name, amount: AppDataMapping.double(b.amount), threshold: AppDataMapping.double(t),
-                currency: b.currency.rawValue)
+                currency: b.currency.rawValue, keyLimit: st.snapshot?.balanceIsKeyLimit == true)
             return ("余额预警触发：\(ProviderRegistry.logName(id))", title, body)
         }
         for id in platformAlerts.lowToFire(anomalies, now: now, repeatHours: alertRepeatHours,
@@ -37,30 +44,26 @@ extension UsageModel {
                                            canFire: { lowMessage($0) != nil }) {
             guard let m = lowMessage(id) else { continue }
             logLine(m.log)
-            deliverAlert(title: m.title, body: m.body)
+            deliverAlert(title: m.title, body: m.body, provider: id)
         }
         checkAgentAlerts(store, now: now)
         guard spikeAlertsOn else { return }
         func spikeMessage(_ id: ProviderID) -> (title: String, body: String)? {
-            guard let burn = store.platforms.first(where: { $0.id == id })?.burn, let rate = burn.perHourRecent else { return nil }
+            guard let st = store.platforms.first(where: { $0.id == id }), let burn = st.burn, let rate = burn.perHourRecent else { return nil }
             return StatusPresenter.spikeNotification(provider: ProviderRegistry.displayName(id),
                                                      cnyPerHour: AppDataMapping.double(rate),
-                                                     avgCnyPerDayWeek: AppDataMapping.double(burn.avgPerDayWeek))
+                                                     avgCnyPerDayWeek: AppDataMapping.double(burn.avgPerDayWeek),
+                                                     currency: (st.snapshot?.balance?.currency ?? ProviderRegistry.currency(id)).rawValue,
+                                                     avgDays: burn.avgDays)
         }
         for id in platformAlerts.spikeToFire(anomalies, now: now, canFire: { spikeMessage($0) != nil }) {
             guard let (title, body) = spikeMessage(id) else { continue }
             logLine("用量异常增加提醒：\(body)")
-            UNUserNotificationCenter.current().getNotificationSettings { s in
-                if s.authorizationStatus == .authorized || s.authorizationStatus == .provisional {
-                    self.postSystemNotification(title: title, body: body)
-                } else {
-                    DispatchQueue.main.async { self.showAlertCard(title: title, body: body) }
-                }
-            }
+            deliverAlert(title: title, body: body, sound: false, provider: id)
         }
     }
 
-    /// 代理场景的两种提醒：每小时花费超过（按平台，1 小时内最多一次）、套餐重置前会用完（每个窗口一次）
+    /// 每小时花费提醒（按平台，1 小时内最多一次）
     @MainActor
     func checkAgentAlerts(_ store: UsageStore, now: Date) {
         let settings = ProviderSettings.load(.standard)
@@ -88,20 +91,8 @@ extension UsageModel {
                 let logTitle = m.title.replacingOccurrences(of: ProviderRegistry.displayName(id),
                                                            with: ProviderRegistry.logName(id))
                 logLine("每小时花费提醒：\(logTitle)")
-                deliverAlert(title: m.title, body: m.body)
+                deliverAlert(title: m.title, body: m.body, provider: id)
             }
-        }
-        guard settings.quotaRunoutAlert else { return }
-        let quotaRisks = risks.filter { ProviderRegistry.meter($0.id) == .quota }
-        func runoutMessage(_ id: ProviderID) -> (title: String, body: String)? {
-            guard let q = quotaRisks.first(where: { $0.id == id })?.quotaReading else { return nil }
-            return StatusPresenter.runoutNotification(name: ProviderRegistry.displayName(id), runway: q, now: now,
-                                                      timeZone: .autoupdatingCurrent)
-        }
-        for id in platformAlerts.runoutToFire(quotaRisks, now: now, canFire: { runoutMessage($0) != nil }) {
-            guard let m = runoutMessage(id) else { continue }
-            logLine("套餐重置前会用完提醒：\(ProviderRegistry.logName(id))")
-            deliverAlert(title: m.title, body: m.body)
         }
     }
 
@@ -113,30 +104,103 @@ extension UsageModel {
         for alert in alerts {
             let body = QuotaText.exhausted(name: ProviderRegistry.displayName(alert.id), window: alert.window,
                                            now: now, timeZone: .autoupdatingCurrent)
-            logLine("套餐额度用完提醒")
-            deliverAlert(title: L("quota.alertUsedUpTitle"), body: body)
+            logLine("套餐额度用完提醒：\(ProviderRegistry.logName(alert.id))")
+            deliverAlert(title: L("quota.alertUsedUpTitle"), body: body, provider: alert.id)
+        }
+    }
+
+    func checkQuotaRecovered(_ platforms: [PlatformState], now: Date) {
+        let settings = ProviderSettings.load(.standard)
+        let previous = recoveryMemory
+        let alerts = recoveryMemory.toFire(platforms, lowAlerts: settings.lowAlerts, now: now)
+        if recoveryMemory != previous { recoveryMemory.save(.standard) }
+        guard settings.quotaRecoveredAlert else { return }
+        for (id, window) in alerts {
+            logLine("额度恢复提醒：\(ProviderRegistry.logName(id))")
+            deliverAlert(title: L("alert.recovered.title", ProviderRegistry.displayName(id), QuotaText.windowName(window.kind)),
+                         body: L("alert.recovered.body", Int((100 - window.effectiveUsed(at: now)).rounded(.down))), provider: id)
         }
     }
 
     /// 发提醒：有系统通知权限走通知中心，没有就用浮动警示卡
-    func deliverAlert(title: String, body: String) {
-        NSSound(named: "Basso")?.play()
+    /// sound：是否先响一声提示音（用量异常增加提醒不响）
+    func deliverAlert(title: String, body: String, sound: Bool = true, provider: ProviderID?) {
+        pendingAlerts.append(PendingAlert(provider: provider, title: title, body: body, sound: sound))
+        scheduleAlertFlush()
+    }
+
+    func scheduleAlertFlush() {
+        guard !alertFlushScheduled else { return }
+        alertFlushScheduled = true
+        DispatchQueue.main.async { [weak self] in self?.flushAlerts() }
+    }
+
+    func flushAlerts() {
+        alertFlushScheduled = false
+        let pending = pendingAlerts
+        pendingAlerts.removeAll()
+        let now = Date()
+        let d = UserDefaults.standard
+        let calendar = Calendar.current
+        func allowed(_ alert: PendingAlert) -> Bool {
+            if let id = alert.provider, AlertMute.isMuted(id, now: now, d: d, calendar: calendar) {
+                logLine("今天已静音，不发：\(ProviderRegistry.logName(id))")
+                return false
+            }
+            return true
+        }
+        let alerts = pending.filter(allowed)
+        var backlog = QuietBacklog.load(d)
+        if QuietHours.load(d)?.contains(now, calendar: calendar) == true {
+            if !alerts.isEmpty {
+                backlog.append(alerts)
+                backlog.save(d)
+                logLine("安静时段，暂存 \(alerts.count) 条提醒")
+            }
+            return
+        }
+        // 已积压的平台也可能刚被用户静音。
+        var visibleBacklog = QuietBacklog()
+        visibleBacklog.append(backlog.alerts.filter(allowed))
+        // 安静时段汇总单独发一条，不和本轮新提醒合并（嵌套在一起读着乱）
+        typealias Delivery = (title: String, body: String, sound: Bool, providers: [ProviderID], parts: [PendingAlert])
+        var deliveries: [Delivery] = []
+        if let summary = visibleBacklog.drain() {
+            deliveries.append((summary.alert.title, summary.alert.body, summary.alert.sound, summary.providers, [summary.alert]))
+        }
+        if !backlog.alerts.isEmpty { QuietBacklog().save(d) }
+        if let merged = AlertBatch.merge(alerts) {
+            deliveries.append((merged.title, merged.body, merged.sound, merged.providers, alerts))
+        }
+        guard !deliveries.isEmpty else { return }
+        let items = deliveries
+        let playSound = deliveries.contains(where: \.sound)
         UNUserNotificationCenter.current().getNotificationSettings { s in
             if s.authorizationStatus == .authorized || s.authorizationStatus == .provisional {
-                self.postSystemNotification(title: title, body: body)
+                for item in items {
+                    self.postSystemNotification(title: item.title, body: item.body, sound: item.sound, providers: item.providers)
+                }
             } else {
-                // 没授权系统通知 → 用自己画的浮动警示卡兜底（不依赖任何权限）
-                DispatchQueue.main.async { self.showAlertCard(title: title, body: body) }
+                // 没授权系统通知 → 用自己画的浮动警示卡兜底（不依赖任何权限）。
+                // 卡片高度固定，不合并：本轮每条提醒各一张，照原来那样排队
+                DispatchQueue.main.async {
+                    // 系统通知自带声音；只有浮动卡这条路才自己响一声，避免连响两次
+                    if playSound { NSSound(named: "Basso")?.play() }
+                    for item in items { for part in item.parts { self.showAlertCard(title: part.title, body: part.body) } }
+                }
             }
         }
     }
 
     /// 在通知中心的回调线程上调用（不在主线程）：只碰 UNUserNotificationCenter 和日志，都是线程安全的
-    nonisolated func postSystemNotification(title: String, body: String) {
+    nonisolated func postSystemNotification(title: String, body: String, sound: Bool, providers: [ProviderID]) {
         let c = UNMutableNotificationContent()
         c.title = title
         c.body = body
-        c.sound = .default
+        c.sound = sound ? .default : nil
+        // 「今天不再提醒」只挂在单平台通知上：多平台合并 / 汇总时一点会静音好几个平台
+        c.categoryIdentifier = providers.count == 1 ? "tokenbar.alert" : "tokenbar.alert.multi"
+        c.userInfo["providers"] = providers.map(\.rawValue)
         let req = UNNotificationRequest(identifier: "balance-alert-\(UUID().uuidString)",
                                         content: c, trigger: nil)
         UNUserNotificationCenter.current().add(req) { err in
@@ -174,10 +238,17 @@ extension UsageModel {
 
     /// 首次运行时申请一次通知权限（拒绝也不影响：走浮动卡兜底）
     func requestNotificationAuthOnce() {
-        // ⚠️ `--render` 离屏自检不是经 LaunchServices 启动的真 App（无 bundle 代理）：
-        // 这里碰 UNUserNotificationCenter 会抛 NSAssertion 直接 abort —— 实测 `--render` 退出码 133、
-        // 一个 PNG 都渲染不出来。自检模式必须跳过。
-        guard !CommandLine.arguments.contains(where: { $0 == "--render" || $0 == "--render-check" }) else { return }
+        // ⚠️ `--render` 离屏自检碰 UNUserNotificationCenter 会 abort：唯一调用方（UsageModel.init）已 guard !kRendering
+        let center = UNUserNotificationCenter.current()
+        let delegate = AlertNotificationDelegate(model: self)
+        notificationDelegate = delegate
+        center.delegate = delegate
+        center.setNotificationCategories([UNNotificationCategory(identifier: "tokenbar.alert", actions: [
+            UNNotificationAction(identifier: "open", title: L("alert.action.open"), options: .foreground),
+            UNNotificationAction(identifier: "muteToday", title: L("alert.action.muteToday"), options: [])
+        ], intentIdentifiers: [], options: []), UNNotificationCategory(identifier: "tokenbar.alert.multi", actions: [
+            UNNotificationAction(identifier: "open", title: L("alert.action.open"), options: .foreground)
+        ], intentIdentifiers: [], options: [])])
         let key = "didRequestNotificationAuth"
         if UserDefaults.standard.bool(forKey: key) { return }
         UserDefaults.standard.set(true, forKey: key)

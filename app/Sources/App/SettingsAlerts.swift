@@ -1,37 +1,61 @@
 import AppKit
-import Combine
 import SwiftUI
 
-// ---------------------------------------------------------------- 设置「提醒」页：预警线、每小时花费（列宽 alertColumnWidth 是存储属性，留在 Settings.swift）
+struct QuietHoursRow: View {
+    let live: Bool
+    let first: Bool
+    let p: Palette
+    @State private var selected = "off"
+
+    var body: some View {
+        SettingsRow(label: L("set.quietHours"), help: L("set.quietHoursHelp"), first: first, p: p) {
+            // 用同页自绘下拉（原生 Picker 离屏预览画不出来）
+            DropdownButton(title: L("set.quietHours"),
+                           options: [("off", L("set.quietHours.off")), ("22-7", "22:00–7:00"),
+                                     ("23-8", "23:00–8:00"), ("0-8", "0:00–8:00")],
+                           selected: selected, p: p) { value in
+                selected = value
+                if live { QuietHours.save(QuietHours.parse(value), .standard) }
+            }
+            .onAppear { if live { selected = QuietHours.load(.standard)?.value ?? "off" } }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 设置「提醒」页：平台读数、预警线、每小时花费
 
 extension SettingsView {
-    func alertHeader(quota: Bool) -> some View {
-        HStack(spacing: 6) {
-            LT("page.platform")
-            Spacer(minLength: 10)
-            Text(quota ? L("set.alert.remainingBelow") : L("set.alert.balanceBelow")).frame(width: alertColumnWidth, alignment: .trailing)
-            if !quota { LT("set.alert.hourlyOver").frame(width: alertColumnWidth, alignment: .trailing) }
-        }
-        .font(.system(size: 11)).foregroundColor(p.sub)
-        .padding(.horizontal, 12).frame(height: 26)
-    }
-
-    func alertRow(_ id: ProviderID, first: Bool, _ c: Ctx) -> some View {
-        VStack(spacing: 0) {
+    func alertStatusRow(_ id: ProviderID, first: Bool, _ c: Ctx) -> some View {
+        let snapshot = c.inp.platforms.first { $0.id == id }?.snapshot
+        let meter = ProviderRegistry.meter(id)
+        let reading = AccountReading.from(snapshot: snapshot, meter: meter, now: model.fixedNow ?? Date())
+        let stale = id == .claudePlan && model.claudeHookGone
+        let statusReading = SettingsLayout.alertStatusReading(state: c.states[id] ?? .notAdded,
+                                                              reading: reading, stale: stale)
+        return VStack(spacing: 0) {
             if !first { Hairline(p: p).padding(.leading, 12) }
-            HStack(spacing: 6) {
-                Text(ProviderRegistry.displayName(id)).font(.system(size: 12.5)).foregroundColor(p.text).lineLimit(1).fixedSize()
-                if c.main == id { MainBadge() }
-                Spacer(minLength: 10)
-                DropdownButton(title: L("set.alertLineFor", ProviderRegistry.displayName(id)),
-                               options: SettingsLayout.alertOptions(quota: ProviderRegistry.meter(id) == .quota, symbol: symbol(id, c)),
-                               selected: alertKey(id, c), p: p) { pickAlert($0, id, c) }
-                    .frame(width: alertColumnWidth, alignment: .trailing)
-                if ProviderRegistry.meter(id) == .money {
-                    hourlyButton(id, c).frame(width: alertColumnWidth, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 6) {
+                    Text(statusReading?.text ?? (stale ? ClaudeHookCopy.hookGone : (c.states[id] ?? .notAdded).label(for: id)))
+                        .font(.system(size: 12.5)).foregroundColor(p.text)
+                    if c.main == id { MainBadge() }
+                    Spacer(minLength: 0)
+                }
+                if let fraction = SettingsLayout.alertBarFraction(statusReading, fuelFull: model.fuelFullCny,
+                                                                  scale: SettingsLayout.gaugeScaleCurrency(added: c.added,
+                                                                                                           actual: SettingsLayout.balanceCurrencies(c.inp.platforms)),
+                                                                  usdToCny: model.gaugeRate) {
+                    GeometryReader { g in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(p.track)
+                            Capsule().fill(meter == .quota ? quotaTint(QuotaLevel.severity(remainingFraction: fraction)) : levelTint(fraction))
+                                .frame(width: g.size.width * fraction)
+                        }
+                    }.frame(height: 4)
                 }
             }
-            .padding(.horizontal, 12).frame(minHeight: 36)
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .frame(minHeight: 36)
         }
     }
 
@@ -47,33 +71,27 @@ extension SettingsView {
         .help(L("set.alert.hourlyHelp"))
     }
 
-    /// 主平台读写 balanceAlertCny（它是 lowAlerts[主平台] 的镜像），其他平台直接读写 lowAlerts
+    /// 预警线只存在 ProviderSettings.lowAlerts 一处（所有平台同一套读写）；离屏渲染时正在显示的平台用给定值
     func alertValue(_ id: ProviderID, _ c: Ctx) -> Double {
-        if id == c.main { return model.balanceAlertCny }
+        if id == c.main, let r = model.renderAlert { return r }
         return c.inp.settings.lowAlerts[id].map { NSDecimalNumber(decimal: $0).doubleValue } ?? 0
     }
 
     func alertKey(_ id: ProviderID, _ c: Ctx) -> String {
-        SettingsLayout.alertSelection(value: alertValue(id, c),
-                                      custom: id == c.main ? model.balanceAlertCustom : model.alertCustomOpen.contains(id))
+        SettingsLayout.alertSelection(value: alertValue(id, c), custom: model.alertCustomOpen.contains(id))
     }
 
     func symbol(_ id: ProviderID, _ c: Ctx) -> String {
-        id == c.main ? currencySymbol(model.data?.balance.currency) : "¥"
+        SettingsLayout.alertSymbol(id, main: c.main, mainCurrency: model.data?.balance.currency)
     }
 
-    func pickAlert(_ k: String, _ id: ProviderID, _ c: Ctx) {
+    func pickAlert(_ k: String, _ id: ProviderID) {
         switch SettingsLayout.alertPick(k) {
         case .custom:
-            if id == c.main { model.balanceAlertCustom = true } else { model.alertCustomOpen.insert(id) }
+            model.alertCustomOpen.insert(id)
         case .set(let d):
-            if id == c.main {
-                model.balanceAlertCustom = false
-                model.balanceAlertCny = d.map { NSDecimalNumber(decimal: $0).doubleValue } ?? 0
-            } else {
-                model.alertCustomOpen.remove(id)
-                model.updateProviderSettings { $0.lowAlerts[id] = d }
-            }
+            model.alertCustomOpen.remove(id)
+            model.updateProviderSettings { $0.lowAlerts[id] = d }
         case .ignore: break
         }
     }
@@ -87,13 +105,9 @@ extension SettingsView {
                 AmountField(value: v > 0 ? Decimal(string: String(v), locale: Locale(identifier: "en_US_POSIX")) : nil,
                             placeholder: "8") { d in
                     guard case .set(let d) = SettingsLayout.customAlertInput(d, quota: isQuota, isMain: id == c.main) else { return }
-                    if id == c.main {
-                        if let d { model.balanceAlertCny = NSDecimalNumber(decimal: d).doubleValue }
-                    } else {
-                        // 正在输入：值变成 0 时输入框也要留着，不能整行消失
-                        model.alertCustomOpen.insert(id)
-                        model.updateProviderSettings { $0.lowAlerts[id] = d }
-                    }
+                    // 正在输入：值变成 0 时输入框也要留着，不能整行消失
+                    model.alertCustomOpen.insert(id)
+                    model.updateProviderSettings { $0.lowAlerts[id] = d }
                 }
                 .id("alert-custom-\(id.rawValue)")
                 if isQuota { Text("%").font(.system(size: 12)).foregroundColor(p.sub) }

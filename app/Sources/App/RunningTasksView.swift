@@ -8,6 +8,14 @@ struct RunningTasksSection: View {
     let fixedNow: Date?
     let p: Palette
     let compact: Bool
+    var showHeader: Bool = true
+    var limit: Int = RunningTaskText.maxShown
+    /// false：不写「还有 N 个」（调用方自己放「显示全部」）
+    var showMore: Bool = true
+    /// 每条任务下面那行（模型 · 已写 · 花费）最多几行
+    var detailLines: Int = 2
+    /// 停住的任务写短形式「停 7分」（「今天」小卡太窄）
+    var shortClock = false
 
     var body: some View {
         if !tasks.isEmpty {
@@ -20,15 +28,17 @@ struct RunningTasksSection: View {
     }
 
     private func content(now: Date) -> some View {
-        let v = RunningTaskText.visible(tasks)
+        let v = (shown: Array(tasks.prefix(max(0, limit))), more: max(0, tasks.count - limit))
         return VStack(alignment: .leading, spacing: compact ? 6 : 8) {
+            if showHeader {
             if compact {
                 Text(RunningTaskText.header(count: tasks.count)).font(.system(size: 11)).foregroundColor(.secondary)
             } else {
                 SectionTitle(text: RunningTaskText.header(count: tasks.count), p: p)
             }
+            }
             ForEach(v.shown, id: \.sessionKey) { t in row(t, now: now) }
-            if v.more > 0 {
+            if showMore && v.more > 0 {
                 Text(RunningTaskText.moreLine(v.more)).font(.system(size: 11)).foregroundColor(p.sub)
             }
         }
@@ -46,11 +56,12 @@ struct RunningTasksSection: View {
                     .foregroundColor(stale ? p.sub : (compact ? .primary : p.text))
                     .lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 6)
-                Text(RunningTaskText.clock(t, now: now))
+                Text(RunningTaskText.clock(t, now: now, short: shortClock))
                     .font(stale ? .system(size: compact ? 11 : 11.5) : .num(compact ? 11.5 : 12, .regular))
-                    .foregroundColor(stale ? p.sub : (compact ? .primary : p.text)).lineLimit(1)
+                    // 「今天」小卡（shortClock）：停住的任务用提醒橙，往往是在等回复
+                    .foregroundColor(stale ? (shortClock ? p.warnText : p.sub) : (compact ? .primary : p.text)).lineLimit(1)
             }
-            Text(RunningTaskText.detail(t)).font(.system(size: 11)).foregroundColor(p.sub).lineLimit(1)
+            Text(shortClock ? RunningTaskText.costDetail(t) : RunningTaskText.detail(t)).font(.system(size: 11)).foregroundColor(p.sub).lineLimit(detailLines)
                 .padding(.leading, glyph + 6)
         }
         .accessibilityElement(children: .ignore)

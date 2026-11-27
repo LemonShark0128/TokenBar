@@ -60,6 +60,42 @@ func registerClaudeStatusLineInstallerTests() {
         try checkEqual(sl?["type"] as? String, "command")
     }
 
+    test("installKeepsStatusLineExtraFields") {
+        let original = "{\"statusLine\":{\"type\":\"command\",\"command\":\"~/bin/sl.sh\",\"padding\":2}}"
+        let e = try makeEnv(settings: original)
+        _ = try e.installer.install()
+        let sl = try json(e.settings)["statusLine"] as? [String: Any]
+        try checkEqual(sl?["command"] as? String, ClaudeStatusLineInstaller.shellQuote(e.installer.hookURL.path))
+        try checkEqual(sl?["type"] as? String, "command")
+        try checkEqual(sl?["padding"] as? Int, 2)
+        try checkEqual(e.installer.state(), .installed)
+        try checkEqual(try e.installer.restore(), .restored)
+        let a = try JSONSerialization.jsonObject(with: Data(original.utf8))
+        let b = try JSONSerialization.jsonObject(with: Data(contentsOf: e.settings))
+        try check(same(a, b), "还原后应与原文件语义相等")
+
+        // 原值不是字典（异常写法）：照旧只写 type / command
+        let e2 = try makeEnv(settings: "{\"statusLine\":\"~/bin/sl.sh\"}")
+        _ = try e2.installer.install()
+        let sl2 = try json(e2.settings)["statusLine"] as? [String: Any]
+        try checkEqual(sl2?.count, 2)
+    }
+
+    test("writesSettingsWithSortedKeys") {
+        // 键多一些、乱序：不排序时 Swift 字典每次运行顺序都不同，dotfiles 仓库里会出现无意义的改动
+        let original = "{\"zeta\":1,\"model\":\"opus\",\"alpha\":true,\"hooks\":{\"z\":1,\"b\":2,\"m\":3},\"env\":{\"Y\":\"1\",\"A\":\"2\"},\"permissions\":[],\"statusLine\":{\"type\":\"command\",\"command\":\"~/bin/sl.sh\",\"padding\":2}}"
+        let e = try makeEnv(settings: original)
+        _ = try e.installer.install()
+        func canonical(_ url: URL) throws -> Data {
+            let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
+            return try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        }
+        try checkEqual(try Data(contentsOf: e.settings), try canonical(e.settings))
+        try checkEqual(try Data(contentsOf: e.installer.originalURL), try canonical(e.installer.originalURL))
+        try checkEqual(try e.installer.restore(), .restored)
+        try checkEqual(try Data(contentsOf: e.settings), try canonical(e.settings))
+    }
+
     test("installLeavesUnparseableFileUntouched") {
         let bad = "{ // 注释\n \"a\": 1, }"
         let e = try makeEnv(settings: bad)
@@ -150,6 +186,45 @@ func registerClaudeStatusLineInstallerTests() {
         try check(FileManager.default.fileExists(atPath: e.installer.originalURL.path), "original 不应被删")
     }
 
+    test("restoreWithReadOnlySupportDirChangesNothing") {
+        // 支持目录只读、删不了 original：不能先写回 settings.json 再报错（界面说失败、残留的 original 又让状态误报「被替换」）
+        let e = try makeEnv(settings: "{\"statusLine\":{\"type\":\"command\",\"command\":\"sl.sh\"}}")
+        let fm = FileManager.default
+        _ = try e.installer.install()
+        let before = try Data(contentsOf: e.settings)
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: e.support.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: e.support.path) }
+        var threw = false
+        do { _ = try e.installer.restore() } catch { threw = true }
+        try check(threw, "应抛错")
+        try checkEqual(try Data(contentsOf: e.settings), before)
+        try check(fm.fileExists(atPath: e.installer.originalURL.path), "original 应还在原处")
+        try checkEqual(e.installer.state(), .installed)
+        // 权限恢复后能正常还原
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: e.support.path)
+        try checkEqual(try e.installer.restore(), .restored)
+        try checkEqual(try command(e.settings), "sl.sh")
+        try checkEqual(e.installer.state(), .notInstalled)
+    }
+
+    test("restoreWithUnwritableSettingsPutsOriginalBack") {
+        let e = try makeEnv(settings: "{\"statusLine\":{\"type\":\"command\",\"command\":\"sl.sh\"}}")
+        let fm = FileManager.default
+        _ = try e.installer.install()
+        let before = try Data(contentsOf: e.settings)
+        let origBefore = try Data(contentsOf: e.installer.originalURL)
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: e.claudeDir.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: e.claudeDir.path) }
+        var threw = false
+        do { _ = try e.installer.restore() } catch { threw = true }
+        try check(threw, "应抛错")
+        try checkEqual(try Data(contentsOf: e.settings), before)
+        try checkEqual(try Data(contentsOf: e.installer.originalURL), origBefore)
+        try checkEqual(e.installer.state(), .installed)
+        let leftovers = try fm.contentsOfDirectory(atPath: e.support.path).filter { $0.contains("restoring") }
+        try checkEqual(leftovers, [])
+    }
+
     test("installThroughSymlinkedSettingsKeepsLink") {
         let e = try makeEnv(settings: nil)
         let fm = FileManager.default
@@ -168,6 +243,33 @@ func registerClaudeStatusLineInstallerTests() {
         _ = try e.installer.restore()
         try check((try? fm.destinationOfSymbolicLink(atPath: e.settings.path)) != nil, "还原后仍应是符号链接")
         try check(try command(real) == nil, "目标文件应已还原")
+    }
+
+    test("installThroughDanglingSymlinkKeepsLink") {
+        // dotfiles 刚克隆、目标文件（连同所在目录）还没建：链接要保留，内容写进链接目标
+        let e = try makeEnv(settings: nil)
+        let fm = FileManager.default
+        let real = e.root.appendingPathComponent("dotfiles repo/claude/settings.json")
+        try fm.createSymbolicLink(at: e.settings, withDestinationURL: real)
+        let r = try e.installer.install()
+        try checkEqual(r, .installed(backup: nil))
+        try checkEqual(try? fm.destinationOfSymbolicLink(atPath: e.settings.path), real.path)
+        try checkEqual(try command(real), e.installer.hookCommand)
+        try checkEqual(e.installer.state(), .installed)
+        try checkEqual(try e.installer.restore(), .restored)
+        try check((try? fm.destinationOfSymbolicLink(atPath: e.settings.path)) != nil, "还原后仍应是符号链接")
+        try check(try command(real) == nil, "目标文件应已还原")
+    }
+
+    test("installThroughRelativeDanglingSymlinkResolvesFromLinkDir") {
+        // 相对路径的链接按链接所在目录解析，不按当前工作目录
+        let e = try makeEnv(settings: nil)
+        let fm = FileManager.default
+        try fm.createSymbolicLink(atPath: e.settings.path, withDestinationPath: "../dotfiles/settings.json")
+        _ = try e.installer.install()
+        let real = e.root.appendingPathComponent("dotfiles/settings.json")
+        try checkEqual(try? fm.destinationOfSymbolicLink(atPath: e.settings.path), "../dotfiles/settings.json")
+        try checkEqual(try command(real), e.installer.hookCommand)
     }
 
     test("reinstallRepairsMissingHookScript") {
@@ -194,6 +296,15 @@ func registerClaudeStatusLineInstallerTests() {
         let e = try makeEnv(settings: nil)
         let obj = try JSONSerialization.jsonObject(with: Data(("{" + e.installer.manualSnippet + "}").utf8)) as? [String: Any]
         try checkEqual((obj?["statusLine"] as? [String: Any])?["command"] as? String, e.installer.hookCommand)
+    }
+
+    test("previewSnippetHidesRealHome") {
+        // 预览图会拿去做发布截图：片段里不能出现本机家目录（用户名），形状和真实片段一致
+        let snippet = ClaudeStatusLineInstaller.preview.manualSnippet
+        try check(!snippet.contains(NSHomeDirectory()))
+        let obj = try JSONSerialization.jsonObject(with: Data(("{" + snippet + "}").utf8)) as? [String: Any]
+        try checkEqual((obj?["statusLine"] as? [String: Any])?["command"] as? String,
+                       "'/Users/you/Library/Application Support/TokenBar/claude-statusline.sh'")
     }
 
     test("shellQuoteEscapesSingleQuote") {

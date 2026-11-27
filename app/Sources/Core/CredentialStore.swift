@@ -54,8 +54,8 @@ struct SystemKeychainOperations: KeychainOperations {
 
 /// 所有平台的凭据合在钥匙串的一条通用密码里：service = "<前缀>.all"，account = "credentials"，
 /// 值是 JSON：{"version":1,"providers":{"deepseek":{"apiKey":"…"},…}}。
-/// 为什么合并：App 是 ad-hoc 签名，每次重装或更新签名都会变，钥匙串会对每一条逐个弹框问授权；
-/// 合成一条后每次重装只问一次。
+/// 为什么合并：早期 App 是 ad-hoc 签名，每次重装签名都会变，钥匙串会对每一条逐个弹框问授权；
+/// 合成一条后每次重装只问一次。现在用「TokenBar Dev」证书签名，签名稳定，合并格式照旧保留。
 ///
 /// - 一次启动只读一次钥匙串：第一次读成功后整份缓存在内存里，之后的 read 都走内存；
 ///   save / delete 对整条做「读-改-写」，写成功后才更新内存缓存。
@@ -73,7 +73,8 @@ final class KeychainCredentialStore: CredentialStore, @unchecked Sendable {
     static let mergedAccount = "credentials"
     static let formatVersion = 1
     static let mergedWrittenKey = "credentials.mergedWritten"
-    static func legacyLeftKey(_ p: ProviderID) -> String { "credentials.legacyLeft.\(p.rawValue)" }
+    static func legacyLeftKey(_ p: ProviderID) -> String { legacyLeftKey(raw: p.rawValue) }
+    static func legacyLeftKey(raw: String) -> String { "credentials.legacyLeft.\(raw)" }
     let servicePrefix: String
     let ops: any KeychainOperations
     let defaults: UserDefaults
@@ -237,8 +238,8 @@ final class KeychainCredentialStore: CredentialStore, @unchecked Sendable {
     private func migrateLegacy() -> Result<[String: [String: String]], LoadFailure> {
         var all: [String: [String: String]] = [:]
         // 早于「添加过」标记的老安装一个标记都没有：照旧迁移全部平台
-        let flagged = ProviderID.allCases.contains { defaults.object(forKey: "accountAdded.\($0.rawValue)") != nil }
-        for p in ProviderID.allCases where !flagged || defaults.bool(forKey: "accountAdded.\(p.rawValue)") {
+        let flagged = ProviderID.allCases.contains { defaults.object(forKey: UsageStore.addedKey($0)) != nil }
+        for p in ProviderID.allCases where !flagged || defaults.bool(forKey: UsageStore.addedKey(p)) {
             for key in Self.knownKeys {
                 var q = mergedQuery
                 q[kSecAttrService as String] = legacyService(p)
@@ -259,10 +260,11 @@ final class KeychainCredentialStore: CredentialStore, @unchecked Sendable {
             }
         }
         if !all.isEmpty {
+            // 写不进去不记住失败（有意）：下次读取再试一次迁移（见 keychainMigrationWriteFailureIsErrorNotCached）
             do { try writeMerged(all) } catch let e as KeychainError { return .failure(.keychain(e.status)) } catch {
                 return .failure(.keychain(errSecIO))
             }
-            for id in all.keys { defaults.set(true, forKey: "credentials.legacyLeft.\(id)") }   // 同 legacyLeftKey
+            for id in all.keys { defaults.set(true, forKey: Self.legacyLeftKey(raw: id)) }
         }
         cache = all   // 都没有就缓存空状态，不写钥匙串
         return .success(all)

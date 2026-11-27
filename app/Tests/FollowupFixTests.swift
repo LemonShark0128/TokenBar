@@ -10,9 +10,7 @@ final class GatedOnceProvider: UsageProvider, @unchecked Sendable {
         self.first = first; self.rest = rest
     }
     var id: ProviderID { .deepseek }
-    var displayName: String { "GatedOnce" }
-    var capabilities: Capabilities { Capabilities(hasBalance: true, currency: .cny, minPollInterval: 60, dayBoundary: .local) }
-    var loginSteps: [LoginStep] { [] }
+    var capabilities: Capabilities { Capabilities(hasBalance: true, currency: .cny, minPollInterval: 60) }
     func validate(_ c: Credentials) async -> ValidationResult { .ok(summary: "") }
     func fetch(_ c: Credentials, now: Date, timeZone: TimeZone) async -> Result<ProviderSnapshot, ProviderError> {
         used.append(c)
@@ -84,14 +82,14 @@ func registerFollowupFixTests() {
 func registerReloginNoteTests() {
     // 评审：设置里重新登录硅基流动失败时静默关窗 → 账号行下写明结果
     test("reloginNoteCopy") {
-        let fail = ReloginNote.make(provider: .siliconflow, ok: false, message: "登录没有成功，请重新登录硅基流动")
+        let fail = ReloginNote.make(ok: false, message: "登录没有成功，请重新登录硅基流动")
         try checkEqual(fail, ReloginNote(text: "登录没有成功，请重新登录硅基流动", isError: true))
-        let keychain = ReloginNote.make(provider: .siliconflow, ok: false, message: "存进钥匙串失败：x")
+        let keychain = ReloginNote.make(ok: false, message: "存进钥匙串失败：x")
         try checkEqual(keychain, ReloginNote(text: "重新登录没有成功：存进钥匙串失败：x", isError: true))
-        let ok = ReloginNote.make(provider: .siliconflow, ok: true, message: "已连接，余额 ¥9.98")
+        let ok = ReloginNote.make(ok: true, message: "已连接，余额 ¥9.98")
         try checkEqual(ok, ReloginNote(text: "已重新登录：已连接，余额 ¥9.98", isError: false))
         // DeepSeek 控制台登录成功时只有「已登录」
-        try checkEqual(ReloginNote.make(provider: .deepseek, ok: true, message: "已登录"),
+        try checkEqual(ReloginNote.make(ok: true, message: "已登录"),
                        ReloginNote(text: "已重新登录", isError: false))
     }
 }

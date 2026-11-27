@@ -7,8 +7,19 @@ func registerLegacyPlatformTests() {
     test("adminPlatformsRemovedFromProviderID") {
         try check(ProviderID(rawValue: "claude") == nil, "claude 不再是平台")
         try check(ProviderID(rawValue: "openai") == nil, "openai 不再是平台")
-        try checkEqual(ProviderID.allCases, [.deepseek, .siliconflow, .codexPlan, .claudePlan])
-        try checkEqual(ProviderRegistry.all, [.deepseek, .siliconflow, .codexPlan, .claudePlan])
+        try checkEqual(ProviderID.allCases, [.deepseek, .siliconflow, .codexPlan, .claudePlan, .kimi, .openrouter, .packyapi, .geminiPlan])
+        try checkEqual(ProviderRegistry.all, [.deepseek, .siliconflow, .kimi, .openrouter, .packyapi, .codexPlan, .claudePlan, .geminiPlan])
+    }
+
+    // 平台类型有两个来源（界面和提醒看 ProviderRegistry，取数轮询看 capabilities）：必须逐平台一致
+    test("meterSourcesAgree") {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("tb-meter-\(UUID().uuidString)")
+        let providers: [UsageProvider] = [DeepSeekProvider(), SiliconFlowProvider(), KimiProvider(), OpenRouterProvider(), PackyAPIProvider(), CodexPlanProvider(root: tmp, resetCredits: { nil }),
+                                          ClaudePlanProvider(quotaFile: tmp.appendingPathComponent("q.json")), GeminiPlanProvider()]
+        try checkEqual(Set(providers.map(\.id)), Set(ProviderID.allCases))
+        for p in providers {
+            try checkEqual(p.capabilities.meter, ProviderRegistry.meter(p.id))
+        }
     }
 
     @MainActor func makeLegacyStore(_ d: UserDefaults, ids: [ProviderID] = [.deepseek, .siliconflow]) throws -> UsageStore {
@@ -30,6 +41,25 @@ func registerLegacyPlatformTests() {
         try check(ProviderID.allCases.contains(main))
         try checkEqual(main, .deepseek)
         try checkEqual(store.switchState.auto, false)
+    }
+    // 只加了硅基流动的老用户，主平台存的是 openai：解码先记成 DeepSeek，还要再回落到硅基流动
+    // （上一条用例 DeepSeek 已添加，回落结果恰好等于解码默认值，测不出回落）
+    testAsync("legacyMainSwitchFallsBackToSiliconFlow") {
+        let d = freshDefaults()
+        d.set(Data(#"{"main":"openai","auto":false}"#.utf8), forKey: "mainSwitch")
+        let store = try makeLegacyStore(d, ids: [.siliconflow])
+        try checkEqual(store.mainProvider, .siliconflow)
+        try checkEqual(store.switchState.auto, false)
+        try checkEqual(store.menuBarProvider, .siliconflow)
+    }
+    // 存的主平台是 DeepSeek（合法，但这次没添加）：同样回落到硅基流动
+    testAsync("unaddedDeepSeekMainFallsBackToSiliconFlow") {
+        let d = freshDefaults()
+        d.set(Data(#"{"main":"deepseek","auto":true}"#.utf8), forKey: "mainSwitch")
+        let store = try makeLegacyStore(d, ids: [.siliconflow])
+        try checkEqual(store.mainProvider, .siliconflow)
+        try checkEqual(store.switchState.auto, true)
+        try checkEqual(store.menuBarProvider, .siliconflow)
     }
     // 正在计时的候选平台是 Claude：只丢掉候选，主平台和其余设置保留
     testAsync("legacyMainSwitchLeaderDropped") {

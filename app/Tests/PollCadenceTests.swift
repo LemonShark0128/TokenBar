@@ -7,9 +7,7 @@ final class SlowProvider: UsageProvider, @unchecked Sendable {
     private(set) var calls = 0
     init(_ id: ProviderID, clock: FakeClock, cost: TimeInterval) { pid = id; self.clock = clock; self.cost = cost }
     var id: ProviderID { pid }
-    var displayName: String { "Slow" }
-    var capabilities: Capabilities { Capabilities(hasBalance: true, currency: .cny, minPollInterval: 60, dayBoundary: .local) }
-    var loginSteps: [LoginStep] { [.apiKey(required: true)] }
+    var capabilities: Capabilities { Capabilities(hasBalance: true, currency: .cny, minPollInterval: 60) }
     func validate(_ c: Credentials) async -> ValidationResult { .ok(summary: "") }
     func fetch(_ c: Credentials, now: Date, timeZone: TimeZone) async -> Result<ProviderSnapshot, ProviderError> {
         calls += 1

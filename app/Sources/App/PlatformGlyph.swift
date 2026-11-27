@@ -13,22 +13,7 @@ enum PlatformGlyph {
         let pt = kMenuIconPt
         let img = NSImage(size: NSSize(width: pt, height: pt), flipped: false) { rect in
             draw(id, in: rect, color: tint ?? .black)
-            for (on, text, size, top) in [(dayBadge, L("badge.day"), 5.6, false), (alertBadge, "!", 7.0, true)] where on {
-                guard let ctx = NSGraphicsContext.current else { continue }
-                let r: CGFloat = 3.9
-                let c = NSPoint(x: rect.maxX - r, y: top ? rect.maxY - r : rect.minY + r)
-                NSGraphicsContext.saveGraphicsState()
-                ctx.compositingOperation = .destinationOut
-                NSBezierPath(ovalIn: NSRect(x: c.x - r - 1, y: c.y - r - 1, width: 2 * r + 2, height: 2 * r + 2)).fill()
-                ctx.compositingOperation = .sourceOver
-                (tint ?? .black).setFill()
-                NSBezierPath(ovalIn: NSRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)).fill()
-                ctx.compositingOperation = .destinationOut
-                let g = NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: size, weight: .heavy)])
-                let gs = g.size()
-                g.draw(at: NSPoint(x: c.x - gs.width / 2, y: c.y - gs.height / 2))
-                NSGraphicsContext.restoreGraphicsState()
-            }
+            GaugeIcon.drawBadges(in: rect, color: tint ?? .black, dayBadge: dayBadge, alertBadge: alertBadge)
             return true
         }
         img.isTemplate = tint == nil
@@ -57,8 +42,12 @@ enum PlatformGlyph {
         switch id {
         case .claudePlan: claude()
         case .codexPlan: codex()
+        case .geminiPlan: gemini()
         case .deepseek: deepseek()
         case .siliconflow: siliconflow()
+        case .kimi: kimi()
+        case .openrouter: openrouter()
+        case .packyapi: packyapi()
         }
         NSGraphicsContext.restoreGraphicsState()
     }
@@ -90,6 +79,19 @@ enum PlatformGlyph {
         }
     }
 
+    /// 四角星芒：四条向心凹弧汇成菱形星
+    private static func gemini() {
+        let r: CGFloat = 7.2
+        let p = NSBezierPath()
+        p.move(to: NSPoint(x: 0, y: r))
+        p.curve(to: NSPoint(x: r, y: 0), controlPoint1: NSPoint(x: 0.6, y: 1.8), controlPoint2: NSPoint(x: 1.8, y: 0.6))
+        p.curve(to: NSPoint(x: 0, y: -r), controlPoint1: NSPoint(x: 1.8, y: -0.6), controlPoint2: NSPoint(x: 0.6, y: -1.8))
+        p.curve(to: NSPoint(x: -r, y: 0), controlPoint1: NSPoint(x: -0.6, y: -1.8), controlPoint2: NSPoint(x: -1.8, y: -0.6))
+        p.curve(to: NSPoint(x: 0, y: r), controlPoint1: NSPoint(x: -1.8, y: 0.6), controlPoint2: NSPoint(x: -0.6, y: 1.8))
+        p.close()
+        p.fill()
+    }
+
     /// 鲸鱼：圆身子、上翘的尾巴、挖空的眼睛
     private static func deepseek() {
         let body = NSBezierPath()
@@ -107,6 +109,52 @@ enum PlatformGlyph {
             ctx.compositingOperation = .destinationOut
             NSBezierPath(ovalIn: NSRect(x: -4.6, y: -1.2, width: 1.8, height: 1.8)).fill()
             ctx.compositingOperation = .sourceOver
+        }
+    }
+
+    /// 弯月：大圆挖掉右上偏移的圆，缺口里点一颗星（不与月牙相接）
+    private static func kimi() {
+        NSBezierPath(ovalIn: NSRect(x: -7, y: -7, width: 14, height: 14)).fill()
+        if let ctx = NSGraphicsContext.current {
+            ctx.compositingOperation = .destinationOut
+            NSBezierPath(ovalIn: NSRect(x: -3.2, y: -3.6, width: 12.4, height: 12.4)).fill()
+            ctx.compositingOperation = .sourceOver
+        }
+        NSBezierPath(ovalIn: NSRect(x: 2.4, y: -0.1, width: 2.2, height: 2.2)).fill()
+    }
+
+    /// 包裹：等轴测的方盒子（六边形外框 + 中间 Y 形棱线），上面一面涂实
+    private static func packyapi() {
+        let r: CGFloat = 7, h = r * 0.866
+        let top = NSPoint(x: 0, y: r), ur = NSPoint(x: h, y: r / 2), lr = NSPoint(x: h, y: -r / 2)
+        let bottom = NSPoint(x: 0, y: -r), ll = NSPoint(x: -h, y: -r / 2), ul = NSPoint(x: -h, y: r / 2)
+        let center = NSPoint.zero
+        let lid = NSBezierPath()
+        lid.move(to: top); lid.line(to: ur); lid.line(to: center); lid.line(to: ul); lid.close()
+        lid.fill()
+        let box = NSBezierPath()
+        box.lineWidth = 1.5
+        box.lineJoinStyle = .round
+        box.move(to: top)
+        for pt in [ur, lr, bottom, ll, ul] { box.line(to: pt) }
+        box.close()
+        box.move(to: center); box.line(to: bottom)
+        box.stroke()
+    }
+
+    /// 路由分叉：左边一个实心节点，一条线出来分成三路，各自停在一个空心小圆上
+    private static func openrouter() {
+        NSBezierPath(ovalIn: NSRect(x: -7.4, y: -2.2, width: 4.4, height: 4.4)).fill()
+        for y in [5.0, 0.0, -5.0] as [CGFloat] {
+            let p = NSBezierPath()
+            p.lineWidth = 1.7
+            p.lineCapStyle = .round
+            p.move(to: NSPoint(x: -3.4, y: 0))
+            p.curve(to: NSPoint(x: 3.6, y: y), controlPoint1: NSPoint(x: 0, y: 0), controlPoint2: NSPoint(x: 0, y: y))
+            p.stroke()
+            let dot = NSBezierPath(ovalIn: NSRect(x: 3.8, y: y - 1.6, width: 3.2, height: 3.2))
+            dot.lineWidth = 1.4
+            dot.stroke()
         }
     }
 

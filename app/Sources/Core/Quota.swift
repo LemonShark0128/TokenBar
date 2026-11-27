@@ -38,10 +38,11 @@ struct Quota: Equatable, Codable {
     var observedAt: Date
     /// 读数来自桌面 App 历史记录，属于推算。
     var estimated: Bool = false
+    var resetCredits: ResetCredits? = nil
 }
 
 extension Quota {
-    private enum CodingKeys: String, CodingKey { case plan, windows, observedAt, estimated }
+    private enum CodingKeys: String, CodingKey { case plan, windows, observedAt, estimated, resetCredits }
     /// 兼容没有推算标记的旧快照。
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -49,6 +50,7 @@ extension Quota {
         windows = try c.decode([QuotaWindow].self, forKey: .windows)
         observedAt = try c.decode(Date.self, forKey: .observedAt)
         estimated = try c.decodeIfPresent(Bool.self, forKey: .estimated) ?? false
+        resetCredits = try c.decodeIfPresent(ResetCredits.self, forKey: .resetCredits)
     }
 }
 
@@ -62,17 +64,32 @@ extension QuotaWindow {
     func effectiveUsed(at now: Date) -> Double {
         isReset(at: now) ? 0 : min(100, max(0, usedPercent))
     }
+
+    /// 用完：剩余向下取整为 0（界面写「剩 0%」）。面板、提醒、菜单栏、续航都用这一个判法
+    func isExhausted(at now: Date) -> Bool {
+        QuotaText.isExhausted(remaining: 100 - effectiveUsed(at: now))
+    }
 }
 
 extension Quota {
-    /// 界面读数：优先 5 小时窗口，再用每周窗口，最后取第一个窗口。
-    var displayWindow: QuotaWindow? {
-        windows.first { $0.kind == .session } ?? windows.first { $0.kind == .weekly } ?? windows.first
+    /// 5 小时 / 每周窗口里已用完的、恢复最晚的那个（两个都恢复才能再用）；都没用完为 nil。
+    /// 「本周（Opus）」这类单模型窗口用完时别的模型还能用，不算整个平台用完
+    func blockingWindow(at now: Date) -> QuotaWindow? {
+        let done = windows.filter { ($0.kind == .session || $0.kind == .weekly) && $0.isExhausted(at: now) }
+        guard !done.isEmpty else { return nil }
+        return done.filter { $0.resetsAt != nil }.max { $0.resetsAt! < $1.resetsAt! } ?? done.first { $0.kind == .session } ?? done[0]
+    }
+
+    /// 界面读数（表盘、标题、菜单栏）：5 小时或每周窗口用完时就是用完的那个（取最晚恢复的；
+    /// 11/6 用户定：每周用完、5 小时窗口还有余时不再写「剩 70%」）；否则优先 5 小时窗口，再用每周窗口，最后取第一个窗口。
+    func displayWindow(at now: Date) -> QuotaWindow? {
+        blockingWindow(at: now)
+            ?? windows.first { $0.kind == .session } ?? windows.first { $0.kind == .weekly } ?? windows.first
     }
 
     /// 显示口径的剩余百分比；已重置按剩余 100%。
     func displayRemainingPercent(at now: Date) -> Double? {
-        displayWindow.map { 100 - $0.effectiveUsed(at: now) }
+        displayWindow(at: now).map { 100 - $0.effectiveUsed(at: now) }
     }
 
     /// 预警口径的最紧窗口：剩余最少；剩余相同取数组里靠前的
@@ -95,11 +112,27 @@ extension Quota {
     }
 }
 
+extension QuotaWindow.Kind {
+    /// 存进采样库 quota_window 列的写法
+    var sampleKey: String {
+        switch self {
+        case .session: return "session"
+        case .weekly: return "weekly"
+        case .weeklyModel(let m): return "weeklyModel:\(m)"
+        }
+    }
+}
+
 enum QuotaActivity {
-    /// 近 1 小时额度已用百分点的涨幅。相邻两点只计正差值（负值是窗口重置，nil 的点跳过）
+    /// 近 1 小时额度已用百分点的涨幅。相邻两点只计正差值（负值是窗口重置，nil 的点跳过）。
+    /// 只用和最新一条同一窗口的采样：5 小时窗口没了退到每周窗口时，两个窗口的已用不能相减；
+    /// 没记窗口的老采样（升级前留下的）照旧参与
     static func risePP(_ samples: [Sample], now: Date) -> Double {
         let cutoff = now.addingTimeInterval(-3600)
-        let sorted = samples.sorted { $0.t < $1.t }
+        var sorted = samples.sorted { $0.t < $1.t }
+        if let current = sorted.last(where: { $0.quotaUsed != nil })?.quotaWindow {
+            sorted = sorted.filter { $0.quotaWindow == nil || $0.quotaWindow == current }
+        }
         let recent = sorted.filter { $0.t > cutoff }
         var pts = recent
         if let base = sorted.last(where: { $0.t <= cutoff }) { pts.insert(base, at: 0) }

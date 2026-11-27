@@ -280,4 +280,67 @@ func registerTokenChartTests() {
         try checkEqual(cost("硅基 · Qwen3"), "¥1.20")
         try checkEqual(cost("硅基 · bge-m3"), nil)
     }
+    // 中号卡折叠行「另 N 个模型」：「其他」按它那天实际包含的模型数算，不算成 1 个
+    test("chartModelCountExpandsOther") {
+        let models = ["m1": 900, "m2": 800, "m3": 700, "m4": 600, "m5": 50, "m6": 40, "m7": 30]
+        let c = TokenChart.build(main: .deepseek, mainDays: mainDays(models), others: [], todayISO: "2026-10-15")
+        let today = c.bars.count - 1
+        let items = c.legend(bar: today)
+        try checkEqual(items.count, 5)                       // 前 4 名 + 「其他」
+        try checkEqual(c.bars[today].otherModels, 3)
+        try checkEqual(c.modelCount(Array(items.suffix(2)), bar: today), 4)   // m4 + 其他(m5–m7)
+        try checkEqual(c.modelCount(Array(items.prefix(2)), bar: today), 2)
+    }
+    // 「另 N 个模型」点开：列出那天的每一个模型，「其他」拆成里面的真实模型（排在命名模型后面、按用量从多到少）
+    test("chartAllModelsExpandsOther") {
+        let models = ["m1": 900, "m2": 800, "m3": 700, "m4": 600, "m5": 40, "m6": 50, "m7": 30]
+        let c = TokenChart.build(main: .deepseek, mainDays: mainDays(models, yesterday: ["m1": 10, "m6": 5]),
+                                 others: [], todayISO: "2026-10-15")
+        let today = c.bars.count - 1
+        let rows = c.allModels(bar: today)
+        try checkEqual(rows.map(\.label), ["M1", "M2", "M3", "M4", "M6", "M5", "M7"])
+        try checkEqual(rows.map(\.tokens), [900, 800, 700, 600, 50, 40, 30])
+        try checkEqual(rows.map(\.series), [0, 1, 2, 3, 4, 4, 4])     // 其他里的模型用「其他」的颜色
+        try checkEqual(rows.reduce(0) { $0 + $1.tokens }, c.bars[today].total)
+        // 以前的某天：只列那天有用量的
+        let y = c.allModels(bar: today - 1)
+        try checkEqual(y.map(\.label), ["M1", "M6"])
+        try checkEqual(y.map(\.series), [0, 4])
+        try checkEqual(c.allModels(bar: 99).count, 0)
+    }
+    // 点开的列表里每个模型都写自己的花费：套餐写「套餐」，按量付费取账单金额，看不到的不写
+    test("chartAllModelsCosts") {
+        let claude = TokenSource(provider: .claudePlan, byDay: ["2026-10-15": [
+            "claude-opus-5-5": 5_000, "claude-sonnet-5-5": 4_000, "claude-haiku-5-5": 3_000, "claude-opus-4-7": 20]])
+        let sf = TokenSource(provider: .siliconflow, byDay: ["2026-10-15": ["Qwen/Qwen3": 30, "BAAI/bge-m3": 10]],
+                             costByDay: ["2026-10-15": ["Qwen/Qwen3": 0.25]], currency: "CNY")
+        let c = TokenChart.build(main: .deepseek, mainDays: mainDays(["deepseek-flash": 2_000]), others: [claude, sf],
+                                 todayISO: "2026-10-15", mainTodayCost: ["deepseek-flash": 1.5], mainCurrency: "CNY")
+        let rows = c.allModels(bar: c.bars.count - 1)
+        func cost(_ label: String) -> String?? { rows.first { $0.label == label }.map(\.cost) }
+        try checkEqual(rows.count, 7)
+        try checkEqual(cost("Claude · opus-5-5"), .some("套餐"))
+        try checkEqual(cost("DeepSeek · Flash"), .some("¥1.50"))
+        try checkEqual(cost("硅基 · Qwen3"), .some("¥0.25"))     // 在「其他」里也单独写
+        try checkEqual(cost("硅基 · bge-m3"), .some(nil))
+        try checkEqual(cost("Claude · opus-4-7"), .some("套餐"))
+        // 单平台全是套餐：每行不写「套餐」（标题写一次）
+        let plans = TokenChart.build(main: nil, mainDays: [], others: [claude], todayISO: "2026-10-15")
+        try check(plans.allModels(bar: plans.bars.count - 1).allSatisfy { $0.cost == nil })
+    }
+    // 以前的某天：「其他」里主平台模型的花费取那天明细的金额，不是今天的；单平台按量付费也逐行写金额
+    test("chartAllModelsPastDayCosts") {
+        func det(_ t: Int, _ c: Double) -> AppData.Day.Detail {
+            .init(tokens: t, costCny: c, cacheHit: 0, cacheMiss: t, output: 0, hitRate: 0)
+        }
+        let models = ["m1": 900, "m2": 800, "m3": 700, "m4": 600, "m5": 50]
+        var days = mainDays(models, yesterday: ["m1": 20, "m5": 10])
+        days[5].detail = ["m1": det(20, 0.2), "m5": det(10, 0.07)]
+        let c = TokenChart.build(main: .deepseek, mainDays: days, others: [], todayISO: "2026-10-15",
+                                 mainTodayCost: ["m1": 9, "m5": 3], mainCurrency: "CNY")
+        let y = c.allModels(bar: c.bars.count - 2)
+        try checkEqual(y.map(\.label), ["M1", "M5"])
+        try checkEqual(y.map(\.cost), ["¥0.20", "¥0.07"])
+        try checkEqual(c.allModels(bar: c.bars.count - 1).last?.cost, "¥3.00")
+    }
 }

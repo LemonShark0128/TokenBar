@@ -17,6 +17,15 @@ func registerSideOrderTests() {
         try checkEqual(SideOrder.score(nil), 0)
         try checkEqual(SideOrder.score(.quota(risePP: 10)), 2)
     }
+    test("sideOrderTieIgnoresFloatNoise") {
+        // 涨幅是两个百分比相减：30 − 1.4 算出的倍数是 5.720000000000001，比 ¥2.86/时（5.72）多出 1e-15，仍算同分按平台顺序
+        let rise = 30.0 - 1.4
+        let act: [ProviderID: Activity] = [.codexPlan: .quota(risePP: rise), .siliconflow: .money(perHourCny: Decimal(string: "2.86")!)]
+        try checkEqual(SideOrder.ranked([.codexPlan, .siliconflow], activity: act), [.siliconflow, .codexPlan])
+        // 真正的差距（0.01 个百分点）不被抹掉
+        let ahead: [ProviderID: Activity] = [.codexPlan: .quota(risePP: 28.61), .siliconflow: .money(perHourCny: Decimal(string: "2.86")!)]
+        try checkEqual(SideOrder.ranked([.siliconflow, .codexPlan], activity: ahead), [.codexPlan, .siliconflow])
+    }
     test("sideOrderReconcileKeepsFrozenOrder") {
         // 面板开着（或还没重新打开）：名次不变，只处理增减
         try checkEqual(SideOrder.reconcile([.codexPlan, .siliconflow], with: [.siliconflow, .codexPlan]),

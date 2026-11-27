@@ -1,12 +1,10 @@
 import AppKit
-import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 状态：界面读数（菜单栏信号、油量、套餐行、朗读）
 
 extension UsageModel {
-    /// 菜单栏图标的信号：低于预警线变橙、花费飙升加橙点、数据不新鲜整体变灰
+    /// 菜单栏图标的信号：low = 低于预警线（数字变橙）；spike = 花费飙升 / 辅助平台异常 / 主平台低于预警线（图标变橙）；dim = 数据不新鲜（整体变灰）
     var menuSignal: (low: Bool, spike: Bool, dim: Bool) {
         guard let d = data else { return (false, false, true) }
         // 任一辅助平台异常（凭据失效、连不上…）也让图标变橙，沿用「飙升」的橙色规则
@@ -48,12 +46,29 @@ extension UsageModel {
     typealias Freshness = FreshnessLevel
     var freshness: (Freshness, String) { StatusPresenter.freshness(statusInput) }
 
-    /// 油量表读数：可用余额 ÷ 满盘（0…1）
+    /// 「表盘满格金额」的币种：已添加的按量付费平台都是一种币就用它，混着为 nil（按 ¥）。
+    /// 真 App 看 store 里已添加的平台；离屏预览没有 store，看面板上的主平台和辅助平台
+    var gaugeScale: String? {
+        // 小组件里点开的单平台详情没有 store（被动模型）：跟小组件本身用同一个刻度
+        if let inherited = gaugeScaleFrom { return inherited() }
+        if let s = usageStore {
+            let added = Self.accountStates(AccountsInput(platforms: s.platforms, mainID: s.mainProvider, auto: true,
+                                                         settings: ProviderSettings())).added
+            return SettingsLayout.gaugeScaleCurrency(added: added, actual: SettingsLayout.balanceCurrencies(s.platforms))
+        }
+        guard let d = data else { return nil }
+        return SettingsLayout.scaleCurrency([d.balance.isQuota ? nil : d.balance.currency] + d.sides.map { $0.isQuota ? nil : $0.currency })
+    }
+
+    /// 换算刻度用的汇率（设置里的美元汇率，随数据一起来）
+    var gaugeRate: Double { data?.cardExchangeRate ?? 7.1 }
+
+    /// 油量表读数：可用余额（换成刻度币种）÷ 满盘（0…1）
     var fuelLevel: Double {
         guard let bal = data?.balance.cny, bal.isFinite else { return 0 }
-        // 套餐平台：输入保留剩余比例，表盘内部换算已用
+        // 套餐平台：输入和表盘均使用剩余比例
         if data?.balance.isQuota == true { return max(0, min(1, bal / 100)) }
-        return max(0, min(1, bal / max(1, fuelFullCny)))
+        return SettingsLayout.gaugeFraction(bal, currency: data?.balance.currency, full: fuelFullCny, scale: gaugeScale, usdToCny: gaugeRate)
     }
 
     /// 油量表的 VoiceOver 朗读
@@ -64,17 +79,18 @@ extension UsageModel {
         }
         if let runway = d.runway {
             return A11yText.gauge(provider: mainName, balanceCny: d.balance.cny, runwayDays: nil,
-                                  currency: d.balance.currency == "USD" ? .usd : .cny) + "，" + runway.title
+                                  currency: d.balance.currency == "USD" ? .usd : .cny,
+                                  keyLimit: d.mainCardSide?.tankIsKeyLimit == true) + "，" + runway.title
         }
         return A11yText.gauge(provider: mainName, balanceCny: d.balance.cny, runwayDays: d.burn?.runwayDays,
-                       currency: d.balance.currency == "USD" ? .usd : .cny)
+                       currency: d.balance.currency == "USD" ? .usd : .cny, keyLimit: d.mainCardSide?.tankIsKeyLimit == true)
     }
 
     /// 一行辅助平台 / 菜单栏平台的油量（0…1）
     func fuelLevel(of s: AppData.Side) -> Double {
         if s.isQuota { return s.quotaRemaining.map { max(0, min(1, $0 / 100)) } ?? 0 }
         guard let t = s.tank, t.isFinite else { return 0 }
-        return max(0, min(1, t / max(1, fuelFullCny)))
+        return SettingsLayout.gaugeFraction(t, currency: s.currency, full: fuelFullCny, scale: gaugeScale, usdToCny: gaugeRate)
     }
 
     /// 标题栏那颗点的套餐版：短写「12 分钟前」「刚刚」（完整的「最近一次使用」在油箱下方）；

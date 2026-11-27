@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 
 // ---------------------------------------------------------------- 首次引导
@@ -20,8 +19,14 @@ struct OnboardingPreview {
     var claudeDesktopAdded = false
     var claudeDesktopHasData = false
     var claudeDesktopViaCLI = false
+    /// 「用本机 Claude Code 查」结果页的情况（没装 / 没登录等）；nil 时按上面两项
+    var claudeCLIResult: ClaudeDesktopResult?
+    /// 「登录 claude.ai」已登录好
+    var claudeWebDone = false
     /// 已添加平台的连接状态（选平台页的勾选颜色）；不给时已添加的都算已连接
     var states: [ProviderID: AccountState]?
+    /// 管理页每行的读数（余额 / 剩余百分比）
+    var readings: [ProviderID: AccountReading]?
 }
 
 /// Claude 套餐安装相关的文案（引导页和重装弹窗共用）
@@ -43,6 +48,8 @@ struct OnboardingView: View {
     @State var menuBarConfirmed = false
     @State var connected: Set<ProviderID> = []
     @State var apiKey = ""
+    /// PackyAPI 的用户 ID（和访问令牌一起填；访问令牌借用 apiKey）
+    @State var userId = ""
     @State var message = ""
     @State var verified = false
     @State var busy = false
@@ -52,15 +59,23 @@ struct OnboardingView: View {
     /// Claude 套餐的来源：nil = 还没选（显示「选来源」页）；presetClaudeChoice 不为 nil 时跳过选择
     @State var claudeChoice: ClaudePlanSource?
     /// 「选来源」页当前点着的那一项（默认桌面 App）
-    @State var claudePick: ClaudePlanSource = .desktop
+    @State var claudePick: ClaudePlanSource = .web
     @State var claudeDesktopAdded = false
     @State var claudeDesktopHasData = false
     @State var claudeDesktopViaCLI = false
+    @State var claudeCLIResult: ClaudeDesktopResult?
+    @State var claudeWebDone = false
+    @State var claudeSessionInput = ""
     let presetClaudeChoice: ClaudePlanSource?
     /// 刚复制过的代码框内容（那个框的按钮显示「已复制」）
     @State var copiedBox: String?
     /// 在选平台页移除过平台：done 页不再用（异步还没更新的）needsSetup 判断有没有平台
     @State var removedSome = false
+    /// 老用户从「添加 / 移除平台」进来：选平台这一步画管理页。放在 @State 里、只在打开时定下：
+    /// 界面刷新会重跑 init，第一次引导中途连上第一个平台后不能突然变成管理页；移除光了也不变
+    @State var manageMode: Bool
+    /// 在管理页点了「添加」、正在走那一个平台的连接：办完回到管理页
+    @State var manageAdding = false
     let preview: OnboardingPreview?
 
     init(model: UsageModel, initialStep: OnboardingStep = .welcome, p: Palette, only: ProviderID? = nil,
@@ -73,10 +88,13 @@ struct OnboardingView: View {
         _claudeDesktopAdded = State(initialValue: preview?.claudeDesktopAdded ?? false)
         _claudeDesktopHasData = State(initialValue: preview?.claudeDesktopHasData ?? false)
         _claudeDesktopViaCLI = State(initialValue: preview?.claudeDesktopViaCLI ?? false)
+        _claudeCLIResult = State(initialValue: preview?.claudeCLIResult)
+        _claudeWebDone = State(initialValue: preview?.claudeWebDone ?? false)
         _step = State(initialValue: initialStep)
         // 只在第一次 init 时生效（@State 的初始值），之后的 init 读到的新值会被丢掉
         let added = preview?.added
             ?? Set(ProviderRegistry.all.filter { model.usageStore?.isAdded($0) == true })
+        _manageMode = State(initialValue: OnboardingPlan.showsManage(added: added, only: only))
         var flow = OnboardingFlow(added: added, only: only, picked: preview?.picked)
         if initialStep == .login { flow.startLogin(at: preview?.loginIndex ?? 0) }
         _flow = State(initialValue: flow)
@@ -106,7 +124,7 @@ struct OnboardingView: View {
         Group {
             switch step {
             case .welcome: welcome
-            case .pick: pick
+            case .pick: if manageMode { manage } else { pick }
             case .menubar: menubar
             case .login: login
             case .done: done
@@ -114,7 +132,8 @@ struct OnboardingView: View {
         }
         .frame(maxHeight: .infinity, alignment: .topLeading)
         .padding(.horizontal, 22).padding(.vertical, 16)
-        .frame(width: 420, height: 372, alignment: .topLeading)
+        // 508 → 556（11/24）：8 个平台时选平台页（两组 8 行）和管理页放得下底部按钮
+        .frame(width: 420, height: 556, alignment: .topLeading)
     }
 
     func title(_ t: String, _ sub: String) -> some View {
@@ -135,15 +154,18 @@ struct OnboardingView: View {
     // 流程推进 ---------------------------------------------------------
 
     func resetPlatform() {
-        apiKey = ""; message = ""; verified = false; busy = false
+        apiKey = ""; userId = ""; message = ""; verified = false; busy = false
         claudeSnippet = nil; claudeInstalled = false; copiedBox = nil
-        claudeChoice = presetClaudeChoice; claudePick = .desktop; claudeDesktopAdded = false; claudeDesktopHasData = false; claudeDesktopViaCLI = false
+        claudeChoice = presetClaudeChoice; claudePick = .web; claudeDesktopAdded = false; claudeDesktopHasData = false; claudeDesktopViaCLI = false
+        claudeCLIResult = nil; claudeWebDone = false; claudeSessionInput = ""
     }
 
     /// 当前平台办完（或跳过）：下一个平台，没有了就收尾
     func advance() {
         resetPlatform()
         if flow.advance() { step = .login; return }
+        // 从管理页点「添加」进来的：办完（或跳过）回到管理页，不动菜单栏设置
+        if manageAdding { manageAdding = false; step = .pick; return }
         // 「显示哪个平台」：只有走过这一步才生效。当前使用：打开自动；固定：它确实连上了才生效
         if menuBarConfirmed, let store = model.usageStore {
             if menuBarAuto {
@@ -169,30 +191,13 @@ struct OnboardingView: View {
         }
     }
 
-    static var pickDetail: [ProviderID: String] { [
-        .deepseek: L("ob.pick.deepseek"),
-        .siliconflow: L("ob.pick.siliconflow"),
-        .codexPlan: L("ob.pick.codex"),
-        .claudePlan: L("ob.pick.claude"),
-    ] }
-
     var pick: some View {
-        // 4 个平台：标题带一句说明，行距放松，填满同一高度的窗口
+        // 第一次打开：按量付费 / 套餐两组，每行一句短说明（窗口定高，英文也要放得下底部按钮）；老用户进来走管理页（manage）
+        // 不用 ScrollView：离屏预览画不出 ScrollView 的内容
         VStack(alignment: .leading, spacing: 12) {
             title(L("ob.pickTitle"), added.isEmpty ? L("ob.pickNote")
                                            : L("ob.pickNoteAdded"))
-            SettingsGroup(title: L("page.platform"), p: p) {
-                ForEach(Array(ProviderRegistry.all.enumerated()), id: \.element) { i, id in
-                    let isAdded = added.contains(id)
-                    let on = picked.contains(id)
-                    let st = pickState(id)
-                    pickRow(ProviderRegistry.displayName(id),
-                            isAdded ? OnboardingPlan.addedDetail(on: on, state: st) : (Self.pickDetail[id] ?? ""),
-                            check: OnboardingPlan.pickCheck(on: on, added: isAdded, state: st), first: i == 0) {
-                        if picked.contains(id) { picked.remove(id) } else { picked.insert(id) }
-                    }
-                }
-            }
+            pickGroups
             next(only == nil ? OnboardingPlan.pickButton(picked: picked, added: added) : L("ob.next")) {
                 // 取消勾选的已添加平台：先确认，确认后才移除；取消就留在这一页
                 let removing = only == nil ? OnboardingPlan.toRemove(picked: picked, added: added) : []
@@ -201,6 +206,9 @@ struct OnboardingView: View {
                     let failed = removing.filter { !model.performRemove($0) }
                     connected.subtract(removing.filter { !failed.contains($0) })
                     removedSome = removedSome || failed.count < removing.count
+                    // 移除的正好是固定显示的平台：UsageStore 会改回自动切换（异步，这里还读不到），
+                    // 页面里打开时读的「固定」也要跟着改，否则下一步会把回落的平台重新固定
+                    if !menuBarAuto, removing.contains(menuBar), !failed.contains(menuBar) { menuBarAuto = true }
                     // 没移除成功的（Claude 套餐还原不了状态栏设置）：勾回去、留在这一页，并说明原因
                     if !failed.isEmpty {
                         picked.formUnion(failed)
@@ -222,46 +230,26 @@ struct OnboardingView: View {
         return UsageModel.accountState(for: model.usageStore?.platforms.first { $0.id == id })
     }
 
-    /// 勾选框：已连接的平台绿勾、新勾的蓝勾、已添加但没连上的灰勾；已添加的可以取消勾选，取消等于移除
-    func pickRow(_ name: String, _ detail: String, check: OnboardingPlan.PickCheck, first: Bool = false,
-                         toggle: @escaping () -> Void) -> some View {
-        let on = check != .off
-        return VStack(spacing: 0) {
-            if !first { Hairline(p: p).padding(.leading, 12) }
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: on ? "checkmark.square.fill" : "square")
-                    .foregroundColor(check == .connected ? Accent.green : (check == .new ? Accent.blue : p.sub))
-                    .font(.system(size: 14))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(name).font(.system(size: 12.5, weight: .medium)).foregroundColor(p.text)
-                    Text(detail).font(.system(size: 11)).foregroundColor(p.sub).fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 12).padding(.vertical, 7)
-            .contentShape(Rectangle())
-            .onTapGesture { toggle() }
-            .accessibilityElement(children: .combine)
-            .accessibilityAddTraits(on ? .isSelected : [])
-        }
-    }
-
     var menubar: some View {
         VStack(alignment: .leading, spacing: 12) {
             title(L("set.showWhich"), L("ob.showWhichNote"))
             SettingsGroup(title: L("set.showWhich"), p: p) {
-                SettingsRow(label: L("ob.currentUseRec"), first: true, p: p) {
-                    if menuBarAuto { Image(systemName: "checkmark").foregroundColor(Accent.blue) }
-                }
-                .contentShape(Rectangle())
-                .onTapGesture { menuBarAuto = true }
-                .accessibilityAddTraits(menuBarAuto ? .isSelected : [])
-                ForEach(allPicked, id: \.self) { id in
-                    SettingsRow(label: ProviderRegistry.displayName(id), p: p) {
-                        if !menuBarAuto && chosenMenuBar == id { Image(systemName: "checkmark").foregroundColor(Accent.blue) }
+                Button { menuBarAuto = true } label: {
+                    SettingsRow(label: L("ob.currentUseRec"), first: true, p: p) {
+                        if menuBarAuto { Image(systemName: "checkmark").foregroundColor(Accent.blue).accessibilityHidden(true) }
                     }
                     .contentShape(Rectangle())
-                    .onTapGesture { menuBarAuto = false; menuBar = id }
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(menuBarAuto ? .isSelected : [])
+                ForEach(allPicked, id: \.self) { id in
+                    Button { menuBarAuto = false; menuBar = id } label: {
+                        SettingsRow(label: ProviderRegistry.displayName(id), p: p) {
+                            if !menuBarAuto && chosenMenuBar == id { Image(systemName: "checkmark").foregroundColor(Accent.blue).accessibilityHidden(true) }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                     .accessibilityAddTraits(!menuBarAuto && chosenMenuBar == id ? .isSelected : [])
                 }
             }
@@ -274,7 +262,10 @@ struct OnboardingView: View {
         case nil: Color.clear.onAppear { advance() }   // 队列已空：走 advance 收尾（含菜单栏写回），不在登录步骤里画完成页
         case .deepseek: loginDeepSeek
         case .siliconflow: loginSiliconFlow
-        case .codexPlan: loginPlan
+        case .kimi: loginKimi
+        case .openrouter: loginOpenRouter
+        case .packyapi: loginPackyAPI
+        case .codexPlan, .geminiPlan: loginPlan
         case .claudePlan: loginClaudePlan
         }
     }

@@ -41,10 +41,54 @@ enum OnboardingPlan {
     }
 
     /// 已添加平台那一行的副标题
-    static func addedDetail(on: Bool, state: AccountState?) -> String {
+    static func addedDetail(on: Bool, state: AccountState?, id: ProviderID) -> String {
         guard on else { return L("ob.addedUncheckToRemove") }
         if pickCheck(on: true, added: true, state: state) == .connected { return L("ob.connected") }
-        return L("ob.addedState", (state ?? .offline).label)
+        return L("ob.addedState", (state ?? .offline).label(for: id))
+    }
+
+    // 「添加 / 移除平台」管理页（用户 11/6 选 proposal-pick-redesign 乙）------------------------------
+
+    /// 老用户（已有平台）从面板「添加 / 移除平台」进来看管理页；第一次打开、或从设置添加某一个平台时不看
+    static func showsManage(added: Set<ProviderID>, only: ProviderID?) -> Bool { only == nil && !added.isEmpty }
+
+    /// 管理页的两组：已添加的、还能添加的，都按界面顺序
+    static func manageLists(added: Set<ProviderID>) -> (added: [ProviderID], addable: [ProviderID]) {
+        (ProviderRegistry.all.filter { added.contains($0) }, ProviderRegistry.all.filter { !added.contains($0) })
+    }
+
+    /// 已添加平台那一行的状态：连上了写「已连接 · 余额 ¥5.35」，没连上写「已添加 · 登录已过期」并标成要处理
+    static func addedStatus(_ id: ProviderID, state: AccountState?, reading: AccountReading?) -> (text: String, warn: Bool) {
+        if state == .hidden { return (AccountState.hidden.label, false) }
+        let warn = (state ?? .offline).tone == .warn
+        guard pickCheck(on: true, added: true, state: state) == .connected else {
+            return (L("ob.addedState", (state ?? .offline).label(for: id)), warn)
+        }
+        return (reading.map { L("ob.connectedWith", $0.text) } ?? L("ob.connected"), warn)
+    }
+
+    /// 今天页底部「已隐藏：Kimi、硅基流动」（按界面顺序）
+    static func hiddenLine(_ ids: [ProviderID]) -> String {
+        L("today.hiddenLine", ProviderRegistry.all.filter { ids.contains($0) }.map(ProviderRegistry.displayName).joined(separator: L("common.listSep")))
+    }
+
+    /// 「添加 / 移除平台」右边的「已隐藏 2」（用户 11/6 选 proposal-hidden-bottom 丁：不占新行，点开小弹窗逐个显示）
+    static func hiddenMenuTitle(_ ids: [ProviderID]) -> String { L("today.hiddenCount", ids.count) }
+    /// 读屏：「已隐藏 2 个平台：硅基流动、Kimi」
+    static func hiddenMenuA11y(_ ids: [ProviderID]) -> String {
+        L("today.hiddenCountA11y", ids.count,
+          ProviderRegistry.all.filter { ids.contains($0) }.map(ProviderRegistry.displayName).joined(separator: L("common.listSep")))
+    }
+    /// 弹窗底部「全部显示」：隐藏了两个以上才有（只有一个时和那一行的「显示」重复）
+    static func showsShowAll(_ ids: [ProviderID]) -> Bool { ids.count >= 2 }
+
+    /// 管理页「可添加」一行的短说明：怎么连 · 能看到什么（一行写完）
+    static func shortGain(_ id: ProviderID) -> String { L("ob.gain.\(id.rawValue)") }
+
+    /// 选平台页的分组：按量付费看余额、套餐看额度
+    static var groups: [(title: String, ids: [ProviderID])] {
+        [(L("ob.groupPayg"), ProviderRegistry.all.filter { ProviderRegistry.meter($0) == .money }),
+         (L("ob.groupPlan"), ProviderRegistry.all.filter { ProviderRegistry.meter($0) == .quota })]
     }
 
     /// 移除一个平台时确认框里的说明（设置里的「移除」和选平台页共用）。
@@ -54,6 +98,7 @@ enum OnboardingPlan {
             return L("remove.detail.claudeDesktop")
         }
         if id == .claudePlan { return L("remove.detail.claudeTerminal") }
+        if id == .geminiPlan { return L("remove.detail.gemini") }
         if ProviderRegistry.meter(id) == .quota { return L("remove.detail.quota") }
         return L("remove.detail.payg")
     }

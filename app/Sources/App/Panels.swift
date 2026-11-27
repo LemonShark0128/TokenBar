@@ -1,13 +1,33 @@
 import AppKit
-import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 面板 / 小组件
 
 struct PanelView: View {
     @ObservedObject var model: UsageModel
     let p: Palette
+    var body: some View {
+        if let detail = model.panelDetailModel, model.panelHome != "single" {
+            PanelContentView(model: detail, p: p, owner: model)
+        } else {
+            PanelContentView(model: model, p: p)
+        }
+    }
+}
+
+struct PanelContentView: View {
+    @ObservedObject var model: UsageModel
+    let p: Palette
+    var owner: UsageModel? = nil
+    private var actions: UsageModel { owner ?? model }
+    private var today: Bool {
+        owner == nil && TodayCards.showsHome(preference: model.panelHome, platformCount: (model.todayData?.sides.count ?? 0) + 1)
+    }
+    /// 今天首页和详情页里点别的平台只打开它的详情，不改正在显示的平台（用户 11-05）；单平台经典面板仍是固定显示它
+    private var sideOpensDetail: Bool { today || owner != nil }
+    private func openSide(_ id: ProviderID) {
+        if sideOpensDetail { actions.showPanelDetail(id) } else { model.usageStore?.pinMain(id) }
+    }
     @Namespace private var switchNS
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -16,7 +36,12 @@ struct PanelView: View {
         let mainMatch = SwitchMatch(provider: model.mainID, ns: switchNS, style: style)
         VStack(alignment: .leading, spacing: PanelLayout.sectionGap) {
             HStack(spacing: 8) {
-                Text(model.mainName).font(.system(size: 13, weight: .semibold)).foregroundColor(p.text)
+                if let owner {
+                    Button(L("today.back")) { owner.showTodayHome() }
+                        .buttonStyle(.plain).font(.system(size: 12)).foregroundColor(Accent.blue)
+                }
+                // 平台全隐藏了：没有在显示的平台，标题写「今天」，不写某个被隐藏的平台名
+                Text(today || (model.needsSetup && !actions.hiddenIDs.isEmpty) ? L("today.title") : model.mainName).font(.system(size: 13, weight: .semibold)).foregroundColor(p.text)
                     .switchGeometry(mainMatch, "name")
                 FreshDot(model: model, p: p)
                 // 正在轮流：一排小圆点，当前那个实心（用户 10-19：让人知道面板为什么会自己换）
@@ -46,20 +71,24 @@ struct PanelView: View {
                     .accessibilityHint(L("panel.unpinHint"))
                 }
                 Spacer()
+                if today {
+                    Button(L(model.todayEditing ? "today.done" : "today.edit")) { model.todayEditing.toggle() }
+                        .buttonStyle(.plain).font(.system(size: 11)).foregroundColor(p.sub)
+                }
                 HStack(spacing: 14) {
-                    Button { model.fetch() } label: { Image(systemName: "arrow.clockwise") }
+                    Button { actions.fetch(resetSlowdown: true) } label: { Image(systemName: "arrow.clockwise") }
                         .help(L("panel.refreshNow"))
                         .accessibilityLabel(L("panel.refreshNow"))
                     Button {
-                        model.onClosePanel?()
-                        if !model.widgetVisible { model.toggleWidget() }
+                        actions.onClosePanel?()
+                        if !actions.widgetVisible { actions.toggleWidget() }
                     } label: { Image(systemName: "pip.exit") }
                         .help(L("panel.popOutHelp"))
                         .accessibilityLabel(L("panel.popOut"))
-                    Button { model.openSettings() } label: { Image(systemName: "gearshape") }
+                    Button { actions.openSettings() } label: { Image(systemName: "gearshape") }
                         .help(L("panel.settingsHelp"))
                         .accessibilityLabel(L("panel.settings"))
-                    Button { model.onClosePanel?() } label: { Image(systemName: "xmark") }
+                    Button { actions.onClosePanel?() } label: { Image(systemName: "xmark") }
                         .help(L("panel.closeHelp"))
                         .accessibilityLabel(L("panel.close"))
                         .accessibilityHint(L("panel.closeHint"))
@@ -72,13 +101,13 @@ struct PanelView: View {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(riskTint(banner.severity, ok: Accent.orange))
                         .accessibilityHidden(true)
-                    // 「预计可用时间：X，下次重置：HH:mm」一行放不下：最多折两行，不截断
+                    // 按量付费余额预警（套餐平台 2026-11-06 起不出横幅）；窄时最多折两行，不截断
                     Text(banner.text).font(.system(size: 12)).foregroundColor(p.text)
                         .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                         .accessibilityLabel(L("panel.alertA11y", A11yText.speak(banner.text)))
                     Spacer(minLength: 0)
                     Button(L("panel.view")) {
-                        if let id = ProviderID(rawValue: banner.id) { model.usageStore?.pinMain(id) }
+                        if let id = ProviderID(rawValue: banner.id) { openSide(id) }
                     }.buttonStyle(.plain).font(.system(size: 12)).foregroundColor(Accent.blue).fixedSize()
                     .accessibilityLabel(L("panel.viewA11y"))
                     .accessibilityHint(L("panel.viewHint"))
@@ -93,6 +122,25 @@ struct PanelView: View {
                 .transition(.opacity)
             }
 
+            // 读不到钥匙串（11/6 用户定 proposal-keychain-error-ui 乙）：不说「登录失效」；被拒绝时给「重试」，锁着时自动恢复
+            if let kc = model.keychainBanner {
+                HStack(spacing: 8) {
+                    Image(systemName: "key.fill").foregroundColor(Accent.orange).accessibilityHidden(true)
+                    Text(kc.text).font(.system(size: 12)).foregroundColor(p.text)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                        .accessibilityLabel(L("panel.alertA11y", A11yText.speak(kc.text)))
+                    Spacer(minLength: 0)
+                    if kc.canRetry {
+                        Button(L("panel.retry")) { actions.retryKeychain() }
+                            .buttonStyle(.plain).font(.system(size: 12)).foregroundColor(Accent.blue).fixedSize()
+                            .accessibilityHint(L("kc.retryHint"))
+                    }
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Accent.orange.opacity(0.14)))
+            }
+
+            // 切换提示（只剩按量付费平台「余额在减少」；套餐平台的提示行 2026-11-06 起不再显示，面板高度不再跳）
             if let notice = model.switchNotice {
                 Text(notice).font(.system(size: 11.5)).foregroundColor(p.sub)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -100,39 +148,56 @@ struct PanelView: View {
                     .transition(.opacity)
             }
 
-            if let d = model.data, d.balance.isQuota {
-                // 套餐平台：表盘是已用百分比，金额区块换成窗口列表
+            if today, let d = model.todayData {
+                TodayGrid(model: model, d: d, p: p)
+                Hairline(p: p)
+                HStack(spacing: 8) {
+                    Button { actions.openOnboarding(at: .pick) } label: {
+                        Label(PanelLayout.addRemoveTitle, systemImage: "plus.circle")
+                            .font(.system(size: 12)).foregroundColor(Accent.blue)
+                    }.buttonStyle(.plain)
+                    Spacer(minLength: 8)
+                    HiddenPlatformsButton(ids: actions.hiddenIDs, p: p, onShow: showHiddenOrAll)
+                }
+            } else if let d = model.data, d.balance.isQuota {
+                // 套餐平台：表盘是剩余百分比，金额区块换成窗口列表
                 QuotaMain(model: model, d: d, p: p, match: mainMatch)
                 sidesAndAdd(d, style: style)
             } else if let d = model.data {
-                let (cap, spike) = burnCaption(d, fuelFull: model.fuelFullCny)
+                let (cap, spike) = burnCaption(d, fuelFull: model.fuelFullCny, fullSymbol: currencySymbol(model.gaugeScale))
+                let sourceTag = costSourceTag(d.today.source)
                 FuelGauge(level: model.fuelLevel, balance: fmtMoney(d.balance.cny, d.balance.currency), caption: cap,
                           captionColor: spike ? Accent.orange : nil, chip: d.runway,
                           p: p,
-                          a11yLabel: model.gaugeA11y(d), match: mainMatch)
+                          a11yLabel: model.gaugeA11y(d), match: mainMatch,
+                          overline: d.mainCardSide?.tankIsKeyLimit == true ? L("gauge.keyLimitOverline") : nil)
                     .frame(maxWidth: .infinity)
-                if costSourceTag(d.today.source) == "离线" {
+                if sourceTag == "离线" {
                     // 冷启动断网：只有最后一次采样的余额，花费一概不显示（不是 ¥0.00）
                     LT("panel.offlineNote", model.mainName)
                         .font(.system(size: 11.5)).foregroundColor(p.sub).fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityLabel(A11yText.offline(provider: model.mainName) + L("panel.offlineA11ySuffix"))
-                } else if costSourceTag(d.today.source) == "余额" {
+                } else if sourceTag == "余额" {
                     // 没登录控制台：花费看不到，不能写成 ¥0.00（看不到 ≠ 没花）
                     BalanceOnlyCallout(name: model.mainName, expired: model.mainState?.status == .consoleLoginNeeded,
                                        problem: model.mainState?.snapshot?.consoleProblem, p: p) {
                         model.openConsoleLogin()
                     }
                 } else {
+                    // 按余额变化估算（Kimi）、只给花费金额（OpenRouter）：没有 token 和模型明细，只写今日 / 本月，不画 token 柱图
+                    let estimate = !BalanceEstimatePresentation.mainHasTokenDetail(d)
                     VStack(alignment: .leading, spacing: 6) {
                         StatRow(items: [(L("panel.today"), fmtMoney(d.today.costCny, d.balance.currency)),
-                                        (L("panel.month"), fmtMoney(d.month.costCny, d.balance.currency)),
-                                        (L("panel.cacheHit"), overallHitRate(d.models))], p: p)
-                            .help(costSourceTag(d.today.source) == "账单" ? L("panel.billHelp") : "")
+                                        (L("panel.month"), fmtMoney(d.month.costCny, d.balance.currency))]
+                                        + (estimate ? [] : [(L("panel.cacheHit"), overallHitRate(d.models))]), p: p)
+                            .help(sourceTag == "账单" ? L("panel.billHelp") : "")
                         SourceTag(source: d.today.source, p: p)
                     }
-                    TrendStrip(chart: d.tokenChart(main: model.mainID), days: d.trend7, onPick: { model.openDetail($0) },
-                               p: p, incomplete: d.trendIncomplete, picked: model.trendPick, onSelect: model.pickTrendDay)
+                    if !estimate {
+                        TrendStrip(chart: d.tokenChart(main: model.mainID), days: d.trend7, onPick: { model.openDetail($0) },
+                                   p: p, incomplete: d.trendIncomplete, picked: model.trendPick, onSelect: model.pickTrendDay)
+                    }
                 }
                 sidesAndAdd(d, style: style)
                 if !d.models.isEmpty {        // 只有余额时没有明细可看，整行不显示
@@ -156,21 +221,32 @@ struct PanelView: View {
                         TokenDetailCard(models: d.models, picked: $model.selectedModel, p: p)
                     }
                 }
+            } else if model.needsSetup, !actions.hiddenIDs.isEmpty {
+                // 添加过平台、但全都隐藏了：不是「还没添加」，给显示回来的入口
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(L("today.allHidden")).font(.system(size: 13, weight: .semibold)).foregroundColor(p.text)
+                    HiddenPlatformsLine(ids: actions.hiddenIDs, p: p, onShow: showHidden)
+                }
+                .padding(.vertical, 20)
             } else if model.needsSetup {
                 VStack(alignment: .leading, spacing: 8) {
                     LT("panel.addFirst").font(.system(size: 13, weight: .semibold)).foregroundColor(p.text)
                     LT("panel.addFirstNote")
                         .font(.system(size: 11.5)).foregroundColor(p.sub).fixedSize(horizontal: false, vertical: true)
-                    Button(L("panel.addPlatform")) { model.openOnboarding(at: .pick) }
+                    Button(L("panel.addPlatform")) { actions.openOnboarding(at: .pick) }
                         .buttonStyle(.plain).font(.system(size: 12)).foregroundColor(Accent.blue)
                 }
                 .padding(.vertical, 20)
             } else {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(StatusPresenter.offlineTitle(model.mainID)).font(.system(size: 13, weight: .semibold)).foregroundColor(p.text)
+                    let keychain: Bool = { if case .keychainUnreadable? = model.mainState?.status { return true }; return false }()
+                    Text(keychain ? L("kc.unreadableShort") : StatusPresenter.offlineTitle(model.mainID)).font(.system(size: 13, weight: .semibold)).foregroundColor(p.text)
                     Text(model.error ?? (ProviderRegistry.meter(model.mainID) == .quota ? L("panel.retryLater") : L("panel.checkNetwork"))).font(.system(size: 11.5)).foregroundColor(p.warnText)
-                    Button(L("panel.retry")) { model.fetch() }
-                        .buttonStyle(.plain).font(.system(size: 12)).foregroundColor(Accent.blue)
+                    // 读不到钥匙串时「重试」在顶部横幅里（锁着时不给），这里不重复；其余照旧刷新
+                    if !keychain {
+                        Button(L("panel.retry")) { actions.fetch(resetSlowdown: true) }
+                            .buttonStyle(.plain).font(.system(size: 12)).foregroundColor(Accent.blue)
+                    }
                 }
                 .padding(.vertical, 20)
             }
@@ -205,28 +281,38 @@ struct PanelView: View {
                     }
                 }
                 ForEach(d.sides) { sd in
-                    Button { if let id = ProviderID(rawValue: sd.id) { model.usageStore?.pinMain(id) } } label: {
+                    Button { if let id = ProviderID(rawValue: sd.id) { openSide(id) } } label: {
                         SideRow(side: sd, level: model.fuelLevel(of: sd), p: p,
                                 match: ProviderID(rawValue: sd.id).map { SwitchMatch(provider: $0, ns: switchNS, style: style) })
                     }.buttonStyle(.plain)
-                    .help(L("panel.clickToPin"))
-                    .accessibilityHint(L("action.pinIt"))
+                    .help(L(sideOpensDetail ? "panel.clickToView" : "panel.clickToPin"))
+                    .accessibilityHint(L(sideOpensDetail ? "panel.viewDetailHint" : "action.pinIt"))
                 }
             }
         }
         Hairline(p: p)
-        Button { model.openOnboarding(at: .pick) } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "plus.circle").font(.system(size: 13)).accessibilityHidden(true)
-                Text(PanelLayout.addRemoveTitle).font(.system(size: 12))
-                Spacer()
-            }
-            .foregroundColor(Accent.blue).contentShape(Rectangle())
-        }.buttonStyle(.plain)
+        HStack(spacing: 8) {
+            Button { actions.openOnboarding(at: .pick) } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "plus.circle").font(.system(size: 13)).accessibilityHidden(true)
+                    Text(PanelLayout.addRemoveTitle).font(.system(size: 12))
+                    Spacer()
+                }
+                .foregroundColor(Accent.blue).contentShape(Rectangle())
+            }.buttonStyle(.plain)
+            HiddenPlatformsButton(ids: actions.hiddenIDs, p: p, onShow: showHiddenOrAll)
+        }
+    }
+
+    /// 「显示」：这个平台显示回来、马上取一次数
+    private func showHidden(_ id: ProviderID) { actions.setPlatformHidden(id, false) }
+    /// 弹窗里的「显示」/「全部显示」（nil）
+    private func showHiddenOrAll(_ id: ProviderID?) {
+        for h in id.map({ [$0] }) ?? actions.hiddenIDs { showHidden(h) }
     }
 }
 
-/// 套餐平台作主平台的主区：表盘读已用百分比（最紧的窗口），下面是另一个窗口、窗口列表和最近一次使用。
+/// 套餐平台作主平台的主区：表盘读剩余百分比（最紧的窗口），下面是另一个窗口、窗口列表和最近一次使用。
 /// 还没有额度数据时只写一句说明，不画 0%
 struct QuotaMain: View {
     @ObservedObject var model: UsageModel
@@ -235,11 +321,14 @@ struct QuotaMain: View {
     var match: SwitchMatch? = nil
     var body: some View {
         if let q = d.quota, let r = q.remainingPercent {
-            FuelGauge(level: model.fuelLevel, balance: q.exhausted?.gaugeValue ?? L("panel.used", quotaUsedPercent(remaining: r)), caption: q.headline ?? "", chip: d.runway, p: p,
+            FuelGauge(level: model.fuelLevel, balance: q.exhausted?.gaugeValue ?? quotaLeftText(r), caption: q.headline ?? "", chip: d.runway, p: p,
                       a11yLabel: model.gaugeA11y(d), match: match, dimmed: q.stale, quota: true, overline: q.exhausted?.gaugeOverline)
                 .frame(maxWidth: .infinity)
             hookGone
             QuotaWindowList(rows: q.rows, p: p, dimmed: q.stale)
+            if let resets = q.resetCredits {
+                Text(resets).font(.system(size: 11)).foregroundColor(p.sub).lineLimit(1)
+            }
             if let note = q.staleNote {
                 Text(note).font(.system(size: 11, weight: .semibold)).foregroundColor(p.warnText)
             }
@@ -295,24 +384,58 @@ func overallHitRate(_ ms: [AppData.ModelUse]) -> String {
     return all > 0 ? String(format: "%.1f%%", Double(hit) * 100 / Double(all)) : "—"
 }
 
-/// 小组件（精简）：两页 —— 余额（油量表 + 今日/本月）和今日 Token，在标题行点切换。
-/// 两页同高，切换时窗口不跳；记住上次看的那一页。
+/// Only the overview grows beyond four platforms; peek navigation is transient.
 struct WidgetView: View {
     @ObservedObject var model: UsageModel
-    static let pageHeight: CGFloat = 222
+    static let pageHeight: CGFloat = 244
+
+    var body: some View {
+        Group {
+            if let detail = model.widgetDetailModel {
+                WidgetContentView(model: detail, owner: model)
+            } else {
+                WidgetContentView(model: model)
+            }
+        }
+        .onChange(of: model.widgetPage) { refit() }
+        .onChange(of: model.widgetDetailPlatform) { refit() }
+        .onChange(of: model.todayData?.sides.count) { refit() }
+        .onChange(of: model.mainID) { refit() }
+    }
+
+    private func refit() {
+        DispatchQueue.main.async { Hud.refit("widget") }
+    }
+}
+
+/// Balance / tokens retain a fixed height; larger overviews use the grid's natural height.
+struct WidgetContentView: View {
+    @ObservedObject var model: UsageModel
+    // 套餐页最后一行下方预留约 16pt，外层另加 12pt 底部内边距。
+    var owner: UsageModel? = nil
+    private var actions: UsageModel { owner ?? model }
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let p = Palette.of(model.dark)
-        // 套餐平台没有 token 数据：不显示「余额 / Token」切换，始终是余额页
+        let p = Palette.of(actions.dark)
+        // 套餐平台没有 token 页；单平台隐藏切换，多平台仍可切到总览
         let isPlan = ProviderRegistry.meter(model.mainID) == .quota
+        let count = (model.todayData?.sides.count ?? 0) + 1
+        let navigation = TodayCards.widgetNavigation(isPlan: isPlan, platformCount: count,
+                                                    saved: model.widgetPage.isEmpty ? nil : model.widgetPage)
+        let page = owner == nil ? navigation.selected : "balance"
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
+                if let owner {
+                    Button("‹ " + L("today.overview")) { owner.showWidgetOverview() }
+                        .buttonStyle(.plain).font(.system(size: 11)).foregroundColor(Accent.blue)
+                }
                 // 多平台时点后面写当前主平台（新鲜度挪到悬停提示里），切换主平台后看得出是哪个；
                 // 点平台名弹出平台列表，选中即设为主平台（与面板里点辅助行相同）
                 let title = AppDataMapping.widgetTitle(mainName: model.mainName, otherCount: model.data?.sides.count ?? 0)
-                if title != nil {
-                    Button { popUpPlatformMenu(model) } label: {
+                // 「看一眼」时标题不可点：那里的平台菜单是「固定显示」，和正在看的平台对不上
+                if title != nil, owner == nil {
+                    Button { popUpPlatformMenu(actions) } label: {
                         HStack(spacing: 3) {
                             FreshDot(model: model, p: p, title: title)
                             Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold)).foregroundColor(p.sub)
@@ -322,28 +445,37 @@ struct WidgetView: View {
                     .buttonStyle(.plain)
                     .accessibilityHint(L("panel.pickToPin"))
                 } else {
-                    FreshDot(model: model, p: p, title: nil)
+                    FreshDot(model: model, p: p, title: owner == nil ? nil : title)
                 }
                 Spacer()
                 // 隐藏但占位：表盘位置和按量付费平台一致
-                SegmentPicker(items: [("balance", L("widget.balance")), ("tokens", "Token")], selected: model.widgetPage, p: p) {
+                if count < 2 && owner == nil {
+                SegmentPicker(items: navigation.items, selected: page, p: p) {
                     model.widgetPage = $0
                 }
                 .fixedSize()        // 多平台标题行放不下时挤的是状态文字，不是切换器
                 .opacity(isPlan ? 0 : 1).allowsHitTesting(!isPlan).accessibilityHidden(isPlan)
-                Button { model.fetch() } label: { Image(systemName: "arrow.clockwise") }
+                }
+                Button { actions.fetch(resetSlowdown: true) } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.plain).font(.system(size: 11.5, weight: .medium)).foregroundColor(p.sub)
                     .help(L("panel.refreshNow"))
                     .accessibilityLabel(L("panel.refreshNow"))
                 // 和面板里的「弹出成小组件」成对：收起小组件、回到面板
-                Button { model.returnToPanel() } label: { Image(systemName: "pip.enter") }
+                Button { actions.returnToPanel() } label: { Image(systemName: "pip.enter") }
                     .buttonStyle(.plain).font(.system(size: 11.5, weight: .medium)).foregroundColor(p.sub)
                     .help(L("widget.backToPanel"))
                     .accessibilityLabel(L("widget.backToPanel"))
             }
+            if count >= 2 && owner == nil {
+                SegmentPicker(items: navigation.items, selected: page, p: p) {
+                    model.widgetPage = $0
+                }
+            }
             Group {
-                if let d = model.data {
-                    if model.widgetPage == "tokens" && !isPlan {
+                if page == "overview", count >= 2, let d = model.todayData {
+                    WidgetOverview(model: model, d: d, p: p)
+                } else if let d = model.data {
+                    if page == "tokens" && !isPlan {
                         if d.models.isEmpty && model.mainID != .deepseek {
                             // 该平台没有按模型的明细；DeepSeek 登录控制台后才有明细，保持原来的 Token 页
                             LT("widget.noModelDetails").font(.system(size: 11.5)).foregroundColor(p.sub)
@@ -360,10 +492,10 @@ struct WidgetView: View {
                         }
                         }
                     } else if d.balance.isQuota {
-                        // 套餐平台：表盘写已用百分比，说明是最紧窗口的重置时间
+                        // 套餐平台：表盘写剩余百分比，说明是最紧窗口的重置时间
                         VStack(alignment: .leading, spacing: 8) {
                             if let q = d.quota, let r = q.remainingPercent {
-                                FuelGauge(level: model.fuelLevel, balance: q.exhausted?.gaugeValue ?? L("panel.used", quotaUsedPercent(remaining: r)), caption: d.runway?.short ?? q.headlineCompact ?? q.headline ?? "",
+                                FuelGauge(level: model.fuelLevel, balance: q.exhausted?.gaugeValue ?? quotaLeftText(r), caption: d.runway?.short ?? q.headlineCompact ?? q.headline ?? "",
                                           diameter: 172, big: 27, p: p, a11yLabel: model.gaugeA11y(d), dimmed: q.stale, quota: true, overline: q.exhausted?.gaugeOverline)
                                     .frame(maxWidth: .infinity)
                                 QuotaStatRow(rows: Array(q.rows.prefix(2)), p: p, dimmed: q.stale)
@@ -381,10 +513,11 @@ struct WidgetView: View {
                                     ? .opacity : .scale(scale: 0.96).combined(with: .opacity))
                     } else {
                         VStack(alignment: .leading, spacing: 8) {
-                            let (cap, spike) = burnCaption(d, fuelFull: model.fuelFullCny)
+                            let (cap, spike) = burnCaption(d, fuelFull: model.fuelFullCny, fullSymbol: currencySymbol(model.gaugeScale))
                             FuelGauge(level: model.fuelLevel, balance: fmtMoney(d.balance.cny, d.balance.currency), caption: d.runway?.short ?? cap,
                                       captionColor: spike ? Accent.orange : nil,
-                                      diameter: 172, big: 27, p: p, a11yLabel: model.gaugeA11y(d))
+                                      diameter: 172, big: 27, p: p, a11yLabel: model.gaugeA11y(d),
+                                      overline: d.mainCardSide?.tankIsKeyLimit == true ? L("gauge.keyLimitOverline") : nil)
                                 .frame(maxWidth: .infinity)
                             if costSourceTag(d.today.source) == "余额" {
                                 SourceTag(source: d.today.source, p: p)
@@ -400,10 +533,10 @@ struct WidgetView: View {
                                     ? .opacity : .scale(scale: 0.96).combined(with: .opacity))
                     }
                 } else {
-                    Text(model.error ?? (model.needsSetup ? L("a11y.noPlatforms") : L("status.connecting", model.mainName))).font(.system(size: 11.5)).foregroundColor(p.sub)
+                    Text(model.error ?? (model.needsSetup ? A11yText.noPlatforms(allHidden: !model.hiddenIDs.isEmpty) : L("status.connecting", model.mainName))).font(.system(size: 11.5)).foregroundColor(p.sub)
                 }
             }
-            .frame(height: WidgetView.pageHeight, alignment: .top)
+            .frame(height: page == "overview" && count > 4 ? nil : WidgetView.pageHeight, alignment: .top)
             .animation(reduceMotion ? .easeInOut(duration: 0.25)
                        : .spring(response: SwitchMotion.springResponse, dampingFraction: SwitchMotion.springDamping),
                        value: model.mainID)
@@ -422,8 +555,14 @@ struct QuotaStatRow: View {
             ForEach(rows) { r in
                 VStack(alignment: .leading, spacing: 2) {
                     Text(r.name).font(.system(size: 11)).foregroundColor(p.sub)
-                    Text(r.isReset ? L("quota.windowResetShort") : L("panel.usedPct", Int(r.usedPercent.rounded()))).font(.num(17, .semibold))
+                    Text(r.isReset ? L("quota.windowResetShort") : quotaLeftText(100 - r.usedPercent)).font(.num(17, .semibold))
                         .foregroundColor(dimmed ? p.sub.opacity(0.5) : p.text).lineLimit(1).minimumScaleFactor(0.7)
+                    PaceBar(remaining: r.isReset ? 100 : 100 - r.usedPercent,
+                            pace: r.isReset ? nil : r.paceRemainingPercent,
+                            tint: dimmed ? p.sub.opacity(0.5) : quotaTint(QuotaLevel.severity(usedPercent: r.usedPercent)),
+                            track: p.track, height: 4)
+                        .padding(.vertical, 3)
+                        .padding(.trailing, 10)
                     if let reset = r.resetShort {
                         Text(reset).font(.system(size: 10.5)).foregroundColor(p.sub).lineLimit(1)
                     }
@@ -471,7 +610,7 @@ struct RootView: View {
         }
         .frame(width: kPanelWidth, height: kRendering ? 820 : model.panelHeight)
         .background(Backdrop(p: p))
-        .onAppear { model.fetch() }
+        // 面板出现时不再取数：togglePanel 打开时已取一次，再取会让同一平台 1 秒内取两次（11/6 日志）
     }
 }
 

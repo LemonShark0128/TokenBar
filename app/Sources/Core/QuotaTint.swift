@@ -1,5 +1,6 @@
 /// 套餐额度按已用百分比分级；不影响按量付费的余额规则。
 enum QuotaLevel {
+    typealias Severity = RunwaySeverity
     static let warnUsed = 80.0
     static let dangerUsed = 95.0
 

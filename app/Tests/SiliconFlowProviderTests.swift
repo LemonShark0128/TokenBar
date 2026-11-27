@@ -224,8 +224,6 @@ func registerSiliconFlowProviderTests() {
         let p = SiliconFlowProvider(http: client())
         try checkEqual(p.capabilities.minPollInterval, 60)
         try check(p.capabilities.hasBalance && p.capabilities.currency == .cny)
-        guard case .webLogin(let url, let required)? = p.loginSteps.first, p.loginSteps.count == 1 else { throw TestFailure(description: "loginSteps 不对") }
-        try checkEqual(url.absoluteString, "https://cloud.siliconflow.cn/me/bills")
-        try check(required)
+        try checkEqual(SiliconFlowProvider.consoleURL.absoluteString, "https://cloud.siliconflow.cn/me/bills")
     }
 }

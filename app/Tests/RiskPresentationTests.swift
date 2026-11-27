@@ -43,32 +43,59 @@ func registerRiskPresentationTests() {
             try checkEqual(dismissal.dismissed["deepseek"], nil)
         }
     }
-    test("banner keys identify four kinds and reset minute") {
-        let q = quota()
-        let minute = Int(q.resetsAt!.timeIntervalSince1970 / 60)
-        let below = PlatformRisk(id: .claudePlan, kind: .belowThreshold, hours: 0, atRisk: true, severity: .danger, quotaReading: q)
-        try checkEqual(try bannerKey(below), "claudePlan|below|2|\(minute)")
-        try checkEqual(try bannerKey(risk(.claudePlan, q)), "claudePlan|runsOut|2|\(minute)")
-        try checkEqual(try bannerKey(risk(.claudePlan, quota(100))), "claudePlan|exhausted|2|\(minute)")
+    // 2026-11-06 用户选乙：套餐平台不再出顶部横幅；按量付费照旧，键最后一段恒为「-」
+    test("banner keys payg and below, no quota banner") {
         let p = PlatformRisk(id: .siliconflow, kind: .payg(payg()), hours: 3, atRisk: true, severity: .warn)
         try checkEqual(try bannerKey(p), "siliconflow|payg|1|-")
-        var noReset = below; noReset.quotaReading = nil
-        try checkEqual(try bannerKey(noReset), "claudePlan|below|2|-")
+        let below = PlatformRisk(id: .siliconflow, kind: .belowThreshold, hours: 0, atRisk: true, severity: .danger)
+        try checkEqual(try bannerKey(below), "siliconflow|below|2|-")
+        for r in [risk(.claudePlan, quota()), risk(.claudePlan, quota(100)),
+                  PlatformRisk(id: .claudePlan, kind: .belowThreshold, hours: 0, atRisk: true, severity: .danger, quotaReading: quota())] {
+            var d = data(); apply(&d, [r])
+            try checkEqual(d.banner, nil)
+        }
     }
-    test("banner keys ignore payg text but track severity and reset minute") {
+    // 11/6 用户定 round7-scout 第 2 条乙：套餐低于预警线时主卡胶囊写「低于预警线」（红），重置时间放到说明里；
+    // 原来写灰色「近 1 小时没用」或红色「够用到重置」，和侧栏「低于预警线」对不上。预计用完的照旧写剩多久（更具体）
+    test("quota below line chip says below line") {
+        for (q, muted) in [(quota(85, rise: 0), false), (quota(85, rise: 2), false)] {
+            var d = data()
+            apply(&d, [PlatformRisk(id: .claudePlan, kind: .belowThreshold, hours: 0, atRisk: true, severity: .danger, quotaReading: q)],
+                  main: .claudePlan)
+            try checkEqual(d.runway?.title, "低于预警线")
+            try checkEqual(d.runway?.short, "低于预警线")
+            try checkEqual(d.runway?.detail, "2 小时后重置")
+            try checkEqual(d.runway?.severity, RunwaySeverity.danger.rawValue)
+            try checkEqual(d.runway?.muted, muted)
+        }
+        var d = data()
+        apply(&d, [PlatformRisk(id: .claudePlan, kind: .belowThreshold, hours: 0, atRisk: true, severity: .danger, quotaReading: quota(85, rise: 20))],
+              main: .claudePlan)
+        try check(d.runway?.title.hasPrefix("预计可用时间") == true, "\(d.runway?.title ?? "nil")")
+    }
+    // 套餐和按量付费同时有风险：横幅落到按量付费平台（以前会选排在前面的套餐平台）
+    test("banner skips quota risk and picks payg") {
+        var d = data()
+        apply(&d, [risk(.claudePlan, quota(100)), PlatformRisk(id: .siliconflow, kind: .payg(payg()), hours: 3, atRisk: true, severity: .warn)])
+        try checkEqual(d.banner?.id, ProviderID.siliconflow.rawValue)
+    }
+    // 主平台是套餐且自己有风险：按量付费副平台的横幅照样显示；主平台是按量付费且有风险：仍不加横幅
+    test("banner shows payg side when quota main at risk") {
+        let sideRisk = PlatformRisk(id: .siliconflow, kind: .payg(payg()), hours: 3, atRisk: true, severity: .warn)
+        let quotaMain = risk(.claudePlan, quota()), paygMain = PlatformRisk(id: .deepseek, kind: .payg(payg()), hours: 3, atRisk: true, severity: .warn)
+        try check(quotaMain.atRisk && paygMain.atRisk, "两种主平台都要有风险，才测得到这条分支")
+        var d = data(); apply(&d, [quotaMain, sideRisk], main: .claudePlan)
+        try checkEqual(d.banner?.id, ProviderID.siliconflow.rawValue)
+        d = data(); apply(&d, [paygMain, sideRisk], main: .deepseek)
+        try checkEqual(d.banner, nil)
+    }
+    test("banner keys ignore payg text but track severity") {
         var r = PlatformRisk(id: .siliconflow, kind: .payg(payg(3)), hours: 3, atRisk: true, severity: .warn)
         let first = try bannerKey(r)
         r.kind = .payg(payg(4))
         try checkEqual(try bannerKey(r), first)
         r.severity = .danger
         try check(try bannerKey(r) != first, "severity changes reminder")
-        let q = quota(); let initial = try bannerKey(risk(.claudePlan, q))
-        var changed = q; changed.resetsAt = q.resetsAt!.addingTimeInterval(30)
-        try checkEqual(try bannerKey(risk(.claudePlan, changed)), initial)
-        changed.resetsAt = q.resetsAt!.addingTimeInterval(60)
-        try check(try bannerKey(risk(.claudePlan, changed)) != initial, "new reset changes reminder")
-        changed.resetsAt = nil
-        try checkEqual(try bannerKey(risk(.claudePlan, changed)), "claudePlan|runsOut|2|-")
     }
     test("legacy banner key defaults to empty") {
         let legacy = Data(#"{"id":"siliconflow","text":"旧提醒","severity":1}"#.utf8)
@@ -112,7 +139,7 @@ func registerRiskPresentationTests() {
         try checkEqual(state.dismissed, [:])
     }
     test("dismissal persists a dictionary in isolated defaults") {
-        let suite = "TokenBarTests.BannerDismissal.\(UUID().uuidString)"
+        let suite = testSuiteName("banner-dismissal")
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         try checkEqual(BannerDismissal.load(defaults).dismissed, [:])
@@ -136,7 +163,9 @@ func registerRiskPresentationTests() {
                 var d = data()
                 let r = RiskRanker.risk(RiskInput(id: .claudePlan, status: .ok, payg: nil, quota: q, belowThreshold: below))
                 apply(&d, [r], main: .claudePlan)
-                try checkCompact(d.runway, short: short, muted: muted)
+                // 低于预警线且没在快速用完：写「低于预警线」、不变灰（11/6 第 2 条乙）
+                let belowChip = below && (short == "够用到重置" || short == "近 1 小时没用")
+                try checkCompact(d.runway, short: belowChip ? "低于预警线" : short, muted: belowChip ? false : muted)
                 let decoded = try JSONDecoder().decode(AppData.RunwayChip.self, from: JSONEncoder().encode(d.runway))
                 try checkEqual(decoded, d.runway)
             }
@@ -168,7 +197,7 @@ func registerRiskPresentationTests() {
         for (q, title) in [(quota(20, rise: 2), "够用到重置"), (quota(20, rise: 0), "近 1 小时没用"), (quota(100), "额度已用完")] {
             let text = Runway.quotaChip(q, now: now, timeZone: tz)
             try checkEqual(text.title, title)
-            try checkEqual(text.detail, "2 小时后重置")
+            try checkEqual(text.detail, title == "额度已用完" ? "2 小时后恢复" : "2 小时后重置")
         }
     }
     test("quota chip missing reset estimated cross day and rounded rise") {
@@ -192,11 +221,11 @@ func registerRiskPresentationTests() {
             try checkEqual(d.runway?.severity, below ? 2 : 1)
         }
     }
-    test("quota below threshold retains quota chip") {
+    test("quota below threshold chip says below line") {
         let q = quota(95, rise: 0)
         let r = RiskRanker.risk(RiskInput(id: .claudePlan, status: .ok, payg: nil, quota: q, belowThreshold: true))
         var d = data(); apply(&d, [r], main: .claudePlan)
-        try checkEqual(d.runway?.title, "近 1 小时没用")
+        try checkEqual(d.runway?.title, "低于预警线")
         try checkEqual(d.runway?.severity, 2)
     }
     test("side ordering keeps stable tail and risk order after activity reorder") {
@@ -211,11 +240,11 @@ func registerRiskPresentationTests() {
         try checkEqual(d.sides.map(\.riskText), [nil, nil, nil])
     }
     test("banner appears only when main has no risk and clears on refresh") {
-        var d = data(); let r = risk(.claudePlan, quota())
+        var d = data(); let r = PlatformRisk(id: .siliconflow, kind: .payg(payg()), hours: 3, atRisk: true, severity: .danger)
         apply(&d, [r])
-        try checkEqual(d.banner?.id, ProviderID.claudePlan.rawValue)
+        try checkEqual(d.banner?.id, ProviderID.siliconflow.rawValue)
         try checkEqual(d.banner?.severity, 2)
-        try checkEqual(d.banner?.text, "Claude 套餐 预计可用时间：40 分钟，下次重置：\(Runway.resetClock(quota(), now: now, timeZone: tz)!)")
+        try checkEqual(d.banner?.text, "硅基流动 预计可用时间：3 小时")
         apply(&d, [r, PlatformRisk(id: .deepseek, kind: .payg(payg()), hours: 3, atRisk: true, severity: .warn)])
         try checkEqual(d.banner, nil)
         apply(&d, [])
@@ -249,14 +278,11 @@ func registerRiskPresentationTests() {
         try checkEqual(d.banner?.text, "硅基流动 预计可用时间：3 小时")
         apply(&d, [PlatformRisk(id: .siliconflow, kind: .belowThreshold, hours: 0, atRisk: true, severity: .danger)])
         try checkEqual(d.banner?.text, "硅基流动：余额低于预警线")
+        // 套餐平台低于预警线 / 用完 / 快用完：不出顶部横幅（系统通知和卡片红字照旧）
         apply(&d, [PlatformRisk(id: .claudePlan, kind: .belowThreshold, hours: 0, atRisk: true, severity: .danger)])
-        try checkEqual(d.banner?.text, "Claude 套餐：额度低于预警线")
-        var q = quota(100); q.resetsAt = nil
-        apply(&d, [risk(.claudePlan, q)])
-        try checkEqual(d.banner?.text, "Claude 套餐 额度已用完")
-        q = quota(); q.resetsAt = nil
-        apply(&d, [risk(.claudePlan, q)])
-        try checkEqual(d.banner?.text, "Claude 套餐 预计可用时间：40 分钟")
+        try checkEqual(d.banner, nil)
+        apply(&d, [risk(.claudePlan, quota(100))])
+        try checkEqual(d.banner, nil)
     }
     test("quota main maps all states and severity") {
         for q in [quota(), quota(100), quota(20, rise: 2), quota(20, rise: 0)] {

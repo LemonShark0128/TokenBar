@@ -14,6 +14,8 @@ final class RecordingCredentialStore: CredentialStore, @unchecked Sendable {
     }
     func save(_ c: Credentials, for p: ProviderID) throws { saved = c; result = .found(c) }
     func delete(_ p: ProviderID) throws { result = .notFound }
+    private(set) var cleared = 0
+    func clearFailure() { cleared += 1 }
 }
 
 /// fetch 一直挂起，直到 release()；用来制造「上一轮还在取」
@@ -21,9 +23,7 @@ final class GatedProvider: UsageProvider, @unchecked Sendable {
     private(set) var calls = 0
     private var gate: CheckedContinuation<Void, Never>?
     var id: ProviderID { .deepseek }
-    var displayName: String { "Gated" }
-    var capabilities: Capabilities { Capabilities(hasBalance: true, currency: .cny, minPollInterval: 60, dayBoundary: .local) }
-    var loginSteps: [LoginStep] { [] }
+    var capabilities: Capabilities { Capabilities(hasBalance: true, currency: .cny, minPollInterval: 60) }
     func validate(_ c: Credentials) async -> ValidationResult { .ok(summary: "") }
     func fetch(_ c: Credentials, now: Date, timeZone: TimeZone) async -> Result<ProviderSnapshot, ProviderError> {
         calls += 1
@@ -35,7 +35,17 @@ final class GatedProvider: UsageProvider, @unchecked Sendable {
     func release() { gate?.resume(); gate = nil }
 }
 
-func freshDefaults() -> UserDefaults { UserDefaults(suiteName: "tb-test-\(UUID().uuidString)")! }
+/// 测试用 UserDefaults 的 suite 名：临时目录里的绝对路径，plist 就写进那个目录（test.sh 跑完连目录一起删）。
+/// 以前用普通名字，每跑一次在 ~/Library/Preferences 留几十个 tb-*.plist（removePersistentDomain 也只清空不删文件）
+let testDefaultsDir: String = {
+    let dir = NSTemporaryDirectory() + "tb-defaults-\(UUID().uuidString)"
+    // 建不出来就直接报错：否则 plist 写不进磁盘，测试可能照样通过，问题被藏住
+    do { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
+    catch { fatalError("建不了测试用 defaults 目录 \(dir)：\(error)") }
+    return dir
+}()
+func testSuiteName(_ tag: String = "test") -> String { testDefaultsDir + "/\(tag)-\(UUID().uuidString)" }
+func freshDefaults() -> UserDefaults { UserDefaults(suiteName: testSuiteName())! }
 
 @MainActor
 func makeStore(_ p: UsageProvider, clock: FakeClock, cs: CredentialStore, defaults: UserDefaults) throws -> UsageStore {
@@ -61,6 +71,29 @@ final class SlowReviewCredentialStore: CredentialStore, @unchecked Sendable {
         value = c
     }
     func delete(_ p: ProviderID) throws {}
+}
+
+/// read() 挂起直到 release()（在后台线程等），用来制造「读钥匙串途中移除平台」
+final class GatedCredentialStore: CredentialStore, @unchecked Sendable {
+    private let gate = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var startedFlag = false
+    private var readCount = 0
+    private var clearedFlag = false
+    var reads: Int { lock.lock(); defer { lock.unlock() }; return readCount }
+    var cleared: Bool { lock.lock(); defer { lock.unlock() }; return clearedFlag }
+    func clearFailure() { lock.lock(); clearedFlag = true; lock.unlock() }
+    private var value: CredentialRead
+    init(initial: Credentials = someKey) { value = .found(initial) }
+    var started: Bool { lock.lock(); defer { lock.unlock() }; return startedFlag }
+    func read(_ p: ProviderID) -> CredentialRead {
+        lock.lock(); let gated = !startedFlag; startedFlag = true; readCount += 1; let v = value; lock.unlock()
+        if gated { gate.wait() }   // 只拦第一次读：读到的是移除前的旧凭据
+        return v
+    }
+    func release() { gate.signal() }
+    func save(_ c: Credentials, for p: ProviderID) throws { lock.lock(); value = .found(c); lock.unlock() }
+    func delete(_ p: ProviderID) throws { lock.lock(); value = .notFound; lock.unlock() }
 }
 
 /// 只改指定端点的 JSON，其他响应沿用已有样本。
@@ -169,7 +202,157 @@ func registerReviewFixTests() {
         let store = try makeStore(FakeProvider([]), clock: clock, cs: RecordingCredentialStore(.error(-25293)),
                                         defaults: freshDefaults())
         await store.refresh()
-        try checkEqual(store.platforms[0].status, .credentialInvalid)
+        // 11/6 用户定 proposal-keychain-error-ui 乙：读钥匙串出错是单独的状态，不再写成「凭据失效 / API Key 无效」
+        try checkEqual(store.platforms[0].status, .keychainUnreadable(status: -25293))
+    }
+    // 被拒绝后点「重试」：清掉记住的失败、重新读一次，读到就恢复；锁着的不用重试（下一轮自动读）
+    testAsync("keychainRetryReadsAgain") {
+        let clock = FakeClock(), cs = RecordingCredentialStore(.error(-128))
+        let p = FakeProvider([.success(snap(clock.now))])
+        let store = try makeStore(p, clock: clock, cs: cs, defaults: freshDefaults())
+        await store.refresh()
+        try checkEqual(store.platforms[0].status, .keychainUnreadable(status: -128))
+        await store.refresh()
+        try checkEqual(cs.reads, 1)          // 被拒绝后停下，不反复弹框
+        cs.result = .found(someKey)
+        await store.retryKeychain()
+        try checkEqual(cs.cleared, 1)
+        try checkEqual(cs.reads, 2)
+        try checkEqual(store.platforms[0].status, .ok)
+        try checkEqual(p.calls, 1)
+        // 没有读不到钥匙串的平台时，重试什么也不做
+        await store.retryKeychain()
+        try checkEqual(cs.cleared, 1)
+        // 重试后仍被拒绝：照旧是读不到钥匙串、停下
+        let cs2 = RecordingCredentialStore(.error(-128))
+        let again = try makeStore(FakeProvider([]), clock: clock, cs: cs2, defaults: freshDefaults())
+        await again.refresh()
+        await again.retryKeychain()
+        try checkEqual(again.platforms[0].status, .keychainUnreadable(status: -128))
+        await again.refresh()
+        try checkEqual(cs2.reads, 2)
+    }
+    testAsync("keychainReadErrorLogsOncePerCode") {
+        // 读钥匙串失败要记日志（带错误码），同一错误码不重复记；读到凭据记「恢复」
+        let clock = FakeClock(), cs = RecordingCredentialStore(.error(-25308))
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tb-store-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var lines: [String] = []
+        let store = UsageStore(providers: [FakeProvider([.success(snap(clock.now)), .success(snap(clock.now))])], credentials: cs,
+                               samples: try SampleStore(path: dir.appendingPathComponent("s.sqlite").path), intervalSeconds: 120,
+                               clock: { clock.now }, timeZone: { TimeZone(secondsFromGMT: 28800)! }, defaults: freshDefaults(),
+                               log: { lines.append($0) })
+        let name = ProviderRegistry.logName(.deepseek)
+        await store.refresh()
+        await store.refresh()
+        try checkEqual(cs.reads, 2)   // 锁着不停自动刷新，下一轮还会读
+        try checkEqual(lines, ["\(name) 读钥匙串失败（-25308 钥匙串已锁），下一轮自动重试"])
+        cs.result = .found(someKey)
+        await store.refresh()
+        try checkEqual(lines.last, "\(name) 读钥匙串恢复")
+        try checkEqual(store.platforms[0].status, .ok)
+        // 换一个 store（缓存为空）：先锁着，再被拒绝 → 错误码变了再记一行；拒绝后已停，再刷新不重复
+        lines = []
+        cs.result = .error(-25308)
+        let again = UsageStore(providers: [FakeProvider([])], credentials: cs,
+                               samples: try SampleStore(path: dir.appendingPathComponent("s2.sqlite").path), intervalSeconds: 120,
+                               clock: { clock.now }, timeZone: { TimeZone(secondsFromGMT: 28800)! }, defaults: freshDefaults(),
+                               log: { lines.append($0) })
+        await again.refresh()
+        cs.result = .error(-128)
+        await again.refresh()
+        await again.refresh()
+        try checkEqual(lines, ["\(name) 读钥匙串失败（-25308 钥匙串已锁），下一轮自动重试",
+                               "\(name) 读钥匙串失败（-128 用户拒绝），已停止自动刷新，点面板里的「重试」或重新登录后恢复"])
+        try checkEqual(again.platforms[0].status, .keychainUnreadable(status: -128))
+        try checkEqual(UsageStore.keychainFailureLog("Kimi", -34018), "Kimi 读钥匙串失败（-34018），已停止自动刷新，点面板里的「重试」或重新登录后恢复")
+        try checkEqual(UsageStore.keychainFailureLog("Kimi", -26276), "Kimi 读钥匙串失败（-26276 凭据数据损坏），已停止自动刷新，点面板里的「重试」或重新登录后恢复")
+    }
+    testAsync("removeDuringKeychainReadStaysRemoved") {
+        // 读钥匙串途中移除平台：读回来的旧凭据不能再写回缓存和「已添加」，平台保持未添加
+        let clock = FakeClock(), defaults = freshDefaults(), cs = GatedCredentialStore()
+        let p = FakeProvider([.success(snap(clock.now)), .success(snap(clock.now))])
+        let store = try makeStore(p, clock: clock, cs: cs, defaults: defaults)
+        async let first: Void = store.refresh()
+        defer { cs.release() }   // 中途抛错也放行闸门，免得测试挂死
+        var spins = 0
+        while !cs.started { await Task.yield(); spins += 1; if spins > 100_000 { throw TestFailure(description: "读取没有开始") } }
+        try await store.removeAccount(.deepseek)
+        cs.release()
+        await first
+        try checkEqual(store.platforms[0].status, .notAdded)
+        await store.refresh()
+        try checkEqual(store.platforms[0].status, .notAdded)
+        // 重启（新 store、同一份 UserDefaults）后也是未添加，不是「凭据失效」
+        let again = try makeStore(FakeProvider([]), clock: clock, cs: RecordingCredentialStore(.notFound), defaults: defaults)
+        await again.refresh()
+        try checkEqual(again.platforms[0].status, .notAdded)
+    }
+    testAsync("reloginRightAfterRemoveDropsOldFields") {
+        // 移除时旧读取还在途，马上重新登录只填 apiKey：等着共用旧读取的保存不能把旧 webToken 合并回钥匙串
+        let clock = FakeClock(), cs = GatedCredentialStore(initial: Credentials(values: ["apiKey": "old", "webToken": "oldToken"]))
+        let store = try makeStore(FakeProvider([.success(snap(clock.now)), .success(snap(clock.now))]),
+                                  clock: clock, cs: cs, defaults: freshDefaults())
+        async let first: Void = store.refresh()
+        defer { cs.release() }
+        var spins = 0
+        while !cs.started { await Task.yield(); spins += 1; if spins > 100_000 { throw TestFailure(description: "读取没有开始") } }
+        try await store.removeAccount(.deepseek)
+        async let save: Void = store.saveCredentials(["apiKey": "new"], for: .deepseek)
+        // 等保存清完上次拒绝、走到读凭据并开始等在途的旧读取，再放行
+        spins = 0
+        while !cs.cleared { await Task.yield(); spins += 1; if spins > 100_000 { throw TestFailure(description: "保存没有开始") } }
+        for _ in 0..<50 { await Task.yield() }
+        cs.release()
+        await first
+        try await save
+        try checkEqual(cs.reads, 1)   // 保存确实共用了那次旧读取（自己另读就没测到这条路）
+        try checkEqual(cs.read(.deepseek), .found(Credentials(values: ["apiKey": "new"])))
+    }
+    testAsync("stuckTickDoesNotRefetchLaterPlatform") {
+        // 上一拍卡在 DeepSeek 时，下一拍取了硅基流动；卡住的那拍醒来不能拿旧时刻把硅基流动当成「时钟回拨」再取一次
+        let clock = FakeClock(), slow = GatedProvider()
+        let sf = FakeProvider([.success(snap(clock.now)), .success(snap(clock.now))], id: .siliconflow)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tb-store-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let store = UsageStore(providers: [slow, sf], credentials: RecordingCredentialStore(.found(someKey)),
+                               samples: try SampleStore(path: dir.appendingPathComponent("s.sqlite").path), intervalSeconds: 120,
+                               clock: { clock.now }, timeZone: { TimeZone(secondsFromGMT: 28800)! }, defaults: freshDefaults())
+        async let stuck: Void = store.tick()
+        defer { slow.release() }
+        for _ in 0..<200 where !slow.waiting { await Task.yield(); try await Task.sleep(nanoseconds: 1_000_000) }
+        try check(slow.waiting, "DeepSeek 没开始取")
+        clock.now = clock.now.addingTimeInterval(15)
+        await store.tick()                       // 下一拍：DeepSeek 在途跳过，取硅基流动
+        try checkEqual(sf.calls, 1)
+        clock.now = clock.now.addingTimeInterval(10)
+        slow.release()
+        await stuck
+        try checkEqual(sf.calls, 1)
+        try checkEqual(slow.calls, 1)
+    }
+    testAsync("platformDueDuringStuckTickAnchorsAtDueTime") {
+        // 硅基流动 T0+20 到点；T0 那拍卡在 DeepSeek 到 T0+25 才轮到它：下次到点 = 原到点 + 间隔，不是 T0 + 间隔
+        let clock = FakeClock(), slow = GatedProvider()
+        let sf = FakeProvider([.success(snap(clock.now)), .success(snap(clock.now)), .success(snap(clock.now))], id: .siliconflow)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tb-store-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let store = UsageStore(providers: [slow, sf], credentials: RecordingCredentialStore(.found(someKey)),
+                               samples: try SampleStore(path: dir.appendingPathComponent("s.sqlite").path), intervalSeconds: 120,
+                               clock: { clock.now }, timeZone: { TimeZone(secondsFromGMT: 28800)! }, defaults: freshDefaults())
+        let start = clock.now
+        await store.refresh(.siliconflow)        // 硅基流动 start 取过，start+120 到点
+        clock.now = start.addingTimeInterval(100)
+        let t0 = clock.now
+        async let stuck: Void = store.tick()     // DeepSeek 卡住（硅基流动还没到点）
+        defer { slow.release() }
+        for _ in 0..<200 where !slow.waiting { await Task.yield(); try await Task.sleep(nanoseconds: 1_000_000) }
+        try check(slow.waiting, "DeepSeek 没开始取")
+        clock.now = t0.addingTimeInterval(25)    // 卡到 start+125，此时硅基流动已到点
+        slow.release()
+        await stuck
+        try checkEqual(sf.calls, 2)
+        try checkEqual(store.nextDueAt(.siliconflow), start.addingTimeInterval(240))
     }
     testAsync("removeAccountMarksNotAdded") {
         let clock = FakeClock(), defaults = freshDefaults(), cs = RecordingCredentialStore(.found(someKey))
@@ -215,7 +398,7 @@ func registerReviewFixTests() {
         await first.value
     }
     testAsync("refreshRespectsRateLimitBackoff") {
-        let clock = FakeClock(), p = FakeProvider([.failure(.rateLimited(retryAfter: nil)), .success(snap(clock.now))])
+        let clock = FakeClock(), p = FakeProvider([.failure(.rateLimited), .success(snap(clock.now))])
         let store = try makeStore(p, clock: clock, cs: RecordingCredentialStore(.found(someKey)), defaults: freshDefaults())
         await store.refresh()
         await store.refresh()

@@ -191,6 +191,21 @@ func registerQuotaStoreTests() {
         await store.addCredentialFree(.deepseek)
         try checkEqual(store.quotaRise(.deepseek), 15)
     }
+    testAsync("quotaRiseIgnoresWindowSwitch") {
+        // 之前记的是 5 小时窗口（10 → 12），这轮读到的只有每周窗口 60：不能算出 48 个百分点的涨幅
+        let clock = FakeClock()
+        let now = clock.now
+        let seed = [(-3000.0, 10.0), (-2000, 12)].map {
+            Sample(provider: .deepseek, t: now.addingTimeInterval($0.0), balance: nil, cumulativeCost: nil,
+                   currency: .cny, quotaUsed: $0.1, quotaWindow: "session")
+        }
+        var snap = quotaSnap(observedAt: now, fetchedAt: now)
+        snap.quota?.windows = [window(.weekly, used: 60, resets: now.addingTimeInterval(86400))]
+        let (store, samples) = try quotaStore(quotaProvider([.success(snap)]), clock: clock, seed: seed)
+        await store.addCredentialFree(.deepseek)
+        try checkEqual(try samples.latest(.deepseek)?.quotaWindow, "weekly")   // 采样记下窗口种类
+        try checkEqual(store.quotaRise(.deepseek), 0)
+    }
     testAsync("moneyPlatformHasNoQuotaRise") {
         let clock = FakeClock()
         let (store, _) = try makeStore(FakeProvider([.success(snap(clock.now))]), clock: clock)

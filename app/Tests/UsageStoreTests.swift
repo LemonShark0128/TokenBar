@@ -14,10 +14,8 @@ final class FakeProvider: UsageProvider, @unchecked Sendable {
         self.meter = meter; self.needsCredentials = needsCredentials
     }
     var id: ProviderID { pid }
-    var displayName: String { "Fake" }
-    var capabilities: Capabilities { Capabilities(hasBalance: hasBalance, currency: currency, minPollInterval: 60, dayBoundary: .local,
+    var capabilities: Capabilities { Capabilities(hasBalance: hasBalance, currency: currency, minPollInterval: 60,
                                                   meter: meter, needsCredentials: needsCredentials) }
-    var loginSteps: [LoginStep] { [.apiKey(required: true)] }
     func validate(_ c: Credentials) async -> ValidationResult { .ok(summary: "") }
     func fetch(_ c: Credentials, now: Date, timeZone: TimeZone) async -> Result<ProviderSnapshot, ProviderError> {
         calls += 1
@@ -61,6 +59,21 @@ func registerUsageStoreTests() {
         try checkEqual(st.snapshot, first)
         try checkEqual(st.status, .stale(minutes: 5))
     }
+    testAsync("burnAvgUsesObservedDays") {
+        // 平台两天前才开始记、账单只有最近两天有花费：日均按 2 天除，不按 7 天
+        let clock = FakeClock()
+        var s = snap(clock.now, balance: 100)
+        s.trend7 = [0, 0, 0, 0, 0, 10, 10].enumerated().map {
+            DayUsage(day: "d\($0.offset)", tokens: 0, cost: Money(amount: Decimal($0.element), currency: .cny))
+        }
+        let p = FakeProvider([.success(s)])
+        let (store, samples) = try makeStore(p, clock: clock)
+        try samples.append(Sample(provider: .deepseek, t: clock.now.addingTimeInterval(-2 * 86400),
+                                  balance: 120, cumulativeCost: nil, currency: .cny))
+        await store.refresh()
+        try checkEqual(store.platforms[0].burn?.avgPerDayWeek, 10)
+        try checkEqual(store.platforms[0].burn?.runwayDays, 10)
+    }
     testAsync("authStopsPolling") {
         let clock = FakeClock()
         let p = FakeProvider([.failure(.auth("401")), .success(snap(clock.now))])
@@ -74,7 +87,7 @@ func registerUsageStoreTests() {
     }
     testAsync("backoffCapsAt900") {
         let clock = FakeClock()
-        let p = FakeProvider(Array(repeating: .failure(.rateLimited(retryAfter: nil)), count: 6))
+        let p = FakeProvider(Array(repeating: .failure(.rateLimited), count: 6))
         let (store, _) = try makeStore(p, clock: clock)
         var seq: [TimeInterval] = []
         for _ in 0..<6 {
@@ -86,7 +99,7 @@ func registerUsageStoreTests() {
     }
     testAsync("backoffNeverShortensLongBaseInterval") {
         let clock = FakeClock()
-        let p = FakeProvider(Array(repeating: .failure(.rateLimited(retryAfter: nil)), count: 3))
+        let p = FakeProvider(Array(repeating: .failure(.rateLimited), count: 3))
         let (store, _) = try makeStore(p, clock: clock, interval: 1800)
         var seq: [TimeInterval] = []
         for _ in 0..<3 {

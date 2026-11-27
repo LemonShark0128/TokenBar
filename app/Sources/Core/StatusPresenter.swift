@@ -23,6 +23,7 @@ enum StatusPresenter {
         switch id {
         case .codexPlan: return L("status.offlineCodex")
         case .claudePlan: return L("status.offlineClaude")
+        case .geminiPlan: return L("status.offlineGemini")
         default: return L("status.cantReach", ProviderRegistry.displayName(id))
         }
     }
@@ -31,8 +32,16 @@ enum StatusPresenter {
     /// id 给了且是套餐平台时，离线写「读不到本机 … 记录」而不是「连不上 …，检查网络」
     static func errorText(_ s: PlatformStatus, name: String, id: ProviderID? = nil) -> String? {
         switch s {
-        case .credentialInvalid: return L("status.loginExpired", name)
+        case .credentialInvalid:
+            switch id.map(ProviderRegistry.credentialKind) {
+            case .apiKey?: return L("status.keyInvalid", name)
+            case .accessToken?: return L("status.tokenInvalid", name)
+            case .webLogin?: return L("status.webLoginExpired", name)
+            default: return L("status.loginExpired", name)
+            }
         case .schemaChanged: return L("status.schemaChanged", name)
+        case .keychainUnreadable(let code):
+            return code == lockedKeychain ? L("kc.locked") : L("kc.unreadable", name, keychainReason(code))
         case .offline:
             if let id, ProviderRegistry.meter(id) == .quota { return offlineTitle(id) }
             return L("status.cantReachCheckNetwork", name)
@@ -40,11 +49,32 @@ enum StatusPresenter {
         }
     }
 
+    /// 钥匙串锁着（errSecInteractionNotAllowed）：下一轮自动再读，不给「重试」
+    static let lockedKeychain: Int32 = -25308
+
+    /// 读钥匙串失败的原因：被拒绝写「被拒绝」，其余写错误码
+    static func keychainReason(_ code: Int32) -> String {
+        code == -128 ? L("kc.denied") : L("kc.code", Int(code))
+    }
+
+    /// 面板横幅：钥匙串是一整条、所有平台共用，读不到时合成一条；都只是锁着时不给「重试」。没有为 nil
+    static func keychainBanner(_ platforms: [PlatformState]) -> KeychainBanner? {
+        let failed = platforms.compactMap { st -> (ProviderID, Int32)? in
+            if case .keychainUnreadable(let code) = st.status { return (st.id, code) }
+            return nil
+        }
+        guard !failed.isEmpty else { return nil }
+        let blocked = failed.filter { $0.1 != lockedKeychain }
+        guard let first = blocked.first else { return KeychainBanner(text: L("kc.locked"), canRetry: false) }
+        let names = blocked.map { ProviderRegistry.displayName($0.0) }.joined(separator: L("kc.nameSep"))
+        return KeychainBanner(text: L("kc.banner", names, keychainReason(first.1)), canRetry: true)
+    }
+
     /// 界面上的错误文案：还没添加、第一次取数还没回来都不算错误
     static func error(for st: PlatformState, name: String) -> String? {
         if case .stale = st.status { return nil }
         if let detail = st.errorDetail { return detail }
-        if st.status == .notAdded || st.status == .loading { return nil }
+        if !st.status.isShown || st.status == .loading { return nil }
         if st.snapshot != nil || st.lastSample != nil { return errorText(st.status, name: name, id: st.id) }
         return errorText(st.status, name: name, id: st.id) ?? L("status.connecting", name)
     }
@@ -55,22 +85,30 @@ enum StatusPresenter {
             switch st.status {
             case .stale(let minutes) where ProviderRegistry.meter(st.id) == .quota:
                 let mins = st.quotaAge(now: i.now).map { Int($0 / 60) } ?? minutes
-                return (st.quotaTooOld(now: i.now) ? .offline : .stale, L("status.minAgoNotUpdated", mins))
+                return (st.quotaTooOld(now: i.now) ? .offline : .stale, L("status.agoNotUpdated", QuotaText.ago(minutes: mins)))
             case .loading: return (.stale, L("status.connecting", i.providerName))
-            case .credentialInvalid: return (.offline, L("status.needsRelogin"))
+            case .credentialInvalid:
+                switch ProviderRegistry.credentialKind(st.id) {
+                case .apiKey: return (.offline, L("status.keyInvalidShort"))
+                case .accessToken: return (.offline, L("status.tokenInvalidShort"))
+                case .webLogin: return (.offline, L("status.loginExpiredShort"))
+                case .none: return (.offline, L("status.needsRelogin"))
+                }
             case .schemaChanged: return (.offline, L("status.apiChanged"))
+            case .keychainUnreadable(let code):
+                return code == lockedKeychain ? (.stale, L("kc.lockedShort")) : (.offline, L("kc.unreadableShort"))
             case .consoleLoginNeeded: return (.estimate, L("status.consoleLoginExpired"))
             case .rateLimited: return (.stale, L("status.rateLimited"))
             case .offline where st.snapshotFromDisk && st.snapshot != nil:
                 // 冷启动断网：显示的是上次成功取到的完整数据，标明是多久以前的
                 let mins = Int(i.now.timeIntervalSince(st.snapshot!.fetchedAt) / 60)
-                return (.stale, L("status.offlineMinAgo", mins))
+                return (.stale, L("status.offlineAgo", QuotaText.ago(minutes: mins)))
             case .offline where st.lastSample == nil:
                 return (.offline, ProviderRegistry.meter(st.id) == .quota ? offlineTitle(st.id) : L("status.cantReach", i.providerName))
             case .offline:
                 // 冷启动断网但有历史采样：显示的是那次的余额，标明是多久以前的
                 let mins = Int(i.now.timeIntervalSince(st.lastSample!.t) / 60)
-                return (.stale, L("status.offlineBalanceMinAgo", mins))
+                return (.stale, L("status.offlineBalanceAgo", QuotaText.ago(minutes: mins)))
             default: break
             }
         }
@@ -83,14 +121,17 @@ enum StatusPresenter {
             if let st = i.state, ProviderRegistry.meter(st.id) == .quota { return (.offline, offlineTitle(st.id)) }
             return (.offline, L("status.cantReach", i.providerName))
         }
-        let age = d.balance.ageS ?? 0
-        if age > 600 { return (.stale, L("status.minNotUpdated", age / 60)) }
+        let age = max(0, d.balance.ageS ?? 0)     // 时钟回拨时不写负数
+        if age > 600 { return (.stale, QuotaText.notUpdatedFor(minutes: age / 60)) }
         return (.ok, age < 60 ? L("status.secAgo", age) : L("status.minAgo", age / 60))
     }
 
     /// 低油量通知的文字（系统通知 / 浮动警示卡）：写明平台名
-    static func lowTankNotification(name: String, amount: Double, threshold: Double, currency: String?) -> (title: String, body: String) {
+    /// keyLimit：金额是 API Key 的剩余花费上限（OpenRouter），写「Key 剩余额度不足」
+    static func lowTankNotification(name: String, amount: Double, threshold: Double, currency: String?,
+                                    keyLimit: Bool = false) -> (title: String, body: String) {
         let amt = fmtMoney(amount, currency), th = fmtMoney(threshold, currency, 0)
+        if keyLimit { return (L("alert.keyLimit.title", name), L("alert.keyLimit.body", amt, th)) }
         return (L("alert.lowTank.title", name), L("alert.lowTank.body", amt, th))
     }
 
@@ -100,25 +141,27 @@ enum StatusPresenter {
     }
 
     /// 花费飙升的系统通知 / 提醒卡文案：只陈述用量增加了多少，不猜原因
-    static func spikeNotification(provider: String, cnyPerHour: Double, avgCnyPerDayWeek: Double?) -> (title: String, body: String) {
+    /// currency：平台币种（金额前的符号）；avgDays：日均覆盖的天数（平台只给周 / 月累计时，如 OpenRouter），nil = 近 7 天
+    static func spikeNotification(provider: String, cnyPerHour: Double, avgCnyPerDayWeek: Double?,
+                                  currency: String? = nil, avgDays: Int? = nil) -> (title: String, body: String) {
         let x = cnyPerHour * 24 / max(avgCnyPerDayWeek ?? 1, 0.01)
-        return (L("alert.spike.title", provider), L("alert.spike.body", String(format: "%.2f", cnyPerHour), String(format: "%.0f", x)))
+        let rate = fmtMoney(cnyPerHour, currency), times = String(format: "%.0f", x)
+        let body = avgDays.map { L("alert.spike.bodyDays", rate, times, $0) } ?? L("alert.spike.body", rate, times)
+        return (L("alert.spike.title", provider), body)
     }
 
     /// 「每小时花费超过」的系统通知 / 提醒卡：「DeepSeek 每小时花费超过 ¥2」「每小时 ¥4.80，预计可用时间：5 小时 36 分」
     static func hourlyNotification(name: String, perHour: Double, threshold: Double, currency: String?,
                                    runwayHours: Double?) -> (title: String, body: String) {
         let digits = threshold == threshold.rounded() ? 0 : 2
-        let body = L("alert.hourly.body", fmtMoney(perHour, currency)) + (runwayHours.map { L("alert.hourly.runway", runwayText($0)) } ?? "")
+        let body = L("alert.hourly.body", fmtMoney(perHour, currency)) + (runwayHours.map { L("alert.hourly.runway", Runway.spanText(hours: $0)) } ?? "")
         return (L("alert.hourly.title", name, fmtMoney(threshold, currency, digits)), body)
     }
 
-    /// 「套餐重置前会用完」的系统通知 / 提醒卡
-    static func runoutNotification(name: String, runway q: QuotaRunway, now: Date, timeZone: TimeZone) -> (title: String, body: String) {
-        let reset = Runway.resetClock(q, now: now, timeZone: timeZone).map { L("alert.runout.reset", $0) } ?? ""
-        return (L("alert.runout.title", name), L("alert.runout.body", Runway.durationText(hours: q.hoursToEmpty ?? 0)) + reset)
-    }
+}
 
-    /// 可用时长：< 1 小时写「不到 1 小时」（与面板胶囊一致）
-    private static func runwayText(_ h: Double) -> String { h < 1 ? L("common.underOneHour") : Runway.durationText(hours: h) }
+/// 面板顶部「读不到钥匙串」横幅（proposal-keychain-error-ui 乙）
+struct KeychainBanner: Equatable {
+    var text: String
+    var canRetry: Bool
 }

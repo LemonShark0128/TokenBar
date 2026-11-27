@@ -29,9 +29,52 @@ func registerCodexPlanProviderTests() {
         return f
     }
     func fetch(_ root: URL) async -> Result<ProviderSnapshot, ProviderError> {
-        await CodexPlanProvider(root: root).fetch(Credentials(values: [:]), now: now, timeZone: utc)
+        await CodexPlanProvider(root: root, resetCredits: { nil }, resetCreditsMemory: ResetCreditsMemory()).fetch(Credentials(values: [:]), now: now, timeZone: utc)
     }
 
+    testAsync("codexRemembersLiveResetCreditsOnLogFallback") {
+        let root = try tmp()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeSession(root: root, day: "2026/10/15", name: "a.jsonl", lines: [codexLine()], mtime: now)
+        actor LiveSequence {
+            var calls = 0
+            func next() -> Quota? {
+                calls += 1
+                guard calls == 1 else { return nil }
+                var q = Quota(plan: "plus", windows: [], observedAt: Date(timeIntervalSince1970: 0))
+                q.resetCredits = ResetCredits(available: 2, expiresAt: nil)
+                return q
+            }
+        }
+        let live = LiveSequence()
+        let memory = ResetCreditsMemory()
+        let provider = CodexPlanProvider(root: { root }, liveUsage: { await live.next() }, resetCreditsMemory: memory)
+        let first = try await provider.fetch(Credentials(values: [:]), now: now, timeZone: utc).get()
+        try checkEqual(first.quota?.resetCredits?.available, 2)
+        let second = try await provider.fetch(Credentials(values: [:]), now: now.addingTimeInterval(60), timeZone: utc).get()
+        try checkEqual(second.quota?.windows.first?.usedPercent, 35)
+        try checkEqual(second.quota?.resetCredits?.available, 2)
+    }
+    testAsync("codexRecreatedProviderUsesMemoryAndLoaderTakesPriority") {
+        let root = try tmp()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeSession(root: root, day: "2026/10/15", name: "a.jsonl", lines: [codexLine()], mtime: now)
+        let memory = ResetCreditsMemory()
+        let live = CodexPlanProvider(root: { root }, liveUsage: {
+            var q = Quota(plan: "plus", windows: [], observedAt: now)
+            q.resetCredits = ResetCredits(available: 2, expiresAt: nil)
+            return q
+        }, resetCreditsMemory: memory)
+        _ = try await live.fetch(Credentials(values: [:]), now: now, timeZone: utc).get()
+        let fallback = CodexPlanProvider(root: root, resetCredits: { nil }, resetCreditsMemory: memory)
+        let recalled = try await fallback.fetch(Credentials(values: [:]), now: now, timeZone: utc).get()
+        try checkEqual(recalled.quota?.resetCredits?.available, 2)
+        let override = CodexPlanProvider(root: { root }, resetCredits: { ResetCredits(available: 0, expiresAt: nil) }, resetCreditsMemory: memory)
+        let loaded = try await override.fetch(Credentials(values: [:]), now: now, timeZone: utc).get()
+        try checkEqual(loaded.quota?.resetCredits?.available, 0)
+        let expired = try await fallback.fetch(Credentials(values: [:]), now: now.addingTimeInterval(86400), timeZone: utc).get()
+        try checkEqual(expired.quota?.resetCredits, nil)
+    }
     testAsync("codexChoosesNewestObservationAcrossSessions") {
         let root = try tmp()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -99,6 +142,25 @@ func registerCodexPlanProviderTests() {
         guard case .success(let s2) = await fetch(root2) else { throw TestFailure(description: "should succeed") }
         try check(s2.quota == nil)
         try checkEqual(s2.quotaNote, "还没有额度数据")
+
+        // 第 256 KB 的起点恰好落在半行里一条完整记录的「{」上：这半截本身是合法的 codex 行，
+        // 但整行没读全，必须丢掉（漏了 dropFirst 会读成已用 99%）
+        let root3 = try tmp()
+        let rest = String(codexLine(used: 99).dropFirst())
+        let padLen = Int(CodexPlanProvider.tailBytes) - 1 - "{\"pad\":\"\",".utf8.count - rest.utf8.count
+        let inner = "{\"pad\":\"" + String(repeating: "z", count: padLen) + "\"," + rest
+        try checkEqual(inner.utf8.count + 1, Int(CodexPlanProvider.tailBytes))
+        let head = String(repeating: "y", count: 100)
+        let f3 = try writeSession(root: root3, day: "2026/10/15", name: "cut2.jsonl", lines: [head + inner], mtime: now)
+        let size3 = (try FileManager.default.attributesOfItem(atPath: f3.path)[.size] as? NSNumber)?.intValue ?? 0
+        try checkEqual(size3 - Int(CodexPlanProvider.tailBytes), head.utf8.count)
+        guard case .success(.some(let whole)) = CodexPlanProvider.parseRateLimitLine(Data(inner.utf8)) else {
+            throw TestFailure(description: "fragment should parse on its own")
+        }
+        try checkEqual(whole.windows[0].usedPercent, 99)
+        guard case .success(let s3) = await fetch(root3) else { throw TestFailure(description: "should succeed") }
+        try check(s3.quota == nil)
+        try checkEqual(s3.quotaNote, "还没有额度数据")
     }
     testAsync("codexMissingSecondary") {
         let root = try tmp()
@@ -137,20 +199,31 @@ func registerCodexPlanProviderTests() {
         try check(s.quota == nil)
         try checkEqual(s.quotaNote, "还没有额度数据")
     }
-    testAsync("codexIgnoresAuthJson") {
-        let base = try tmp()
-        let root = base.appendingPathComponent("sessions")
-        try writeSession(root: root, day: "2026/10/15", name: "a.jsonl", lines: [codexLine()], mtime: now)
-        let auth = base.appendingPathComponent("auth.json")
-        try Data("{\"secret\":1}".utf8).write(to: auth)
-        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: auth.path)
-        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: auth.path) }
-        guard case .success(let s) = await fetch(root), s.quota != nil else { throw TestFailure(description: "should succeed") }
-    }
     /// 把文件设成不可读，返回恢复权限的闭包（测试结束前调用，免得临时目录删不掉）
     func lock(_ f: URL) throws -> () -> Void {
         try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: f.path)
         return { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: f.path) }
+    }
+    testAsync("codexIgnoresAuthJson") {
+        // 不可读的 auth.json 放在 sessions 根目录和日期目录里（遍历一定会经过）：照样取到额度、不报「读不到」
+        let root = try tmp()
+        let day = try writeSession(root: root, day: "2026/10/15", name: "a.jsonl", lines: [codexLine()], mtime: now)
+            .deletingLastPathComponent()
+        var unlocks: [() -> Void] = []
+        defer { unlocks.forEach { $0() } }
+        for dir in [root, day] {
+            let auth = dir.appendingPathComponent("auth.json")
+            try Data("{\"secret\":1}".utf8).write(to: auth)
+            try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: auth.path)
+            unlocks.append(try lock(auth))
+        }
+        guard case .success(let s) = await fetch(root), s.quota != nil else { throw TestFailure(description: "should succeed") }
+        // 代码里（注释除外）不出现 auth.json
+        let src = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/Core/CodexPlanProvider.swift")
+        let code = try String(contentsOf: src, encoding: .utf8).split(separator: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+        try check(!code.contains { $0.contains("auth.json") })
     }
     // 已知小问题 Task 3：某个 jsonl 读不出来时继续试下一个文件
     testAsync("codexUnreadableNewestFallsBackToOlder") {

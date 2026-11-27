@@ -1,23 +1,9 @@
 import AppKit
 import Combine
 import SwiftUI
-import UserNotifications
-
-// ---------------------------------------------------------------- 小组件窗口
-
-@MainActor
-final class WidgetController {
-    static let shared = WidgetController()
-
-    func toggle(_ model: UsageModel) {
-        model.toggleWidget()
-    }
-}
 
 // ---------------------------------------------------------------- 浮动窗口（面板/设置/详情/状态条）
 
-/// 浮动窗内容宿主：订阅 model，切主题时用新调色板重画「内容 + 背景」。
-/// 之前调色板只在开窗那一刻取一次 → 设置窗切主题没反应、小组件变成浅底白字（实测）。
 /// 浮动窗内容高度：内容变高变矮时（如设置换页）由 Hud.refit 改它，不重建内容、不丢界面状态
 @MainActor
 final class HudHeight: ObservableObject {
@@ -25,11 +11,15 @@ final class HudHeight: ObservableObject {
     init(_ v: CGFloat) { value = v }
 }
 
+/// 浮动窗内容宿主：订阅 model，切主题时用新调色板重画「内容 + 背景」。
+/// 之前调色板只在开窗那一刻取一次 → 设置窗切主题没反应、小组件变成浅底白字（实测）。
 struct ThemedHost: View {
     @ObservedObject var model: UsageModel
     let width: CGFloat
     @ObservedObject var height: HudHeight
     let build: (Palette) -> AnyView
+    /// 要读字、要填表的窗口（添加平台）：不跟面板的透明度，铺不透明底，后面的窗口文字不透过来
+    var opaque = false
     var body: some View {
         let p = Palette.of(model.dark)
         ScrollView { build(p) }       // 安全区已经让开了标题栏，不再额外加 top（原先是双倍留白）
@@ -37,7 +27,13 @@ struct ThemedHost: View {
             .frame(width: width, height: height.value)
             // 往下滚时内容不再钻到透明标题栏底下（之前会和关闭键的底衬叠在一起）
             .clipped()
-            .background(Backdrop(p: p))
+            .background(Group {
+                if opaque {
+                    LinearGradient(colors: [p.bgTop, p.bgBottom], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+                } else {
+                    Backdrop(p: p)
+                }
+            })
     }
 }
 
@@ -46,6 +42,8 @@ final class Hud {
     static var windows: [String: NSWindow] = [:]
     /// 窗口被红色关闭键关掉时的回调（用来同步设置里的开关）
     static var onClose: [String: () -> Void] = [:]
+    /// 每个窗口登记的通知观察者：discard 时注销，否则通知中心一直留着它们（和 willClose 闭包里的窗口）
+    private static var observers: [String: [NSObjectProtocol]] = [:]
 
     /// 按内容定高的窗口：量高度用的内容和当前高度（Hud.refit 用）
     private static var themes: [String: (model: UsageModel, build: (Palette) -> AnyView, width: CGFloat, height: HudHeight)] = [:]
@@ -74,6 +72,7 @@ final class Hud {
         windows[key] = nil
         themes[key] = nil
         onClose[key] = nil
+        observers.removeValue(forKey: key)?.forEach { NotificationCenter.default.removeObserver($0) }
         w.orderOut(nil)
         w.contentView = nil
     }
@@ -92,6 +91,7 @@ final class Hud {
 
     @discardableResult
     static func toggle(key: String, title: String, size: CGSize, titled: Bool = true, minimizable: Bool = false, plain: Bool = false,
+                       opaque: Bool = false,
                        themed: (model: UsageModel, build: (Palette) -> AnyView)? = nil,
                        origin: @escaping (CGSize) -> NSPoint, content: AnyView = AnyView(EmptyView())) -> Bool {
         if let w = windows[key], w.isVisible {
@@ -114,7 +114,7 @@ final class Hud {
             size.height = min(measured, Fit.maxHeight - top)
             let box = HudHeight(size.height)
             themes[key] = (t.model, t.build, size.width, box)
-            root = AnyView(ThemedHost(model: t.model, width: size.width, height: box, build: t.build))
+            root = AnyView(ThemedHost(model: t.model, width: size.width, height: box, build: t.build, opaque: opaque))
         }
         w.title = title
         w.contentView = NSHostingView(rootView: root)
@@ -139,7 +139,7 @@ final class Hud {
         return parts.count == 2 ? NSPoint(x: parts[0], y: parts[1]) : nil
     }
 
-    private static func rememberOrigin(_ key: String, _ w: NSWindow) {
+    private static func rememberOrigin(_ key: String, _ w: NSWindow) -> NSObjectProtocol {
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
                                                object: w, queue: .main) { [weak w] _ in
             // 回调在主队列上，但闭包被声明成 @Sendable：用 Task { @MainActor } 让编译器检查
@@ -163,15 +163,19 @@ final class Hud {
         let start = savedOrigin(key) ?? origin
         let w = NSWindow(contentRect: NSRect(origin: start, size: size), styleMask: mask,
                          backing: .buffered, defer: false)
-        rememberOrigin(key, w)
-        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
-                                               object: w, queue: .main) { _ in
+        let moved = rememberOrigin(key, w)
+        let closing = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
+                                                             object: w, queue: .main) { [weak w] _ in
             Task { @MainActor in
+                guard let w else { return }
                 // 晚一拍执行：这期间同一个 key 已经开了新窗口，就不能调新窗口的关闭回调
                 if windows[key] === w { onClose[key]?() }
                 discardLater(key, w)
             }
         }
+        // 同一个 key 的旧窗口还没放掉就建了新窗口：先注销旧的观察者
+        observers.removeValue(forKey: key)?.forEach { NotificationCenter.default.removeObserver($0) }
+        observers[key] = [moved, closing]
         if titled || plain {
             w.title = title
             w.titlebarAppearsTransparent = !plain

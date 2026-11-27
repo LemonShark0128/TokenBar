@@ -17,8 +17,8 @@ extension RenderMode {
         claude.snapshot?.quota?.windows[1].resetsAt = now.addingTimeInterval(86400 + 3600)
 
         let keepData = model.data, keepState = model.mainState, keepSide = model.menuBarSide, keepPage = model.widgetPage
-        let keepAlert = model.balanceAlertCny
-        model.syncingAlert = true; model.balanceAlertCny = 10; model.syncingAlert = false
+        let keepAlert = model.renderAlert
+        model.renderAlert = 10
         model.fixedNow = now; model.fixedTimeZone = tz
         model.menuBarSide = nil
         for dark in [false, true] {
@@ -38,12 +38,22 @@ extension RenderMode {
                 .padding(.vertical, 6).background(Color(white: 0.965)),
                name: "exhausted-menucard", size: CGSize(width: MenuCardHost.width, height: 170), dir: dir)
 
+        // 每周用完、5 小时窗口还剩 70%（11/6 用户定 round7-scout 第 8 条乙）：表盘 / 标题 / 菜单栏都按每周窗口写用完
+        var weekly = claude
+        weekly.snapshot?.quota?.windows[0].usedPercent = 30
+        weekly.snapshot?.quota?.windows[1].resetsAt = now.addingTimeInterval(2 * 86400 + 2 * 3600)
+        model.data = previewData(main: weekly, others: [deepseek], now: now, timeZone: tz); model.mainState = weekly
+        renderFit(PanelView(model: model, p: p), name: "exhausted-weekly-main", width: kPanelWidth, bg: bg, dir: dir)
+        render(MenuBarPreview(model: model, quota: true), name: "exhausted-weekly-menubar", size: CGSize(width: 300, height: 286), dir: dir)
+        model.widgetPage = "balance"     // 结尾统一还原 keepPage
+        renderFit(WidgetView(model: model), name: "exhausted-weekly-widget", width: 270, bg: bg, dir: dir)
+
         model.data = previewData(main: codex, others: [deepseek], now: now, timeZone: tz); model.mainState = codex
         render(MenuBarPreview(model: model, quota: true), name: "exhausted-menubar", size: CGSize(width: 300, height: 286), dir: dir)
         model.widgetPage = "balance"
         renderFit(WidgetView(model: model), name: "exhausted-widget", width: 270, bg: bg, dir: dir)
 
-        model.syncingAlert = true; model.balanceAlertCny = keepAlert; model.syncingAlert = false
+        model.renderAlert = keepAlert
         model.fixedNow = nil; model.fixedTimeZone = nil
         model.data = keepData; model.mainState = keepState; model.menuBarSide = keepSide; model.widgetPage = keepPage
         model.themeMode = originalTheme

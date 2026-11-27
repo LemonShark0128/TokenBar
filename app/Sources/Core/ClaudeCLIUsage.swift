@@ -17,6 +17,14 @@ enum ClaudeCLIUsage {
     /// 复用失败类型，确保现有提示和补查逻辑仍把老版本当作失败。
     static var outdated: Outcome { .failed(L("cli.outdated")) }
     static var throttled: Outcome { .failed(L("cli.throttled")) }
+    /// 命令行报登录错误：提示里直接写怎么登录
+    static var needsLogin: Outcome { .failed(L("cli.needsLogin")) }
+    /// 回复里没有订阅类型：退出登录、或用 API Key / Bedrock / Vertex 都是这样（claude 自己的说明），分不出来，
+    /// 一句话同时说清：没用 Pro/Max 账号登录，怎么登
+    static var notPlanLogin: Outcome { .failed(L("cli.notPlanLogin")) }
+    /// 跟登录有关、重试也没用的结果
+    static func isLoginProblem(_ o: Outcome) -> Bool { o == needsLogin || o == notPlanLogin || o == suspectedLogin }
+    static var suspectedLogin: Outcome { .failed(L("cli.suspectedLogin")) }
     /// 连不上 Anthropic 时，claude 会拿本地存的旧快照回答；快照时间早于这个阈值就不当作新数据
     static var stale: Outcome { .failed(L("cli.stale")) }
     static let staleAfter: TimeInterval = 10 * 60
@@ -40,20 +48,121 @@ enum ClaudeCLIUsage {
         }
     }
 
+    struct AuthStatus: Equatable, Sendable {
+        var loggedIn: Bool
+        var loginExpiresAt: Date?
+    }
+
+    /// 只取判定需要的字段，个人信息不进入诊断日志。
+    static func parseAuthStatus(_ data: Data) -> AuthStatus? {
+        guard let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let loggedIn = o["loggedIn"] as? NSNumber, CFGetTypeID(loggedIn) == CFBooleanGetTypeID() else { return nil }
+        var expiry: Date?
+        if let raw = o["loginExpiresAt"], !(raw is NSNull) {
+            guard let text = raw as? String, let date = ISODate.parse(text) else { return nil }
+            expiry = date
+        }
+        return AuthStatus(loggedIn: loggedIn.boolValue, loginExpiresAt: expiry)
+    }
+
+    /// 只记录真实查询；退避命中不调用这里，避免把等待误当成连续失败。
+    struct ThrottleStreak {
+        private(set) var startedAt: Date?
+        private(set) var count = 0
+        private var lastAt: Date?
+        /// 两次真实查询隔得比这还久（多半是睡眠）就重新计数：限流 2 次、睡 8 小时、醒来再限流 1 次不算「连续 30 分钟」
+        static let maxGap: TimeInterval = 2 * 3600
+
+        mutating func record(_ outcome: Outcome, auth: AuthStatus?, now: Date) -> Outcome {
+            guard outcome == throttled else { self = Self(); return outcome }
+            if let auth, !auth.loggedIn || auth.loginExpiresAt.map({ $0 < now }) == true {
+                self = Self()
+                return needsLogin
+            }
+            if startedAt == nil || now < startedAt! || lastAt.map({ now.timeIntervalSince($0) > Self.maxGap }) == true {
+                startedAt = now; count = 0
+            }
+            lastAt = now
+            count += 1
+            return count >= 3 && now.timeIntervalSince(startedAt!) >= 1800 ? suspectedLogin : throttled
+        }
+    }
+
+    actor AuthCache {
+        private var checkedAt: Date?
+        private var status: AuthStatus?
+        private var pending: Task<AuthStatus?, Never>?
+
+        /// 平时 6 小时查一次；没查到（超时等）或 3 天内到期时 20 分钟就重查：
+        /// auth status 只读本地、约 1 秒，重新登录后「N 天后到期」不该再挂好几个小时
+        static func ttl(_ status: AuthStatus?, now: Date) -> TimeInterval {
+            guard let status, let expiry = status.loginExpiresAt, expiry.timeIntervalSince(now) > 3 * 86400 else { return 20 * 60 }
+            return 6 * 3600
+        }
+
+        func read(now: Date, refresh: Bool = false,
+                  load: @escaping @Sendable () async -> AuthStatus?) async -> AuthStatus? {
+            if let pending { return await pending.value }
+            if !refresh, let checkedAt, now >= checkedAt, now.timeIntervalSince(checkedAt) < Self.ttl(status, now: now) { return status }
+            let task = Task { await load() }
+            pending = task
+            let result = await task.value
+            status = result
+            checkedAt = now
+            pending = nil
+            return result
+        }
+    }
+
     private actor SharedBackoff {
         private var state = Backoff()
+        private var streak = ThrottleStreak()
+        private var suspected = false
+        private var loginInvalid = false
 
         func blocked(now: Date) -> Bool { state.blocked(now: now) }
 
-        func record(_ outcome: Outcome, now: Date, log: @Sendable (String) -> Void) {
-            state.record(outcome, now: now)
-            if outcome == throttled {
+        func record(_ outcome: Outcome, auth: AuthStatus?, now: Date, log: @Sendable (String) -> Void) -> Outcome {
+            let wasSuspected = suspected, wasInvalid = loginInvalid
+            let result = streak.record(outcome, auth: auth, now: now)
+            suspected = result == suspectedLogin
+            loginInvalid = result == needsLogin
+            if result == throttled {
+                state.record(result, now: now)
                 log("claude 额度被限流，\(state.minutes) 分钟内不再查")
+            } else if isLoginProblem(result) {
+                // 登录问题由 Store 的 5 分钟轮询接管，不能继续被 30 分钟限流退避挡住。
+                state = Backoff()
+            } else {
+                // 超时、认不出等：照旧只在拿到额度时清零退避，免得一次超时把限流退避打回 5 分钟
+                state.record(result, now: now)
             }
+            // 失效期间每 5 分钟查一次，只在刚判成失效时记一条，免得一天几百条
+            if result == needsLogin, !wasInvalid, let auth {
+                log("claude 登录已失效（auth status：\(auth.loggedIn ? "已过期" : "未登录")）")
+            }
+            if result == suspectedLogin, !wasSuspected, let start = streak.startedAt {
+                log("claude 连续 \(Int(now.timeIntervalSince(start) / 60)) 分钟拿不到额度，按登录掉线提示")
+            }
+            return result
         }
     }
 
     private static let backoff = SharedBackoff()
+    private static let authCache = AuthCache()
+
+    private static func authStatus(now: Date, refresh: Bool = false) async -> AuthStatus? {
+        await authCache.read(now: now, refresh: refresh) {
+            guard let exe = locate(candidates(home: URL(fileURLWithPath: NSHomeDirectory()), claudeConfig: AgentDirs.current.claudeConfig)) else { return nil }
+            return await runAuthStatus(executable: exe, cwd: standardWorkDir)
+        }
+    }
+
+    static func loginExpiry(now: Date) async -> Date? {
+        let auth = await authStatus(now: now)
+        return auth?.loggedIn == true ? auth?.loginExpiresAt : nil
+    }
+
     static let controlArguments = ["--print", "--input-format", "stream-json", "--output-format", "stream-json",
                                    "--verbose", "--no-session-persistence", "--tools", "", "--strict-mcp-config",
                                    "--mcp-config", #"{"mcpServers":{}}"#, "--setting-sources", "",
@@ -101,31 +210,43 @@ enum ClaudeCLIUsage {
     /// 真 App 用：找命令、在固定目录里跑一次
     static func standard(now: Date, log: @escaping @Sendable (String) -> Void = { _ in }) async -> Outcome {
         guard !(await backoff.blocked(now: now)) else { return throttled }
-        guard let exe = locate(candidates(home: URL(fileURLWithPath: NSHomeDirectory()), claudeConfig: AgentDirs.current.claudeConfig)) else { return .notInstalled }
+        guard let exe = locate(candidates(home: URL(fileURLWithPath: NSHomeDirectory()), claudeConfig: AgentDirs.current.claudeConfig)) else { return await backoff.record(.notInstalled, auth: nil, now: now, log: log) }
         var result = await runControl(executable: exe, cwd: standardWorkDir, timeout: timeout, now: now, log: log)
         if result == outdated {
             result = await run(executable: exe, cwd: standardWorkDir, timeout: timeout, now: now, log: log)
         }
-        await backoff.record(result, now: now, log: log)
+        let auth = result == throttled ? await authStatus(now: now, refresh: true) : nil
+        result = await backoff.record(result, auth: auth, now: now, log: log)
         if result == stale { log("claude 返回旧数据（as_of 早于 10 分钟），多半没连上 Anthropic") }
         return result
     }
 
     /// 跑一次命令；超时就结束进程。输出读完再解析
     static func run(executable: URL, cwd: URL, timeout: TimeInterval, now: Date, log: @escaping @Sendable (String) -> Void = { _ in }) async -> Outcome {
-        await execute(executable: executable, cwd: cwd, timeout: timeout, now: now, control: false, log: log)
+        (await execute(executable: executable, cwd: cwd, timeout: timeout, now: now, control: false, log: log)).usage
     }
 
     static func runControl(executable: URL, cwd: URL, timeout: TimeInterval, now: Date, log: @escaping @Sendable (String) -> Void = { _ in }) async -> Outcome {
-        await execute(executable: executable, cwd: cwd, timeout: timeout, now: now, control: true, log: log)
+        (await execute(executable: executable, cwd: cwd, timeout: timeout, now: now, control: true, log: log)).usage
     }
 
-    private static func execute(executable: URL, cwd: URL, timeout: TimeInterval, now: Date, control: Bool, log: @escaping @Sendable (String) -> Void) async -> Outcome {
+    private enum CommandResult {
+        case usage(Outcome), auth(AuthStatus?)
+        var usage: Outcome { if case .usage(let o) = self { return o }; return .unrecognized }
+    }
+
+    static func runAuthStatus(executable: URL, cwd: URL, timeout: TimeInterval = 10) async -> AuthStatus? {
+        let result = await execute(executable: executable, cwd: cwd, timeout: timeout, now: Date(), control: false, auth: true, log: { _ in })
+        if case .auth(let status) = result { return status }
+        return nil
+    }
+
+    private static func execute(executable: URL, cwd: URL, timeout: TimeInterval, now: Date, control: Bool, auth: Bool = false, log: @escaping @Sendable (String) -> Void) async -> CommandResult {
         try? FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
-        return await withCheckedContinuation { (cont: CheckedContinuation<Outcome, Never>) in
+        return await withCheckedContinuation { (cont: CheckedContinuation<CommandResult, Never>) in
             let p = Process()
             p.executableURL = executable
-            p.arguments = control ? controlArguments : arguments
+            p.arguments = auth ? ["auth", "status", "--json"] : (control ? controlArguments : arguments)
             p.currentDirectoryURL = cwd
             let custom = AgentDirs.custom(.standard)[.claude]
             var env = childEnvironment(base: ProcessInfo.processInfo.environment,
@@ -143,7 +264,7 @@ enum ClaudeCLIUsage {
             p.standardError = FileHandle.nullDevice
             let input: Pipe? = control ? Pipe() : nil
             p.standardInput = input.map { $0 as Any } ?? FileHandle.nullDevice
-            let runner = Runner(process: p, pipe: out, input: input, continuation: cont, now: now, log: log)
+            let runner = Runner(process: p, pipe: out, input: input, continuation: cont, now: now, auth: auth, log: log)
             runner.queue.async { runner.start(timeout: timeout) }
         }
     }
@@ -155,8 +276,9 @@ enum ClaudeCLIUsage {
         private let process: Process
         private let pipe: Pipe
         private let input: Pipe?
-        private let continuation: CheckedContinuation<Outcome, Never>
+        private let continuation: CheckedContinuation<CommandResult, Never>
         private let now: Date
+        private let auth: Bool
         private let log: @Sendable (String) -> Void
         private var channel: DispatchIO?
         private var output = Data()
@@ -164,12 +286,13 @@ enum ClaudeCLIUsage {
         private var eof = false
         private var finished = false
 
-        init(process: Process, pipe: Pipe, input: Pipe?, continuation: CheckedContinuation<Outcome, Never>, now: Date, log: @escaping @Sendable (String) -> Void) {
+        init(process: Process, pipe: Pipe, input: Pipe?, continuation: CheckedContinuation<CommandResult, Never>, now: Date, auth: Bool, log: @escaping @Sendable (String) -> Void) {
             self.process = process
             self.pipe = pipe
             self.input = input
             self.continuation = continuation
             self.now = now
+            self.auth = auth
             self.log = log
         }
 
@@ -213,7 +336,7 @@ enum ClaudeCLIUsage {
                 }
                 if error != 0 {
                     finish(.failed(L("cli.readFailed")))
-                    stop(process)
+                    if input == nil { stop(process) }
                 } else if done {
                     if input != nil, !output.isEmpty, accept(output) { return }
                     eof = true
@@ -224,7 +347,7 @@ enum ClaudeCLIUsage {
                 guard !finished else { return }
                 // 即使主进程已退出，子进程也可能持有管道；截止时间不依赖 isRunning。
                 finish(.failed(L("cli.timeout")))
-                stop(process)
+                if input == nil { stop(process) }     // 控制模式 finish 里已经 stop 过，不再发第二次 SIGTERM
             }
         }
 
@@ -255,13 +378,21 @@ enum ClaudeCLIUsage {
 
         private func completeIfReady() {
             guard !finished, eof, let exitCode else { return }
+            if auth {
+                // auth status 的退出码不能代表登录状态；只按完整 stdout 的字段判断。
+                finishAuth(parseAuthStatus(output))
+                return
+            }
             let result = input == nil ? outcome(stdout: output, exitCode: exitCode, now: now)
                 : (exitCode == 0 ? .unrecognized : .failed(L("cli.exitCode", exitCode)))
             if result == .unrecognized { log("claude 命令行额度输出认不出：" + diagnostic(stdout: input == nil ? output : diagnosticOutput + output)) }
             finish(result)
         }
 
-        private func finish(_ result: Outcome) {
+        private func finish(_ result: Outcome) { complete(.usage(result)) }
+        private func finishAuth(_ status: AuthStatus?) { complete(.auth(status)) }
+
+        private func complete(_ result: CommandResult) {
             guard !finished else { return }
             finished = true
             process.terminationHandler = nil
@@ -311,25 +442,33 @@ enum ClaudeCLIUsage {
             let lower = error.lowercased()
             if lower.contains("supported") || lower.contains("unknown") { return outdated }
             if ["auth", "login", "sign in", "logged in"].contains(where: lower.contains) {
-                return .failed(L("cli.needsLogin"))
+                return needsLogin
             }
             return .failed(error.isEmpty ? L("cli.error") : String(error.prefix(80)))
         }
         let payload = response["response"] as? [String: Any] ?? [:]
         guard let available = payload["rate_limits_available"] as? NSNumber,
               CFGetTypeID(available) == CFBooleanGetTypeID(), available.boolValue else {
-            return .failed(L("cli.noSubscription"))
+            // 没有订阅类型：11/6 实测退出登录后是 null；claude 的说明里 API Key / Bedrock / Vertex 也是 null，分不出来，
+            // 所以写「没有用 Pro/Max 账号登录」并给登录方法。有类型但不是 Pro/Max 才说需要订阅
+            let plan = (payload["subscription_type"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
+            return plan.isEmpty ? notPlanLogin : .failed(L("cli.noSubscription"))
         }
         if payload["rate_limits"] == nil || payload["rate_limits"] is NSNull { return throttled }
         let limits = payload["rate_limits"] as? [String: Any] ?? [:]
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let whole = ISO8601DateFormatter()
-        if let asOf = ((limits["seven_day_breakdown"] as? [String: Any])?["as_of"] as? String)
-            .flatMap({ fractional.date(from: $0) ?? whole.date(from: $0) }),
+        if let asOf = ((limits["seven_day_breakdown"] as? [String: Any])?["as_of"] as? String).flatMap(ISODate.parse),
            now.timeIntervalSince(asOf) > staleAfter {
             return stale
         }
+        let windows = Self.windows(from: limits, now: now)
+        guard !windows.isEmpty else { return .unrecognized }
+        return .quota(Quota(plan: (payload["subscription_type"] as? String)?.lowercased(), windows: windows, observedAt: now,
+                            resetCredits: parseResetCredits(limits["cedar_ember"])))
+    }
+
+    /// 额度窗口：five_hour / seven_day / seven_day_opus / seven_day_sonnet，各有 utilization（0–100）和 resets_at（ISO 时间）。
+    /// claude 命令行的 rate_limits 和 claude.ai 网页的 /usage 是同一种格式（ClaudeWebUsage 共用）
+    static func windows(from limits: [String: Any], now: Date) -> [QuotaWindow] {
         var windows: [QuotaWindow] = []
         for (key, kind, minutes): (String, QuotaWindow.Kind, Int) in [
             ("five_hour", .session, 300), ("seven_day", .weekly, 10080),
@@ -338,12 +477,44 @@ enum ClaudeCLIUsage {
             guard let value = limits[key] as? [String: Any],
                   let used = value["utilization"] as? NSNumber,
                   CFGetTypeID(used) != CFBooleanGetTypeID() else { continue }
-            let reset = (value["resets_at"] as? String).flatMap { fractional.date(from: $0) ?? whole.date(from: $0) }
+            let reset = (value["resets_at"] as? String).flatMap(ISODate.parse)
             windows.append(rolledOver(QuotaWindow(kind: kind, usedPercent: min(100, max(0, used.doubleValue)),
                                                   resetsAt: reset, windowMinutes: minutes), now: now))
         }
-        guard !windows.isEmpty else { return .unrecognized }
-        return .quota(Quota(plan: (payload["subscription_type"] as? String)?.lowercased(), windows: windows, observedAt: now))
+        return windows
+    }
+
+    /// 扩展字段独立解析；结构变化不能影响普通额度。
+    static func parseResetCredits(_ value: Any?) -> ResetCredits? {
+        func findGrants(_ value: Any, depth: Int = 0) -> Any? {
+            guard depth < 20 else { return nil }
+            if let object = value as? [String: Any] {
+                if let grants = object["grants"] { return grants }
+                for key in object.keys.sorted() {
+                    if let found = findGrants(object[key]!, depth: depth + 1) { return found }
+                }
+            } else if let array = value as? [Any] {
+                for child in array {
+                    if let found = findGrants(child, depth: depth + 1) { return found }
+                }
+            }
+            return nil
+        }
+        guard let value, !(value is NSNull),
+              let grants = (findGrants(value) ?? value) as? [[String: Any]] else { return nil }
+        var total = 0
+        var dates: [Date] = []
+        for grant in grants {
+            guard let left = ResetCredits.count(grant["resets_left"]) else { return nil }
+            let sum = total.addingReportingOverflow(left)
+            guard !sum.overflow else { return nil }
+            total = sum.partialValue
+            if let end = grant["ends_at"], !(end is NSNull) {
+                guard let date = ResetCredits.date(end) else { return nil }
+                dates.append(date)
+            }
+        }
+        return ResetCredits(available: total, expiresAt: dates.min())
     }
 
     /// 命令的标准输出（JSON，可能混着别的行）→ 结果
@@ -384,7 +555,8 @@ enum ClaudeCLIUsage {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { $0.lowercased().hasPrefix("current") }.joined(separator: " | ")
         } ?? ""
-        return (current + "；前 200 字：" + String(text.prefix(200)))
+        // 会写进 app.log：原始输出部分先打码（邮箱、token 等）；Current 行是额度文字，原样保留
+        return (current + "；前 200 字：" + Diagnostics.redact(String(text.prefix(200))))
             .components(separatedBy: .newlines).joined(separator: "⏎")
     }
 

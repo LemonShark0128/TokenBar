@@ -1,7 +1,18 @@
 import Foundation
 
 /// 面板/小组件/菜单栏共用的视图数据（原来由 Python 采集服务的 /api/app 提供，第一期起由 AppDataMapping 从 UsageStore 生成）
+struct ApiValue: Codable, Equatable {
+    var todayUSD: Double
+    var weekUSD: Double
+    var perProvider: [String: Double]
+    var partial: Bool
+}
+
 struct AppData: Codable {
+    var mainProvider: ProviderID = .deepseek
+    var mainCardSide: Side? = nil
+    var cardExchangeRate: Double = 7.1
+    var apiValue: ApiValue? = nil
     struct RunwayChip: Codable, Equatable {
         var title: String; var detail: String?; var severity: Int
         var short: String
@@ -55,10 +66,22 @@ struct AppData: Codable {
         var usedPercent: Double; var isReset: Bool; var reset: String?
         /// 窄处（小组件）用的重置时间：「2:13 后重置」；已重置为 nil
         var resetShort: String? = nil
+        var paceRemainingPercent: Double? = nil
+        var countdown: String? = nil
+        var windowKind: String? = nil
+        var resetsAt: Date? = nil
+
+        /// 此刻剩余百分比：已重置或已过重置时间按 100；读数不是有限数时为 nil
+        func remaining(at now: Date) -> Double? {
+            if isReset || resetsAt.map({ $0 <= now }) == true { return 100 }
+            return usedPercent.isFinite ? max(0, min(100, 100 - usedPercent)) : nil
+        }
     }
     /// 套餐平台主面板的数据；quota 为 nil 时只显示 note
     struct QuotaView: Codable, Equatable {
-        var remainingPercent: Double?; var headline: String?; var secondLine: String?
+        var resetCredits: String? = nil
+        var resetCreditsCount: Int? = nil
+        var remainingPercent: Double?; var headline: String?
         var rows: [QuotaRow]; var lastUsed: String?; var note: String?
         /// 套餐名的显示形式（「Plus 套餐」）；Claude 没有
         var plan: String? = nil
@@ -100,8 +123,21 @@ struct AppData: Codable {
         /// 套餐平台还没有额度数据时的那句说明（如「打开 Claude 桌面 App…」）；有数据时为 nil
         var quotaNote: String? = nil
         var quotaStale: Bool = false
+        var quotaRows: [QuotaRow] = []
         var riskText: String? = nil
         var riskSeverity: Int? = nil
+        var resetCredits: String? = nil
+        var resetCreditsCount: Int? = nil
+        var plan: String? = nil
+        var monthCost: Double? = nil
+        var runwayDays: Double? = nil
+        var avgCnyPerDayWeek: Double? = nil
+        /// 日均覆盖了几天（平台只给周 / 月累计时，可能不到 7 天）；nil = 近 7 天
+        var avgDays: Int? = nil
+        /// tank 是 API Key 的剩余花费上限（OpenRouter），界面叫「Key 剩余额度」
+        var tankIsKeyLimit: Bool = false
+        var dataStale: Bool = false
+        var lastUpdated: Date? = nil
         /// 要不要标橙（不是「正常」和「正在连接」）
         var needsAttention: Bool { status != L("side.ok") && status != L("side.connecting") }
     }
@@ -114,7 +150,8 @@ struct AppData: Codable {
     }
     struct CostTok: Codable {
         var costCny: Double; var tokens: Int; var source: String?
-        var known: Bool { source == "平台账单" }
+        /// 有可用的花费数字：平台账单，或按余额变化估算（Kimi；界面另标「估算」）
+        var known: Bool { source == "平台账单" || source == "余额估算" }
     }
     struct ModelUse: Codable, Identifiable {
         var key: String; var label: String
@@ -145,6 +182,7 @@ struct AppData: Codable {
     var sides: [Side] = []
     /// 各平台今日花费换成人民币之和；没有任何平台有今日花费时为 nil
     var totalTodayCny: Double? = nil
+    var yesterdaySameTimeCny: Double? = nil
     /// 合计里有美元平台（按设置汇率换算）：界面加「≈」
     var totalIsApprox: Bool = false
     /// 明细到了页数上限没拉完：近 7 天趋势可能少算，界面标「不完整」（硅基流动重度用户）
@@ -161,6 +199,10 @@ extension AppData {
     /// 手写解码：第二期新加的字段旧采集 /api/app 没有（启动时 UsageStore 接上前会先读一次），缺了取默认值
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        mainProvider = try c.decodeIfPresent(ProviderID.self, forKey: .mainProvider) ?? .deepseek
+        mainCardSide = try c.decodeIfPresent(Side.self, forKey: .mainCardSide)
+        cardExchangeRate = try c.decodeIfPresent(Double.self, forKey: .cardExchangeRate) ?? 7.1
+        apiValue = try c.decodeIfPresent(ApiValue.self, forKey: .apiValue)
         runway = try c.decodeIfPresent(RunwayChip.self, forKey: .runway)
         banner = try c.decodeIfPresent(RiskBanner.self, forKey: .banner)
         sidesByRisk = try c.decodeIfPresent(Bool.self, forKey: .sidesByRisk) ?? false
@@ -173,10 +215,42 @@ extension AppData {
         burn = try c.decodeIfPresent(Burn.self, forKey: .burn)
         sides = try c.decodeIfPresent([Side].self, forKey: .sides) ?? []
         totalTodayCny = try c.decodeIfPresent(Double.self, forKey: .totalTodayCny)
+        yesterdaySameTimeCny = try c.decodeIfPresent(Double.self, forKey: .yesterdaySameTimeCny)
         totalIsApprox = try c.decodeIfPresent(Bool.self, forKey: .totalIsApprox) ?? false
         trendIncomplete = try c.decodeIfPresent(Bool.self, forKey: .trendIncomplete) ?? false
         monthModelsIncomplete = try c.decodeIfPresent(Bool.self, forKey: .monthModelsIncomplete) ?? false
         quota = try c.decodeIfPresent(QuotaView.self, forKey: .quota)
         tokenSources = try c.decodeIfPresent([TokenSource].self, forKey: .tokenSources) ?? []
+    }
+}
+
+extension AppData.Side {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        tank = try c.decodeIfPresent(Double.self, forKey: .tank)
+        currency = try c.decode(String.self, forKey: .currency)
+        todayCost = try c.decodeIfPresent(Double.self, forKey: .todayCost)
+        status = try c.decode(String.self, forKey: .status)
+        quotaRemaining = try c.decodeIfPresent(Double.self, forKey: .quotaRemaining)
+        quotaReset = try c.decodeIfPresent(String.self, forKey: .quotaReset)
+        quotaExhausted = try c.decodeIfPresent(QuotaExhausted.self, forKey: .quotaExhausted)
+        menuQuota = try c.decodeIfPresent(AppData.MenuQuota.self, forKey: .menuQuota)
+        quotaNote = try c.decodeIfPresent(String.self, forKey: .quotaNote)
+        quotaStale = try c.decodeIfPresent(Bool.self, forKey: .quotaStale) ?? false
+        quotaRows = try c.decodeIfPresent([AppData.QuotaRow].self, forKey: .quotaRows) ?? []
+        resetCredits = try c.decodeIfPresent(String.self, forKey: .resetCredits)
+        resetCreditsCount = try c.decodeIfPresent(Int.self, forKey: .resetCreditsCount)
+        plan = try c.decodeIfPresent(String.self, forKey: .plan)
+        monthCost = try c.decodeIfPresent(Double.self, forKey: .monthCost)
+        riskText = try c.decodeIfPresent(String.self, forKey: .riskText)
+        riskSeverity = try c.decodeIfPresent(Int.self, forKey: .riskSeverity)
+        runwayDays = try c.decodeIfPresent(Double.self, forKey: .runwayDays)
+        avgCnyPerDayWeek = try c.decodeIfPresent(Double.self, forKey: .avgCnyPerDayWeek)
+        avgDays = try c.decodeIfPresent(Int.self, forKey: .avgDays)
+        tankIsKeyLimit = try c.decodeIfPresent(Bool.self, forKey: .tankIsKeyLimit) ?? false
+        dataStale = try c.decodeIfPresent(Bool.self, forKey: .dataStale) ?? false
+        lastUpdated = try c.decodeIfPresent(Date.self, forKey: .lastUpdated)
     }
 }

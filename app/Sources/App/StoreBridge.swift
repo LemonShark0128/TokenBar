@@ -16,10 +16,20 @@ extension UsageModel {
             .merge(with: store.$switchState.map { _ in () })
             .merge(with: store.$menuBarProvider.map { _ in () })
             .merge(with: store.$menuBarRotation.map { _ in () })
+            .merge(with: store.$spendHistory.map { _ in () })
             .receive(on: DispatchQueue.main)
             .sink { @MainActor [weak self] _ in self?.applyStore() }     // 前面已 receive(on: main)
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.monitoredAgentDirs != AgentDirs.current else { return }
+                self.reloadRunningTasks()
+            }
+        }
+        startLogMonitoring()
         retuneRunningTimer()
         reloadRunningTasks()
+        store.surfaceVisible = panelShown || widgetVisible
+        if refreshPause.paused { store.setPaused(true) }
         store.start(intervalSeconds: refreshSeconds)
     }
 
@@ -29,16 +39,27 @@ extension UsageModel {
         guard let store = usageStore else { return }
         let pick = SettingsLayout.mainPick(k, current: store.mainProvider)
         if let id = pick.pin { store.pinMain(id) }
-        store.setAutoMain(pick.auto)
-        objectWillChange.send()
+        store.setAutoMain(pick.auto)     // switchState 变化经 storeSub → applyStore 刷新界面
+    }
+
+    /// 用户 2026-11-13：取数和任务扫描后同步，活动出现、限流、到期都触发菜单栏刷新。
+    @MainActor
+    private func syncMenuBarPaygActivity() {
+        let active = usageStore?.paygActiveIDs(now: fixedNow ?? Date()) ?? []
+        if active != menuBarPaygActive { menuBarPaygActive = active }
     }
 
     @MainActor
     func applyStore() {
         guard let store = usageStore else { return }
+        syncMenuBarPaygActivity()
+        scheduleAlertFlush() // 没有新提醒的刷新也要送出安静时段积压。
+        reconcileTodayLayout()
         let risks = store.risks()
+        let kc = StatusPresenter.keychainBanner(store.platforms)
+        if kc != keychainBanner { keychainBanner = kc }
         var pruned = bannerDismissal
-        let added = Set(store.platforms.filter { $0.status != .notAdded }.map(\.id))
+        let added = Set(store.platforms.filter { $0.status.isShown }.map(\.id))
         pruned.prune(risks: risks, pending: added.subtracting(store.platformsWithReading()))
         if pruned != bannerDismissal {
             bannerDismissal = pruned
@@ -54,14 +75,18 @@ extension UsageModel {
             switchNotice = notice
             store.consumeAutoSwitch()
         }
-        syncAlertFromSettings()
         // Codex 套餐第一次读到额度：日志只写这一句（不写额度数字和日志内容）
         if !codexQuotaLogged, store.platforms.contains(where: { $0.id == .codexPlan && $0.status != .notAdded && $0.snapshot?.quota != nil }) {
             codexQuotaLogged = true
             logLine("已读到 Codex 额度")
         }
-        checkQuotaExhausted(store.platforms, now: Date())
-        needsSetup = main.status == .notAdded       // 由 UsageStore 判断，这里不读钥匙串
+        let quotaNow = Date()
+        checkQuotaExhausted(store.platforms, now: quotaNow)
+        checkQuotaRecovered(store.platforms, now: quotaNow)
+        let hidden = store.hiddenPlatforms
+        if hidden != hiddenIDs { hiddenIDs = hidden }
+        // 由 UsageStore 判断，这里不读钥匙串；平台全隐藏了（主平台也是隐藏的）同样没东西可显示
+        needsSetup = !main.status.isShown
         if needsSetup {           // 还没添加平台：不算错误，面板显示添加入口
             data = nil
             menuBarSide = nil
@@ -71,21 +96,24 @@ extension UsageModel {
         let others = store.platforms.filter { $0.id != main.id }
         reloadLocalUsageIfDue(store.platforms)
         // 其他平台：保持当前顺序，只处理增减（名次在下次打开面板时才更新）
-        let sideIDs = others.filter { $0.status != .notAdded }.map(\.id)
+        let sideIDs = others.filter { $0.status.isShown }.map(\.id)
         sideOrder = SideOrder.reconcile(sideOrder, with: SideOrder.ranked(sideIDs, activity: store.activities()))
         let hasData = main.snapshot != nil || main.lastSample != nil
         let wasErr = error != nil
         error = StatusPresenter.error(for: main, name: ProviderRegistry.displayName(main.id))
         if hasData {
-            var d = AppDataMapping.appData(main: main, others: others, now: Date(), timeZone: .autoupdatingCurrent,
-                                           usdToCny: ProviderSettings.load(.standard).usdToCny, localUsage: localUsage)
+            let now = Date(), zone = TimeZone.autoupdatingCurrent
+            let spendHistory = store.spendHistory(now: now, timeZone: zone)
+            var d = AppDataMapping.appData(main: main, others: others, now: now, timeZone: zone,
+                                           usdToCny: ProviderSettings.load(.standard).usdToCny, localUsage: localUsage,
+                                           localBreakdowns: localBreakdowns, spendHistory: spendHistory)
             d.sides = SideOrder.apply(sideOrder, to: d.sides)
             AppDataMapping.applyRisks(&d, main: main.id, risks: risks, now: Date(),
                                       timeZone: .autoupdatingCurrent, currency: d.balance.currency)
             data = d
             // 菜单栏平台就是主平台时不单独取一行：沿用主平台的完整数据（估算今日、续航天数等与原来一致）
             menuBarSide = store.menuBarProvider == main.id ? nil
-                : store.platforms.first { $0.id == store.menuBarProvider && $0.status != .notAdded }
+                : store.platforms.first { $0.id == store.menuBarProvider && $0.status.isShown }
                     .map { AppDataMapping.side($0, now: Date(), timeZone: .autoupdatingCurrent) }
             okCount += main.snapshot != nil && !main.snapshotFromDisk ? 1 : 0
             // 套餐平台不写额度数字（只写平台名）
@@ -93,54 +121,77 @@ extension UsageModel {
             if wasErr && error == nil {
                 logLine("已恢复刷新：\(mainName)\(tank)")
             } else if okCount == 1 {
-                logLine("开始刷新：\(mainName)\(tank) · 每 \(refreshSeconds) 秒（数据来自 App 内置采集）")
+                logLine("开始刷新：\(mainName)\(tank) · 每 \(Int(store.currentInterval(main.id).rounded())) 秒（数据来自 App 内置采集）")
             }
         } else {
             data = nil
             menuBarSide = nil       // 主平台没数据时不留着别的平台的旧数字（自查 Bug D）
         }
+        refreshPanelDetail()
+        refreshWidgetDetail()
         // 各平台的预警线和用量异常：不管主平台有没有数据都按平台检查（第七批自查）
         checkPlatformAlerts(store)
     }
 }
 
 extension UsageModel {
-    /// 添加了 Claude 套餐 / Codex 套餐才读本机日志；放到后台线程，读完回主线程重新生成界面数据
-    /// 扫一次正在跑的任务（只扫已添加的 Claude / Codex 套餐）；结果变了才发布，面板开着时重新定高
     @MainActor
-    func reloadRunningTasks() {
-        guard fixedNow == nil, let store = usageStore else { return }
-        let enabled = Set(store.platforms.filter { ($0.id == .claudePlan || $0.id == .codexPlan) && $0.status != .notAdded }.map(\.id))
+    private var enabledTaskProviders: Set<ProviderID> {
+        guard let store = usageStore else { return [] }
+        return Set(store.platforms.filter { MenuBarSecondary.canRun($0.id) && $0.status.isShown }.map(\.id))
+    }
+
+    /// 扫一次正在跑的任务（只扫已添加且未隐藏的可运行套餐平台）；结果变了才发布，面板开着时重新定高
+    @MainActor
+    func reloadRunningTasks(knownOnly: Bool = false) {
+        guard fixedNow == nil, !refreshPause.paused, let store = usageStore else { return }
+        let enabled = enabledTaskProviders
+        monitoredAgentDirs = AgentDirs.current
+        logWatcher?.rebuild(dirs: AgentDirs.current, enabled: enabled)
+        if runningScanBusy {
+            if !knownOnly { runningFullScanPending = true }
+            return
+        }
         runningGen += 1
         let gen = runningGen
         guard !enabled.isEmpty else {
             store.setRunningTasks([:])
-            Task { await store.setPlanActivity([:]) }
+            if !recentRunningAgents.isEmpty { recentRunningAgents = [] }
             if !runningTasks.isEmpty { runningTasks = []; if panelShown { onRefit?() } }
             retuneRunningTimer()
             return
         }
         let dirs = AgentDirs.current
         let cache = runningCache
-        let probe = desktopProbe
+        let known = Dictionary(grouping: runningTasks.filter { enabled.contains($0.provider) }, by: \.provider)
+            .mapValues { $0.map { URL(fileURLWithPath: $0.sessionKey) } }
+        runningScanBusy = true
         Task { @MainActor [weak self] in
-            let (r, activity) = await Task.detached(priority: .utility) { () -> ([RunningTask], [ProviderID: Date]) in
-                let s = RunningTasks.scanDetailed(enabled: enabled, claudeDir: dirs.claudeConfig,
-                                                  codexSessions: dirs.codexSessions, now: Date(), cache: cache)
-                // 刷新频率用的「有没有在用」：会话日志最近修改 + 在跑的任务 + 桌面 App 记到的额度变化
-                var activity = s.lastChange
-                for t in s.tasks { activity[t.provider] = max(activity[t.provider] ?? t.lastActivity, t.lastActivity) }
-                if enabled.contains(.claudePlan), let d = probe.changedAt(ClaudeAppUsageSource.standardURL) {
-                    activity[.claudePlan] = max(activity[.claudePlan] ?? d, d)
-                }
-                return (s.tasks, activity)
+            let r = await Task.detached(priority: .utility) { () -> [RunningTask] in
+                let s = knownOnly ? RunningTasks.scanKnown(known, now: Date(), cache: cache) : RunningTasks.scanDetailed(
+                    enabled: enabled, claudeDir: dirs.claudeConfig, codexSessions: dirs.codexSessions, now: Date(),
+                    antigravityBrain: dirs.antigravityBrain, cache: cache)
+                return s.tasks
             }.value
-            guard let self, gen == self.runningGen else { return }   // 晚结束的旧扫描丢掉
+            guard let self else { return }
+            self.runningScanBusy = false
+            defer {
+                if self.runningFullScanPending && !self.refreshPause.paused {
+                    self.runningFullScanPending = false
+                    self.reloadRunningTasks()
+                }
+            }
+            guard gen == self.runningGen, !self.refreshPause.paused else { return }   // 晚结束的旧扫描丢掉
             // 菜单栏「自动 / 跟随主面板」要知道各平台最近一次任务活动（每次都交，10 分钟的窗口随时间过去）
             var last: [ProviderID: Date] = [:]
             for t in r { last[t.provider] = max(last[t.provider] ?? t.lastActivity, t.lastActivity) }
+            var remembered = self.menuBarLastActivity
+            for (id, date) in last { remembered[id] = max(remembered[id] ?? date, date) }
+            if remembered != self.menuBarLastActivity { self.menuBarLastActivity = remembered }
             self.usageStore?.setRunningTasks(last)
-            await self.usageStore?.setPlanActivity(activity)
+            self.syncMenuBarPaygActivity()
+            let recent = RunningActivity.recentAgents(r, now: Date())
+            if recent != self.recentRunningAgents { self.recentRunningAgents = recent }
             if r != self.runningTasks {
                 self.runningTasks = r
                 if self.panelShown { self.onRefit?() }
@@ -149,29 +200,83 @@ extension UsageModel {
         }
     }
 
-    /// 在跑任务扫描的频率：面板或小组件开着、或最近 5 分钟有在跑的任务时每 10 秒，否则每 30 秒。变了才重建计时器
     @MainActor
     func retuneRunningTimer() {
-        guard fixedNow == nil, usageStore != nil else { return }
+        guard fixedNow == nil, usageStore != nil, !refreshPause.paused else { return }
         let want = RunningScanCadence.interval(visible: panelShown || widgetVisible,
                                                lastTask: runningTasks.map(\.lastActivity).max(), now: Date())
-        guard want != runningScanEvery || runningTimer == nil else { return }
+        guard want != runningScanEvery || (want != nil && runningTimer == nil) else { return }
+        runningTimer = nil
         runningScanEvery = want
+        guard let want else { return }
         runningTimer = Timer.publish(every: want, tolerance: want * 0.15, on: .main, in: .common).autoconnect()
-            .sink { @MainActor [weak self] _ in self?.reloadRunningTasks() }     // 计时器挂在主 RunLoop 上
+            .sink { @MainActor [weak self] _ in self?.reloadRunningTasks(knownOnly: want == RunningScanCadence.fast) }
     }
 
-    /// 面板或小组件刚打开：马上扫一次，扫描切回每 10 秒
+    @MainActor
+    func startLogMonitoring() {
+        guard fixedNow == nil, !refreshPause.paused else { return }
+        if logWatcher == nil {
+            logWatcher = AgentLogWatcher { [weak self] changed in
+                Task { @MainActor in self?.logsChanged(changed) }
+            }
+        }
+        monitoredAgentDirs = AgentDirs.current
+        logWatcher?.rebuild(dirs: AgentDirs.current, enabled: enabledTaskProviders, force: true)
+        runningFallbackTimer = Timer.publish(every: RunningScanCadence.fallback, tolerance: 15, on: .main, in: .common).autoconnect()
+            .sink { @MainActor [weak self] _ in self?.reloadRunningTasks() }
+    }
+
+    /// 日志文件变了：只是已知在跑的会话就只追读它们，扫不到的文件（子代理日志等）不扫，出现新会话才完整扫描。
+    /// 原来每次都完整扫描，Agent 持续写日志时每秒列一遍所有会话文件（11-05 实测约 3% CPU）
+    @MainActor
+    func logsChanged(_ changed: Set<String>) {
+        let enabled = enabledTaskProviders
+        guard !enabled.isEmpty else { return }
+        let dirs = AgentDirs.current
+        switch RunningScanTrigger.decide(changed: changed, known: Set(runningTasks.map(\.sessionKey)),
+                                         claudeProjects: dirs.claudeConfig.appendingPathComponent("projects"),
+                                         codexSessions: dirs.codexSessions,
+                                         antigravityBrain: enabled.contains(.geminiPlan) ? dirs.antigravityBrain : nil) {
+        case .ignore: break
+        case .known: reloadRunningTasks(knownOnly: true)
+        case .full: reloadRunningTasks()
+        }
+    }
+
+    @MainActor
+    func setRefreshPaused(_ paused: Bool) {
+        guard refreshPause.setPaused(paused) else { return }
+        logLine(paused ? "刷新已暂停（锁屏或显示器休眠）" : "刷新已恢复，立即刷新")
+        usageStore?.setPaused(paused)
+        if paused {
+            runningGen += 1
+            runningTimer = nil
+            runningFallbackTimer = nil
+            runningScanEvery = nil
+            logWatcher?.stop()
+        } else {
+            systemIsDark = StatusTheme.systemIsDark()
+            startLogMonitoring()
+            reloadRunningTasks()
+            retuneRunningTimer()
+        }
+    }
+
     @MainActor
     func visibilityChanged(shown: Bool) {
-        guard usageStore != nil else { return }
+        guard let store = usageStore else { return }
+        let visible = panelShown || widgetVisible
+        Task { @MainActor in await store.setSurfaceVisible(visible) }
         if shown { reloadRunningTasks() } else { retuneRunningTimer() }
     }
 
+    /// 添加了 Claude 套餐 / Codex 套餐才读本机日志；放到后台线程，读完回主线程重新生成界面数据
     @MainActor
     func reloadLocalUsageIfDue(_ platforms: [PlatformState]) {
-        let enabled = Set(platforms.filter { ProviderRegistry.meter($0.id) == .quota && $0.status != .notAdded }.map(\.id))
+        let enabled = Set(platforms.filter { ($0.id == .claudePlan || $0.id == .codexPlan) && $0.status.isShown }.map(\.id))
         if localUsage.keys.contains(where: { !enabled.contains($0) }) { localUsage = localUsage.filter { enabled.contains($0.key) } }
+        localBreakdowns = localBreakdowns.filter { enabled.contains($0.key) }
         // 套餐平台都移除了：不会再读，顺手放掉缓存
         if enabled.isEmpty { localCache.clear(.claude); localCache.clear(.codex) }
         let now = Date()
@@ -181,12 +286,14 @@ extension UsageModel {
         let cache = localCache
         Task { @MainActor [weak self] in
             let r = await Task.detached(priority: .utility) {
-                LocalAgentUsage.read(enabled: enabled, claudeDir: dirs.claudeConfig,
+                LocalAgentUsage.readDetailed(enabled: enabled, claudeDir: dirs.claudeConfig,
                                      codexSessions: dirs.codexSessions, now: now, timeZone: tz, cache: cache)
             }.value
             guard let self, self.localThrottle.finish(gen) else { return }   // 晚结束的旧读取丢掉
-            let changed = r != self.localUsage
-            self.localUsage = r
+            let changed = r.tokens != self.localUsage || r.breakdowns != self.localBreakdowns
+            self.localUsage = r.tokens
+            self.localBreakdowns = r.breakdowns
+            self.usageStore?.setActiveMinutes(r.activeMinutes)
             if changed { self.applyStore() }
         }
     }
@@ -219,6 +326,8 @@ extension UsageModel {
     /// 打开前准备内容以量高度；此处不启动提醒计时，也不把面板标成可见。
     @MainActor
     func panelAppeared() {
+        detailPlatform = nil
+        panelDetailModel = nil
         refreshClaudeHookState()
         reorderSidesOnOpen()
         guard let store = usageStore else { return }
@@ -279,21 +388,11 @@ extension UsageModel {
 }
 
 extension UsageModel {
-    /// 读-改-写 ProviderSettings（汇率、预警线都在里面），随后把主平台预警线同步回镜像
+    /// 读-改-写 ProviderSettings（汇率、预警线都在里面），随后通知界面刷新
     func updateProviderSettings(_ change: (inout ProviderSettings) -> Void) {
         var s = ProviderSettings.load(.standard)
         change(&s)
         s.save(.standard)
-        syncAlertFromSettings()
         objectWillChange.send()
-    }
-
-    /// 主平台的预警线 → balanceAlertCny（不回写）
-    func syncAlertFromSettings() {
-        let v = ProviderSettings.load(.standard).lowAlerts[mainID].map { NSDecimalNumber(decimal: $0).doubleValue } ?? 0
-        guard v != balanceAlertCny else { return }
-        syncingAlert = true
-        balanceAlertCny = v
-        syncingAlert = false
     }
 }

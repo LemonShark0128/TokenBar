@@ -1,18 +1,16 @@
 import Network
 import AppKit
-import Combine
 import SwiftUI
-import UserNotifications
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: UsageModel?
     var status: StatusBarController?
-    private var subs = Set<AnyCancellable>()
     private let pathMonitor = NWPathMonitor()
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        EditMenu.install()     // 输入框里 ⌘C / ⌘V 等快捷键要靠主菜单分发
         let m = UsageModel()
         model = m
         // 第一期：数据由 App 内置采集（UsageStore）提供；凭据在钥匙串，采样历史在 Application Support
@@ -24,7 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if opened == nil { logLine("采样库打不开，本次采样只记在内存里（重启后历史清空）") }
         if let samples = opened ?? (try? SampleStore(path: ":memory:")) {
             let creds = KeychainCredentialStore()
-            let store = UsageStore(providers: ProviderRegistry.all.map { ProviderRegistry.makeProvider($0, http: URLSessionHTTPClient(), log: { logLine($0) }) },
+            let store = UsageStore(providers: ProviderRegistry.all.map { ProviderRegistry.makeProvider($0, http: URLSessionHTTPClient(), credentials: creds, log: { logLine($0) }) },
                                    credentials: creds,
                                    samples: samples, intervalSeconds: m.refreshSeconds,
                                    snapshotCache: SnapshotCache(url: supportDir.appendingPathComponent("last-snapshot.json")),
@@ -81,6 +79,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             + "标题=「\(b.attributedTitle.string)」 图标template=\(b.image?.isTemplate ?? false) "
                             + "变灰=\(b.appearsDisabled) 模式=\(m.mbMode) 信号=\(m.menuSignal)")
                 }
+            case "mbs:bars": m.mbStyle = "bars"
+            case "mbs:classic": m.mbStyle = "classic"
             case "mb:balance": m.mbMode = "balance"
             case "mb:cost": m.mbMode = "cost"
             case "mb:icon": m.mbMode = "icon"
@@ -130,7 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var wasOffline = false
     private func networkChanged(online: Bool) {
         if online {
-            if wasOffline { DispatchQueue.main.async { logLine("网络已恢复，立即刷新"); self.model?.fetch() } }
+            if wasOffline { logLine("网络已恢复，立即刷新"); model?.fetch() }     // 已在主线程（pathUpdateHandler 里 Task @MainActor）
             wasOffline = false
         } else {
             wasOffline = true

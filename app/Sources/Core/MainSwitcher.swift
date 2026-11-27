@@ -33,13 +33,6 @@ enum Activity: Equatable {
     case money(perHourCny: Decimal)
     case quota(risePP: Double)
 
-    /// 近 1 小时算「在用」（主平台切换、菜单栏跟随主面板共用门槛）
-    var inUse: Bool {
-        switch self {
-        case .money(let r): return r >= MainSwitcher.floorPerHourCny
-        case .quota(let x): return x >= MainSwitcher.quotaFloorPP
-        }
-    }
     /// 相对「在用」下限的倍数，跨类型挑最活跃的平台时用（「其他平台」排序也用它，见 SideOrder）
     var multiple: Double {
         switch self {
@@ -49,14 +42,14 @@ enum Activity: Equatable {
     }
 }
 
-/// 主平台自动切换（用户 2026-10-18 定）：10 分钟内有任务在跑的平台；几个都在跑按平台顺序每 10 秒轮流，
+/// 主平台自动切换（用户 2026-10-18 定）：10 分钟内有任务在跑的平台；几个都在跑时固定显示其中的常用平台（2026-11-06 起不再每 10 秒轮流，见 PreferredPlatform），
 /// 只剩一个时保留 1 分钟切换冷却；都没在跑保持上一次。手动设主平台后暂停 7200 秒。
-/// 活跃度门槛（Activity.inUse）仍用在菜单栏「跟随主面板」和「其他平台」排序
+/// 活跃度门槛（Activity.multiple）只用在「其他平台」排序
 enum MainSwitcher {
     static let floorPerHourCny: Decimal = 0.5
     /// 套餐平台「在用」的下限：近 1 小时额度涨幅（百分点）
     static let quotaFloorPP: Double = 5
-    /// 任务最后活动在这么久以内算「在跑」（与菜单栏 MenuBarRotation 相同）
+    /// 任务最后活动在这么久以内算「在跑」
     static let runningWindow: TimeInterval = 600
     /// 两次自动切换之间至少隔这么久
     static let minInterval: TimeInterval = 60
@@ -64,13 +57,14 @@ enum MainSwitcher {
     static let pinFor: TimeInterval = 7200
 
     /// lastActivity：各平台最近一次本机任务活动；added：已添加的平台
+    /// preferred：常用平台（几个同时在用时显示它）
     static func step(_ s: MainSwitchState, lastActivity: [ProviderID: Date], added: Set<ProviderID>,
-                     now: Date) -> MainSwitchState {
+                     now: Date, preferred: ProviderID? = nil) -> MainSwitchState {
         var s = clearLeader(s)
         if !s.auto || (s.pinnedUntil.map { now < $0 } ?? false) { return s }
         let running = rotation(s, lastActivity: lastActivity, added: added, now: now)
         if running.count > 1 {
-            s.main = MenuBarRotation.keep(running, current: s.main)
+            s.main = PreferredPlatform.choose(running: running, preferred: preferred, current: s.main)
             return s
         }
         guard let target = running.first, target != s.main else { return s }
@@ -111,8 +105,6 @@ enum SwitchMotion {
     enum Style: Equatable { case matchedGeometry, fade }
     static let springResponse: Double = 0.5
     static let springDamping: Double = 0.8
-    /// 切换提示显示多久后淡出（秒）
-    static let noticeSeconds: Double = 3
 
     static func style(reduceMotion: Bool) -> Style { reduceMotion ? .fade : .matchedGeometry }
 }

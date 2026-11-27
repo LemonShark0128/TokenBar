@@ -3,7 +3,10 @@ import Foundation
 @MainActor
 func registerCredentialStoreTests() {
     let prefix = "com.lemon.deepseek-tokenbar.test"
-    func store() -> KeychainCredentialStore { KeychainCredentialStore(servicePrefix: prefix) }
+    // 以前用 .standard：读写 ~/Library/Preferences/TokenBarTests.plist，结果受上次运行留下的 accountAdded.* 影响。
+    // 这组测试之间仍共用一份（和原来共用 .standard 一样），只是每次运行都从空开始
+    let d = freshDefaults()
+    func store() -> KeychainCredentialStore { KeychainCredentialStore(servicePrefix: prefix, defaults: d) }
 
     test("saveThenLoad") {
         let s = store(); defer { try? s.delete(.deepseek) }

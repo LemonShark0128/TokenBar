@@ -23,7 +23,7 @@ func registerV101NewUserTests() {
         try checkEqual(AgentDirs.resolve(custom: [.codex: "~"], env: [:], home: home).codexHome.path, home.path)
     }
     test("agentDirsPersistResetAndDisplay") {
-        let suite = "tb new user \(UUID().uuidString)"
+        let suite = testSuiteName("new-user")
         let d = UserDefaults(suiteName: suite)!
         defer { d.removePersistentDomain(forName: suite) }
         let dir = URL(fileURLWithPath: "/tmp/test home/custom data")
@@ -80,7 +80,7 @@ func registerV101NewUserTests() {
         defer { try? FileManager.default.removeItem(at: dir) }
         final class Root: @unchecked Sendable { var url: URL; init(_ url: URL) { self.url = url } }
         let root = Root(dir.appendingPathComponent("missing"))
-        let provider = CodexPlanProvider(root: { root.url })
+        let provider = CodexPlanProvider(root: { root.url }, resetCredits: { nil })
         let now = Date()
         let first = await provider.fetch(Credentials(values: [:]), now: now, timeZone: .current)
         guard case .success(let empty) = first else { throw TestFailure(description: "expected empty") }
@@ -136,7 +136,7 @@ func registerV101NewUserTests() {
     }
     test("agentDirsDefaultPathIsNotCustom") {
         // 选回默认位置不算自定义：否则会给 claude 传 CLAUDE_CONFIG_DIR，它就找不到登录（10-25 实机）
-        let suite = "tb new user \(UUID().uuidString)"
+        let suite = testSuiteName("new-user")
         let d = UserDefaults(suiteName: suite)!
         defer { d.removePersistentDomain(forName: suite) }
         let home = URL(fileURLWithPath: "/tmp/test home")

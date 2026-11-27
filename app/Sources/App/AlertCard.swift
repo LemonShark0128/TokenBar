@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 
 // ---------------------------------------------------------------- D：预警浮动卡
@@ -27,6 +26,7 @@ struct AlertCard: View {
             }
             Text(message)
                 .font(.system(size: 11.5)).foregroundColor(p.text)
+                .lineLimit(5).truncationMode(.tail)   // 卡片固定高 138：安静时段汇总多行时截在行尾，不被裁半行
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }

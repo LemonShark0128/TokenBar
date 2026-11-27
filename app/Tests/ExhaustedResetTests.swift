@@ -44,18 +44,44 @@ func registerExhaustedResetTests() {
         try checkEqual(e(quota(session: 100, sessionIn: soon, weekly: 100, weeklyIn: tomorrow)), QuotaExhausted(clock: "10/16 08:00"))
     }
     test("exhaustionTexts") {
-        try checkEqual(QuotaExhausted(clock: "08:00").text, "下次重置：08:00")
+        try checkEqual(QuotaExhausted(clock: "08:00").text, "08:00 恢复")
         try checkEqual(QuotaExhausted(clock: nil).text, "已用完")
-        try checkEqual(QuotaExhausted(clock: "10/16 08:00").menuBarText, "10/16 08:00 重置")
+        try checkEqual(QuotaExhausted(clock: "10/16 08:00").menuBarText, "10/16 08:00 恢复")
         try checkEqual(QuotaExhausted(clock: nil).menuBarText, "已用完")
         try checkEqual(QuotaExhausted(clock: "10/16 08:00").gaugeValue, "10/16 08:00")
-        try checkEqual(QuotaExhausted(clock: "10/16 08:00").gaugeOverline, "下次重置")
+        try checkEqual(QuotaExhausted(clock: "10/16 08:00").gaugeOverline, "恢复时间")
         try checkEqual(QuotaExhausted(clock: nil).gaugeValue, "已用完")
         try checkEqual(QuotaExhausted(clock: nil).gaugeOverline, nil)
     }
+    // 11/6 用户定 round7-scout 第 7 条乙：用完时一律说「恢复」（横幅、菜单栏、表盘、胶囊、悬停、读屏），不再混写「下次重置」
+    test("exhaustedSaysBackNotReset") {
+        let q = quota(session: 100, sessionIn: soon, weekly: 41, weeklyIn: 5 * 86400)
+        let r = Runway.quota(q, risePP: 0, now: now)!
+        let chip = Runway.quotaChip(r, now: now, timeZone: utc)
+        try checkEqual(chip.title, "额度已用完")
+        try checkEqual(chip.detail, "2 小时 13 分后恢复")
+        try checkEqual(MenuBarText.quotaReading(q, now: now, timeZone: utc)?.reset, "2 小时 13 分后恢复")
+        let rows = AppDataMapping.quotaRows(q.windows, now: now, timeZone: utc)
+        try checkEqual(rows.map(\.resetShort), ["2:13 后恢复", "\(QuotaText.resetText(now.addingTimeInterval(5 * 86400), now: now, timeZone: utc))"])
+        let weeklyOut = AppDataMapping.quotaRows(quota(session: 30, sessionIn: soon, weekly: 100, weeklyIn: tomorrow).windows, now: now, timeZone: utc)
+        try checkEqual(weeklyOut.map(\.resetShort), ["2:13 后重置", "周五 08:00 恢复"])
+        // 两个都用完、每周恢复得晚：只有每周那行写「恢复」，5 小时那行写「重置」（不让人以为 2 小时后就能用）
+        let both = quota(session: 100, sessionIn: soon, weekly: 100, weeklyIn: tomorrow)
+        try checkEqual(AppDataMapping.quotaRows(both.windows, now: now, timeZone: utc).map(\.resetShort), ["2:13 后重置", "周五 08:00 恢复"])
+        try checkEqual(MenuBarText.quotaReading(both, now: now, timeZone: utc)?.reset, "周五 08:00 恢复")
+        // 没用完的照旧写「重置」
+        let ok = quota(session: 30, sessionIn: soon, weekly: 41, weeklyIn: 5 * 86400)
+        try checkEqual(MenuBarText.quotaReading(ok, now: now, timeZone: utc)?.reset, "2 小时 13 分后重置")
+        L10n.lang = .en
+        defer { L10n.lang = .zh }
+        try checkEqual(QuotaExhausted(clock: "08:00").menuBarText, "Back at 08:00")
+        try checkEqual(AppDataMapping.quotaRows(q.windows, now: now, timeZone: utc).first?.resetShort, "back in 2:13")
+        try checkEqual(QuotaExhausted(clock: "08:00").gaugeOverline, "Back at")
+        try checkEqual(QuotaExhausted(clock: "08:00").a11y, "Quota used up, back at 08:00")
+    }
     test("menuBarTitleShowsResetWhenExhausted") {
         let e = QuotaExhausted(clock: "08:00")
-        try checkEqual(MenuBarText.title(mode: "balance", isQuota: true, balance: nil, today: nil, quotaUsed: 100, currency: nil, exhausted: e), "08:00 重置")
+        try checkEqual(MenuBarText.title(mode: "balance", isQuota: true, balance: nil, today: nil, quotaUsed: 100, currency: nil, exhausted: e), "08:00 恢复")
         try checkEqual(MenuBarText.title(mode: "cost", isQuota: true, balance: nil, today: nil, quotaUsed: 100, currency: nil,
                                          exhausted: QuotaExhausted(clock: nil)), "已用完")
         try checkEqual(MenuBarText.title(mode: "icon", isQuota: true, balance: nil, today: nil, quotaUsed: 100, currency: nil, exhausted: e), "")
@@ -64,7 +90,7 @@ func registerExhaustedResetTests() {
     test("menuBarTitleRoundsRemainingBeforeShowingUsed") {
         try checkEqual(MenuBarText.title(mode: "balance", isQuota: true, balance: nil, today: nil, quotaUsed: 99.6, currency: nil), "已用 100%")
         try checkEqual(MenuBarText.title(mode: "balance", isQuota: true, balance: nil, today: nil, quotaUsed: 99.6, currency: nil,
-                                         exhausted: QuotaExhausted(clock: "10:13")), "10:13 重置")
+                                         exhausted: QuotaExhausted(clock: "10:13")), "10:13 恢复")
     }
     test("sideAndReadingCarryExhaustion") {
         let done = planState(quota(session: 100, sessionIn: soon, weekly: 41, weeklyIn: 5 * 86400))
@@ -76,11 +102,11 @@ func registerExhaustedResetTests() {
     }
     test("a11yReadsExhaustion") {
         try checkEqual(A11yText.quotaGauge(provider: "Codex 套餐", remainingPercent: 0.4, reset: "额度已用完",
-                                           exhausted: QuotaExhausted(clock: "08:00")), "Codex 套餐 额度已用完，下次重置 08:00")
+                                           exhausted: QuotaExhausted(clock: "08:00")), "Codex 套餐 额度已用完，08:00 恢复")
         try checkEqual(A11yText.quotaGauge(provider: "Codex 套餐", remainingPercent: 0, reset: nil,
                                            exhausted: QuotaExhausted(clock: nil)), "Codex 套餐 额度已用完")
         let r = AppData.MenuQuota(usedPercent: 100, window: "当前会话", reset: "2 小时 13 分后重置", exhausted: QuotaExhausted(clock: "08:00"))
         try checkEqual(A11yText.menuBarQuotaValue(provider: "Codex 套餐", reading: r, low: true, dim: false),
-                       "Codex 套餐 额度已用完，下次重置 08:00，低于预警线")
+                       "Codex 套餐 额度已用完，08:00 恢复，低于预警线")
     }
 }

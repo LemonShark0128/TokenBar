@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 
 // ---------------------------------------------------------------- 首次引导：Codex 套餐、DeepSeek、硅基流动的登录页和完成页
@@ -9,7 +8,7 @@ extension OnboardingView {
     var loginPlan: some View {
         VStack(alignment: .leading, spacing: 12) {
             title(L("ob.addTitle", current.map(ProviderRegistry.displayName) ?? ""),
-                  L("ob.codexNote"))
+                  current == .geminiPlan ? L("ob.geminiNote") : L("ob.codexNote"))
             Spacer(minLength: 0)
             HStack {
                 Button(L("ob.later")) { advance() }.buttonStyle(.plain).foregroundColor(p.sub).font(.system(size: 12)).disabled(busy)
@@ -50,7 +49,7 @@ extension OnboardingView {
                 Button(busy ? L("ob.verifying") : L("ob.verifySave")) {
                     busy = true
                     Task { @MainActor in
-                        let r = await model.saveDeepSeekKey(apiKey)
+                        let r = await model.saveApiKey(apiKey, for: .deepseek)
                         markConnected(r.ok, r.message)
                         if r.ok { apiKey = "" }
                     }
@@ -67,6 +66,67 @@ extension OnboardingView {
                 Button(L("action.loginConsole")) { model.openConsoleLogin() }
                     .buttonStyle(.plain).foregroundColor(Accent.blue).font(.system(size: 12)).disabled(!verified)
             }
+            Spacer(minLength: 0)
+            loginFooter
+        }
+    }
+
+    /// Kimi：只要 API Key（国内站 platform.moonshot.cn），没有控制台登录
+    var loginKimi: some View {
+        apiKeyOnlyLogin(.kimi, placeholder: "sk-…", footnote: "ob.kimi.estimateNote")
+    }
+
+    /// OpenRouter：只要 API Key（普通 Key 即可；读不到账户余额时看 Key 上限）
+    var loginOpenRouter: some View {
+        apiKeyOnlyLogin(.openrouter, placeholder: "sk-or-v1-…", footnote: "ob.openrouter.billNote")
+    }
+
+    /// PackyAPI：用户 ID + 控制台系统访问令牌（只用 API Key 读不到账户余额，用户 11/9 选甲）
+    var loginPackyAPI: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            title(L("ob.packyapi.title"), L("ob.packyapi.note"))
+            TextField(L("ob.packyapi.userId"), text: $userId).textFieldStyle(.roundedBorder).font(.num(12, .regular))
+            SecureField(L("ob.packyapi.token"), text: $apiKey).textFieldStyle(.roundedBorder).font(.num(12, .regular))
+            HStack(spacing: 10) {
+                Button(busy ? L("ob.verifying") : L("ob.verifySave")) {
+                    busy = true
+                    Task { @MainActor in
+                        let r = await model.saveAccessToken(apiKey, userId: userId, for: .packyapi)
+                        markConnected(r.ok, r.message)
+                        if r.ok { apiKey = ""; userId = "" }
+                    }
+                }.disabled(apiKey.isEmpty || userId.isEmpty || busy)
+            }
+            if !message.isEmpty {
+                Text(message).font(.system(size: 12)).foregroundColor(verified ? Accent.green : Accent.orange)
+            }
+            LT("ob.packyapi.footnote")
+                .font(.system(size: 11)).foregroundColor(p.sub).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            loginFooter
+        }
+    }
+
+    /// 只填一个 API Key 的登录页（标题 / 说明用 ob.<id>.title / ob.<id>.note），底部一段灰字说明
+    private func apiKeyOnlyLogin(_ id: ProviderID, placeholder: String, footnote: String) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            title(L("ob.\(id.rawValue).title"), L("ob.\(id.rawValue).note"))
+            SecureField(placeholder, text: $apiKey).textFieldStyle(.roundedBorder).font(.num(12, .regular))
+            HStack(spacing: 10) {
+                Button(busy ? L("ob.verifying") : L("ob.verifySave")) {
+                    busy = true
+                    Task { @MainActor in
+                        let r = await model.saveApiKey(apiKey, for: id)
+                        markConnected(r.ok, r.message)
+                        if r.ok { apiKey = "" }
+                    }
+                }.disabled(apiKey.isEmpty || busy)
+            }
+            if !message.isEmpty {
+                Text(message).font(.system(size: 12)).foregroundColor(verified ? Accent.green : Accent.orange)
+            }
+            LT(footnote)
+                .font(.system(size: 11)).foregroundColor(p.sub).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
             loginFooter
         }

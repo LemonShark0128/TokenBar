@@ -14,26 +14,35 @@ extension UsageModel {
         AccountState.of(st)
     }
 
-    var accountState: AccountState {
-        if needsSetup { return .notAdded }
-        return Self.accountState(for: mainState ?? PlatformState(id: mainID, snapshot: nil, burn: nil, status: .offline))
+    /// 各平台账号状态和已添加平台（设置页与菜单栏右键菜单共用同一算法）
+    static func accountStates(_ inp: AccountsInput) -> (states: [ProviderID: AccountState], added: [ProviderID]) {
+        var states: [ProviderID: AccountState] = [:]
+        for id in ProviderRegistry.all { states[id] = accountState(for: inp.platforms.first { $0.id == id }) }
+        return (states, SettingsLayout.added(states))
     }
 
     /// 设置「账号」分组的数据：真 App 来自 UsageStore；离屏预览没有 store，用 mainState 和默认设置（结果才可重复）
     @MainActor var accountsInput: AccountsInput {
         if let s = usageStore {
             return AccountsInput(platforms: s.platforms, mainID: s.mainProvider, auto: s.switchState.auto,
-                                 menuBar: s.menuBarProvider, settings: ProviderSettings.load(.standard))
+                                 settings: ProviderSettings.load(.standard))
         }
         return AccountsInput(platforms: mainState.map { [$0] } ?? [], mainID: mainID, auto: true,
-                             menuBar: mainID, settings: ProviderSettings())
+                             settings: ProviderSettings())
     }
 
     @MainActor
     /// claudeChoice：添加 Claude 套餐时跳过「选来源」，直接进那种来源的页（设置里「改用终端版」用）
     func openOnboarding(at step: OnboardingStep = .welcome, platform: ProviderID? = nil, claudeChoice: ClaudePlanSource? = nil) {
         Hud.windows["onboarding"]?.orderOut(nil)
-        _ = Hud.toggle(key: "onboarding", title: L("win.welcome", AppName.display), size: CGSize(width: 420, height: 420),
+        // 老用户从「添加 / 移除平台」进来是管理页：窗口标题跟着写，不再写「欢迎使用」。
+        // 已有平台却还没点过引导的「完成」（上次中途关了窗）：不再从欢迎页开始，直接进管理页
+        let hasAdded = OnboardingPlan.showsManage(
+            added: Set(ProviderRegistry.all.filter { usageStore?.isAdded($0) == true }), only: platform)
+        let step = step == .welcome && hasAdded ? .pick : step
+        let manage = step == .pick && hasAdded
+        _ = Hud.toggle(key: "onboarding", title: manage ? L("ob.manageTitle") : L("win.welcome", AppName.display),
+                       size: CGSize(width: 420, height: 556), opaque: true,     // 高度只用于第一次建窗，实际按内容量（以 OnboardingView 的定高为准）
                        themed: (self, { p in AnyView(OnboardingView(model: self, initialStep: step, p: p, only: platform,
                                                                     claudeChoice: claudeChoice)) }),
                        origin: { size in
@@ -42,24 +51,74 @@ extension UsageModel {
                        })
     }
 
-    /// 校验并保存 API Key（合并保存：保留已有的控制台登录）。钥匙串读写都由 UsageStore 放在后台线程做
+    /// 校验并保存 API Key（DeepSeek / Kimi；合并保存：保留已有的控制台登录）。钥匙串读写都由 UsageStore 放在后台线程做
     @MainActor
-    func saveDeepSeekKey(_ key: String) async -> (ok: Bool, message: String) {
+    func saveApiKey(_ key: String, for id: ProviderID) async -> (ok: Bool, message: String) {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        let r = await DeepSeekProvider().validate(Credentials(values: ["apiKey": trimmed]))
-        let msg = ValidationCopy.message(for: r, provider: .deepseek)
+        let r = await ProviderRegistry.makeProvider(id, http: URLSessionHTTPClient()).validate(Credentials(values: ["apiKey": trimmed]))
+        let msg = ValidationCopy.message(for: r, provider: id)
         guard case .ok = r, let store = usageStore else { return (false, msg) }
-        do { try await store.saveCredentials(["apiKey": trimmed], for: .deepseek) }
+        do { try await store.saveCredentials(["apiKey": trimmed], for: id) }
         catch { return (false, L("keychain.saveFailed", error)) }
-        logLine("DeepSeek API Key 已验证并存入钥匙串")
+        logLine("\(ProviderRegistry.logName(id)) API Key 已验证并存入钥匙串")
         return (true, msg)
+    }
+
+    /// 校验并保存控制台访问令牌 + 用户 ID（PackyAPI）。日志只写平台名，不写令牌和用户 ID
+    @MainActor
+    func saveAccessToken(_ token: String, userId: String, for id: ProviderID) async -> (ok: Bool, message: String) {
+        let values = ["accessToken": token.trimmingCharacters(in: .whitespacesAndNewlines),
+                      "userId": userId.trimmingCharacters(in: .whitespacesAndNewlines)]
+        let r = await ProviderRegistry.makeProvider(id, http: URLSessionHTTPClient()).validate(Credentials(values: values))
+        let msg = ValidationCopy.message(for: r, provider: id)
+        guard case .ok = r, let store = usageStore else { return (false, msg) }
+        do { try await store.saveCredentials(values, for: id) }
+        catch { return (false, L("keychain.saveFailed", error)) }
+        logLine("\(ProviderRegistry.logName(id)) 访问令牌已验证并存入钥匙串")
+        return (true, msg)
+    }
+
+    /// Starting either path supersedes every earlier Claude sign-in attempt.
+    @MainActor
+    func beginClaudeLogin() -> ClaudeLoginAttempts.Ticket {
+        let attempt = claudeLoginAttempts.begin()
+        WebLoginController.current?.stop()
+        WebLoginController.current = nil
+        Hud.discard("weblogin")
+        return attempt
+    }
+
+    /// Both capture paths share persistence acknowledgement, then source activation and refresh.
+    @MainActor
+    func saveClaudeSession(_ input: String, attempt: ClaudeLoginAttempts.Ticket,
+                           onPersisted: @escaping () -> Void = {},
+                           onDone: @escaping (Bool, String) -> Void) async {
+        guard attempt.isCurrent else { return }
+        guard let store = usageStore else { onDone(false, L("claudeWeb.unrecognized")); return }
+        let result = await ClaudeBrowserLogin.connect(input, isCurrent: { attempt.isCurrent }, validate: { key in
+            if case .failure(let error) = await ClaudeWebUsage.fetch(
+                http: URLSessionHTTPClient(cookies: false), sessionKey: key, now: Date()) { return error }
+            return nil
+        }, save: { key in
+            try await store.saveCredentials([ClaudeWebUsage.credentialKey: key], for: .claudePlan,
+                                            attempt: attempt, onPersisted: onPersisted, refresh: false)
+        }, activate: {
+            self.setClaudeSource(.web)
+            self.reloginNotes[.claudePlan] = nil
+        })
+        guard attempt.isCurrent else { return }
+        logLine(result.ok ? "claude.ai 登录成功" : "claude.ai 登录验证或保存失败")
+        if result.ok { await store.refresh(.claudePlan) }
+        guard attempt.isCurrent else { return }
+        onDone(result.ok, result.message)
     }
 
     /// 内嵌 WKWebView 登录控制台：DeepSeek 读 localStorage 的 userToken；硅基流动读登录 Cookie 和 subject id。
     /// 硅基流动取到后先拉一次余额验证，通过才存；onDone 收到（是否成功, 给用户看的话）
     @MainActor
     /// onCancel：用户没登录就关掉了登录窗（引导页要把「等待登录」复位）
-    func openWebLogin(_ id: ProviderID, onDone: ((Bool, String) -> Void)? = nil, onCancel: (() -> Void)? = nil) {
+    func openWebLogin(_ id: ProviderID, onDone: ((Bool, String) -> Void)? = nil, onCancel: (() -> Void)? = nil,
+                      onPersisted: @escaping () -> Void = {}) {
         let url: URL, capture: WebLoginController.Capture, title: String, hint: String?
         switch id {
         case .deepseek:
@@ -70,18 +129,34 @@ extension UsageModel {
             url = SiliconFlowProvider.consoleURL
             capture = .cookie(name: "__SF_auth.session-token", domain: ".siliconflow.cn"); title = L("ob.sf.title")
             hint = nil
+        case .claudePlan:
+            // Claude 套餐「登录 claude.ai」来源（用户 11/6 选）：取 sessionKey Cookie；Google 账号常被拦，提示改用邮箱
+            url = ClaudeWebUsage.loginURL
+            capture = .claudeSession; title = L("ob.claude.webTitle")
+            hint = L("ob.claude.webGoogle")
         default: return
         }
+        let claudeAttempt = id == .claudePlan ? beginClaudeLogin() : nil
         WebLoginController.installCloseKeyMonitor()
         WebLoginController.current?.stop()          // 再次打开时先停掉上一个，免得后台继续每秒轮询
         let controller = WebLoginController(url: url, capture: capture) { [weak self] values in
+            if let claudeAttempt, !claudeAttempt.isCurrent { return }
             WebLoginController.current?.stop()
             WebLoginController.current = nil
             // 这里还在网页的回调里：下一轮再拆掉窗口和网页
-            DispatchQueue.main.async { Hud.discard("weblogin") }
-            guard let store = self?.usageStore else { return }
+            let capturedWindow = Hud.windows["weblogin"]
+            DispatchQueue.main.async {
+                if Hud.windows["weblogin"] === capturedWindow { Hud.discard("weblogin") }
+            }
+            guard let store = self?.usageStore else { onDone?(false, L("claudeWeb.unrecognized")); return }
             Task { @MainActor in
                 var msg = L("relogin.signedIn")
+                if id == .claudePlan {
+                    guard let self, let claudeAttempt, claudeAttempt.isCurrent else { return }
+                    await self.saveClaudeSession(values[ClaudeWebUsage.credentialKey] ?? "", attempt: claudeAttempt,
+                                                 onPersisted: onPersisted, onDone: { onDone?($0, $1) })
+                    return
+                }
                 if id == .siliconflow {
                     let r = await SiliconFlowProvider().validate(Credentials(values: values))
                     msg = ValidationCopy.message(for: r, provider: id,
@@ -107,10 +182,15 @@ extension UsageModel {
         Hud.onClose["weblogin"] = {                  // 用户没登录就关窗：停止轮询、释放网页
             // 登录成功时控制器已清掉（窗口只是收起）；还在等就是用户取消
             let cancelled = WebLoginController.current === controller
-            WebLoginController.current?.stop()
-            WebLoginController.current = nil
-            if cancelled { onCancel?() }
-            DispatchQueue.main.async { Hud.discard("weblogin") }   // 正在关窗：下一轮再放掉网页
+            if cancelled {
+                controller.stop()
+                WebLoginController.current = nil
+                if claudeAttempt?.isCurrent != false { onCancel?() }
+            }
+            let closingWindow = Hud.windows["weblogin"]
+            DispatchQueue.main.async {
+                if Hud.windows["weblogin"] === closingWindow { Hud.discard("weblogin") }
+            }   // 正在关窗：下一轮再放掉网页
         }
         _ = Hud.toggle(key: "weblogin", title: title, size: CGSize(width: 480, height: 680), plain: true,
                        origin: { size in
@@ -158,6 +238,19 @@ extension UsageModel {
         return a.runModal() == .alertFirstButtonReturn
     }
 
+    /// 暂时隐藏 / 显示平台（今天页卡片右键、底部「显示」、管理页「显示」）：登录和「已添加」都保留。
+    /// 隐藏时把安静时段里攒着的它的提醒也丢掉（不刷新了，旧提醒不该再冒出来）
+    @MainActor func setPlatformHidden(_ id: ProviderID, _ hidden: Bool) {
+        guard let store = usageStore else { return }
+        if hidden {
+            var backlog = QuietBacklog.load(.standard)
+            backlog.remove(id)
+            backlog.save(.standard)
+            if detailPlatform == id { showTodayHome() }
+        }
+        Task { @MainActor in await store.setHidden(id, hidden) }
+    }
+
     /// 确认过以后真正移除：Claude 套餐先还原状态栏设置，再从 UsageStore 删掉。
     /// 返回 false 表示没有移除（Claude 套餐的状态栏设置还原不了，原因写在 reloginNotes 里）
     @MainActor @discardableResult
@@ -182,11 +275,20 @@ extension UsageModel {
         Task { @MainActor in
             do {
                 try await store.removeAccount(id)
+                platformAlerts.forget(id)
+                platformAlerts.save(.standard)
+                AlertMute.unmute(id)
+                var backlog = QuietBacklog.load(.standard)
+                backlog.remove(id)
+                backlog.save(.standard)
                 if let n = restoreNote { reloginNotes[id] = n }
-                updateProviderSettings { s in s.lowAlerts[id] = nil }
+                updateProviderSettings { s in
+                    s.lowAlerts[id] = nil
+                    s.hourlyAlerts[id] = nil
+                }
                 // 套餐平台清掉预警线会存成「关闭」；移除时删掉这个键，再添加时回到默认 10%
-                if isPlan { UserDefaults.standard.removeObject(forKey: ProviderSettings.lowAlertKey(id)); syncAlertFromSettings() }
-                // 菜单栏固定的就是被移除的这个：UsageStore.removeAccount 已改回自动跟随
+                if isPlan { UserDefaults.standard.removeObject(forKey: ProviderSettings.lowAlertKey(id)); objectWillChange.send() }
+                // 仅移除固定的主平台时，UsageStore.removeAccount 会恢复自动切换；其他情况保留原设置。
                 logLine(isPlan ? "已移除 \(ProviderRegistry.logName(id))" : "已移除 \(ProviderRegistry.logName(id))（钥匙串凭据已删除）")
             } catch { logLine("移除 \(ProviderRegistry.logName(id)) 失败：\(error)") }
         }
@@ -224,11 +326,7 @@ struct AccountsInput {
     var platforms: [PlatformState]
     var mainID: ProviderID
     var auto: Bool
-    /// 菜单栏显示的平台（10-19 起永远等于主平台）
-    var menuBar: ProviderID
     var settings: ProviderSettings
-    /// 旧的离屏预览还会设置它；菜单栏不再单独选平台，这个值不再影响任何界面
-    var menuBarAuto = true
     var customDirs: [AgentDirKind: String] = [:]
 }
 

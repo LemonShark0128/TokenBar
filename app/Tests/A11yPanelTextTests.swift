@@ -60,7 +60,7 @@ func registerA11yPanelTextTests() {
     test("a11yQuotaWindowRow") {
         let r = AppData.QuotaRow(id: "s", name: "当前会话", usedPercent: 41.6, isReset: false, reset: "2 小时 13 分后重置")
         // 与界面一致写已用（已用 = 100 - 向下取整的剩余），再补一句剩余
-        try checkEqual(A11yText.quotaWindow(r), "当前会话，已用 42%，剩余 58%，2 小时 13 分后重置")
+        try checkEqual(A11yText.quotaWindow(r), "当前会话，剩余 58%，2 小时 13 分后重置")
         let done = AppData.QuotaRow(id: "w", name: "本周", usedPercent: 99.8, isReset: false, reset: "10/16 08:00 重置")
         try checkEqual(A11yText.quotaWindow(done), "本周，额度已用完，10/16 08:00 重置")
         let reset = AppData.QuotaRow(id: "s", name: "当前会话", usedPercent: 0, isReset: true, reset: nil)
@@ -75,21 +75,21 @@ func registerA11yPanelTextTests() {
         try checkEqual(A11yText.side(sf), "硅基流动，约 5 小时后用完，余额 12.00 元")
         var codex = AppData.Side(id: "codexPlan", name: "Codex 套餐", tank: nil, currency: "PCT", todayCost: nil, status: "正常",
                                  quotaRemaining: 59.9, quotaReset: "2:13 后重置")
-        try checkEqual(A11yText.side(codex), "Codex 套餐，2:13 后重置，已用 41%")
+        try checkEqual(A11yText.side(codex), "Codex 套餐，2:13 后重置，剩余 59%")
         codex.quotaExhausted = QuotaExhausted(clock: "10:13")
         codex.riskText = "低于预警线"
-        try checkEqual(A11yText.side(codex), "Codex 套餐，额度已用完，下次重置 10:13")
+        try checkEqual(A11yText.side(codex), "Codex 套餐，额度已用完，10:13 恢复")
         codex.quotaExhausted = nil; codex.riskText = nil; codex.quotaRemaining = nil
         try checkEqual(A11yText.side(codex), "Codex 套餐，2:13 后重置，暂无数据")
         codex.quotaStale = true; codex.quotaRemaining = 80
-        try checkEqual(A11yText.side(codex), "Codex 套餐，2:13 后重置，已用 20%，数据不是最新")
+        try checkEqual(A11yText.side(codex), "Codex 套餐，2:13 后重置，剩余 80%，数据不是最新")
     }
     test("a11yGaugeValueAddsRunwayChip") {
         try checkEqual(A11yText.gaugeValue(base: "DeepSeek 余额 55.95 元", chipTitle: "约 5 小时后用完", chipDetail: "按最近 1 小时 ¥4.80/时"),
                        "DeepSeek 余额 55.95 元，约 5 小时后用完，按最近 1 小时 4.80 元/时")
         // 已经说过的不重复
-        try checkEqual(A11yText.gaugeValue(base: "Codex 已用 41%，约 2 小时后用完", chipTitle: "约 2 小时后用完", chipDetail: nil),
-                       "Codex 已用 41%，约 2 小时后用完")
+        try checkEqual(A11yText.gaugeValue(base: "Codex 剩余 59%，约 2 小时后用完", chipTitle: "约 2 小时后用完", chipDetail: nil),
+                       "Codex 剩余 59%，约 2 小时后用完")
         try checkEqual(A11yText.gaugeValue(base: "DeepSeek 余额 55.95 元", chipTitle: nil, chipDetail: nil), "DeepSeek 余额 55.95 元")
     }
     test("a11yOfflineAndNoRecord") {
@@ -110,10 +110,10 @@ func registerA11yPanelTextTests() {
         try checkEqual(A11yText.menuBarLabel, "Token Bar")
         let q = AppData.MenuQuota(usedPercent: 60, window: "5 小时窗口", reset: "2 小时后重置")
         try checkEqual(A11yText.menuBarQuotaValue(provider: "Claude 套餐", reading: q, low: false, dim: false),
-                       "Claude 套餐 5 小时窗口已用 60%，剩余 40%，2 小时后重置")
+                       "Claude 套餐 5 小时窗口剩 40%，2 小时后重置")
         var done = q; done.exhausted = QuotaExhausted(clock: "10:13")
         try checkEqual(A11yText.menuBarQuotaValue(provider: "Claude 套餐", reading: done, low: true, dim: false),
-                       "Claude 套餐 额度已用完，下次重置 10:13，低于预警线")
+                       "Claude 套餐 额度已用完，10:13 恢复，低于预警线")
         try checkEqual(A11yText.menuBarQuotaValue(provider: "Codex 套餐", reading: nil, low: false, dim: true),
                        "Codex 套餐 额度未知，数据不是最新")
         try checkEqual(A11yText.menuBarValue(provider: "DeepSeek", needsSetup: false, balanceCny: 123.45, runwayDays: nil,

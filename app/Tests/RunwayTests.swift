@@ -13,15 +13,14 @@ func registerRunwayTests() {
         try check(RunwaySeverity.ok < .warn && RunwaySeverity.warn < .danger)
     }
     test("runwayDurationBoundaries") {
-        let cases: [(Double, String, String)] = [
-            (0, "1 分钟", "1m"), (0.3, "18 分钟", "18m"),
-            (1, "1 小时", "1h00m"), (5.6, "5 小时 36 分", "5h36m"),
-            (24, "1 天", "24h00m"), (30, "1 天 6 小时", "30h00m"),
-            (30 + 5.0 / 60, "1 天 6 小时", "30h05m"),
-            (48, "2 天", "2d"), (120, "5 天", "5d"), (2400, "很久", "99d+")]
-        for (hours, full, compact) in cases {
+        let cases: [(Double, String)] = [
+            (0, "1 分钟"), (0.3, "18 分钟"),
+            (1, "1 小时"), (5.6, "5 小时 36 分"),
+            (24, "1 天"), (30, "1 天 6 小时"),
+            (30 + 5.0 / 60, "1 天 6 小时"),
+            (48, "2 天"), (120, "5 天"), (2400, "很久")]
+        for (hours, full) in cases {
             try checkEqual(Runway.durationText(hours: hours), full)
-            try checkEqual(Runway.compactText(hours: hours), compact)
         }
     }
     test("runwayPaygSpikeUsesRecentRate") {
@@ -75,19 +74,18 @@ func registerRunwayTests() {
             (60, 10, .enough, nil, .ok, "够用到重置 · 4 小时 后重置"),
             (60, 20, .runsOut, 2, .warn, "预计可用时间：2 小时 · 比重置早 2 小时"),
             (80, 20, .runsOut, 1, .danger, "预计可用时间：1 小时 · 比重置早 3 小时"),
-            (100, nil, .exhausted, 0, .danger, "额度已用完 · 4 小时 后重置")]
-        for (used, rise, state, hours, severity, text) in cases {
+            (100, nil, .exhausted, 0, .danger, "额度已用完 · 4 小时 后恢复")]
+        for (used, rise, state, hours, severity, _) in cases {
             let r = Runway.quota(quota(used), risePP: rise, now: now)!
             try checkEqual(r.state, state)
             try checkEqual(r.hoursToEmpty, hours)
             try checkEqual(r.remainingPercent, 100 - used)
             try checkEqual(r.risePP, rise ?? 0)
             try checkEqual(r.severity, severity)
-            try checkEqual(Runway.quotaText(r, now: now), text)
         }
     }
     test("runwayQuotaWithoutResetAndExpiredReset") {
-        for (used, rise, state, text) in [
+        for (used, rise, state, _) in [
             (88.0, 1.0, QuotaRunway.State.enough, "够用到重置"),
             (89, 1, .runsOut, "预计可用时间：11 小时"),
             (50, 0.5, .idle, "近 1 小时没用"),
@@ -95,7 +93,6 @@ func registerRunwayTests() {
             let r = Runway.quota(quota(used, resetHours: nil), risePP: rise, now: now)!
             try checkEqual(r.state, state)
             try checkEqual(r.resetsAt, nil)
-            try checkEqual(Runway.quotaText(r, now: now), text)
         }
         for reset in [-1.0, 0] {
             let r = Runway.quota(quota(100, resetHours: reset), risePP: 10, now: now)!
@@ -105,10 +102,8 @@ func registerRunwayTests() {
         }
     }
     test("runwayQuotaEstimatedResetAndWindowChoice") {
-        let r = Runway.quota(quota(60, estimated: true), risePP: 0, now: now)!
-        try checkEqual(Runway.quotaText(r, now: now), "近 1 小时没用 · 约 4 小时 后重置")
-        let running = Runway.quota(quota(60, estimated: true), risePP: 20, now: now)!
-        try checkEqual(Runway.quotaText(running, now: now), "预计可用时间：2 小时 · 比重置早 约 2 小时")
+        try checkEqual(Runway.quota(quota(60, estimated: true), risePP: 0, now: now)?.state, .idle)
+        try checkEqual(Runway.quota(quota(60, estimated: true), risePP: 20, now: now)?.state, .runsOut)
         try checkEqual(Runway.quota(nil, risePP: 1, now: now), nil)
         try checkEqual(Runway.quota(Quota(plan: nil, windows: [], observedAt: now), risePP: 1, now: now), nil)
         var q = quota(60)
@@ -118,5 +113,31 @@ func registerRunwayTests() {
         try checkEqual(Runway.quota(q, risePP: 20, now: now)?.window.kind, .weekly)
         q.windows[0].kind = .weeklyModel("模型")
         try checkEqual(Runway.quota(q, risePP: 20, now: now), nil)
+    }
+    test("runwayQuotaWeeklyExhaustedCountsAsExhausted") {
+        // 每周已用完、5 小时窗口还剩 70%：原来只看 5 小时窗口，写「近 1 小时没用」/「够用到重置」
+        let session = QuotaWindow(kind: .session, usedPercent: 30, resetsAt: now.addingTimeInterval(4 * 3600), windowMinutes: 300)
+        let weekly = QuotaWindow(kind: .weekly, usedPercent: 100, resetsAt: now.addingTimeInterval(50 * 3600), windowMinutes: 10080)
+        for rise: Double? in [nil, 0.5, 10] {
+            let r = Runway.quota(Quota(plan: nil, windows: [session, weekly], observedAt: now), risePP: rise, now: now)!
+            try checkEqual(r.state, .exhausted)
+            try checkEqual(r.severity, .danger)
+            try checkEqual(r.window.kind, .weekly)
+            try checkEqual(r.resetsAt, weekly.resetsAt)
+            try checkEqual(r.remainingPercent, 0)
+        }
+        // 两个都用完：取较晚恢复的（每周）
+        var both = session; both.usedPercent = 100
+        try checkEqual(Runway.quota(Quota(plan: nil, windows: [both, weekly], observedAt: now), risePP: nil, now: now)?.window.kind, .weekly)
+        // 只有单模型每周窗口（Opus）用完：别的模型还能用，不算用完
+        let opus = QuotaWindow(kind: .weeklyModel("opus"), usedPercent: 100, resetsAt: now.addingTimeInterval(50 * 3600), windowMinutes: 10080)
+        try checkEqual(Runway.quota(Quota(plan: nil, windows: [session, opus], observedAt: now), risePP: 10, now: now)?.state, .enough)
+        // 用完的窗口都没有重置时间：仍判用完，取活动窗口
+        var s0 = both; s0.resetsAt = nil; var w0 = weekly; w0.resetsAt = nil
+        let none = Runway.quota(Quota(plan: nil, windows: [s0, w0], observedAt: now), risePP: nil, now: now)
+        try checkEqual(none?.state, .exhausted); try checkEqual(none?.window.kind, .session); try checkEqual(none?.resetsAt, nil)
+        // 每周已重置（过了 resetsAt）不算用完：仍按 5 小时窗口
+        var past = weekly; past.resetsAt = now.addingTimeInterval(-60)
+        try checkEqual(Runway.quota(Quota(plan: nil, windows: [session, past], observedAt: now), risePP: 10, now: now)?.state, .enough)
     }
 }

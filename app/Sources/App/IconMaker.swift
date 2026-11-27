@@ -1,7 +1,5 @@
 import AppKit
-import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 生成 App 图标（.icns）
 

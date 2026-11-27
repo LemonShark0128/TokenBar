@@ -1,25 +1,48 @@
 import Foundation
 
 /// Codex 套餐：读本地会话日志（~/.codex/sessions/yyyy/MM/dd/*.jsonl）里最近一条 token_count 事件的 rate_limits。
-/// 不联网、不登录，也不碰 auth.json；日志里只解析 rate_limits 与时间戳，其余内容不保存、不写日志。
+/// 优先读取 app-server 实时额度，失败时回退本机日志；认证由 CLI 处理。
 struct CodexPlanProvider: UsageProvider {
     private let root: @Sendable () -> URL
-    /// 只用共享实例（系统文档：FileManager.default 可以在多个线程上同时用）；不存成属性，provider 才是真正的 Sendable
+    private let loadResetCredits: @Sendable () async -> ResetCredits?
+    private let resetCreditsMemory: ResetCreditsMemory
+    private let liveUsage: @Sendable () async -> Quota?
+    private let source = SourceLog()
+    private let log: @Sendable (String) -> Void
     private var fileManager: FileManager { .default }
 
-    init(root: @escaping @Sendable () -> URL = { AgentDirs.current.codexSessions }) {
-        self.root = root
+    init(root: @escaping @Sendable () -> URL = { AgentDirs.current.codexSessions },
+         liveUsage: @escaping @Sendable () async -> Quota? = { await CodexAppServerUsage.standard() },
+         log: @escaping @Sendable (String) -> Void = { _ in },
+         resetCreditsMemory: ResetCreditsMemory = .shared) {
+        self.root = root; self.liveUsage = liveUsage; self.log = log
+        self.loadResetCredits = { nil }
+        self.resetCreditsMemory = resetCreditsMemory
     }
 
-    init(root: URL) { self.root = { root } }
+    // 离线数据源注入；旧日志测试不启动 CLI。
+    init(root: @escaping @Sendable () -> URL, resetCredits: @escaping @Sendable () async -> ResetCredits?,
+         resetCreditsMemory: ResetCreditsMemory = .shared) {
+        self.root = root; self.loadResetCredits = resetCredits
+        self.liveUsage = { nil }; self.log = { _ in }
+        self.resetCreditsMemory = resetCreditsMemory
+    }
+    init(root: URL, resetCredits: @escaping @Sendable () async -> ResetCredits?,
+         resetCreditsMemory: ResetCreditsMemory = .shared) {
+        self.init(root: { root }, resetCredits: resetCredits, resetCreditsMemory: resetCreditsMemory)
+    }
+
+    private actor SourceLog {
+        var previous: Bool?
+        func note(live: Bool, log: @Sendable (String) -> Void) {
+            guard previous != live else { return }
+            previous = live
+            log("Codex 额度来源：" + (live ? "实时" : "本机日志"))
+        }
+    }
 
     var id: ProviderID { .codexPlan }
-    var displayName: String { L("provider.codexPlan") }
-    var capabilities: Capabilities {
-        Capabilities(hasBalance: false, currency: .cny, minPollInterval: 60, dayBoundary: .local,
-                     meter: .quota, needsCredentials: false)
-    }
-    var loginSteps: [LoginStep] { [] }
+    var capabilities: Capabilities { ProviderRegistry.capabilities(.codexPlan) }
 
     func validate(_ c: Credentials) async -> ValidationResult { .ok(summary: "") }
 
@@ -29,6 +52,19 @@ struct CodexPlanProvider: UsageProvider {
     static var noDataNote: String { L("codex.noDataNote") }
 
     func fetch(_ c: Credentials, now: Date, timeZone: TimeZone) async -> Result<ProviderSnapshot, ProviderError> {
+        if var q = await liveUsage() {
+            if let credits = q.resetCredits {
+                await resetCreditsMemory.remember(credits, at: now)
+            } else {
+                q.resetCredits = await resetCreditsMemory.recall(now: now)
+            }
+            q.observedAt = now
+            await source.note(live: true, log: log)
+            var s = Self.emptySnapshot(now: now)
+            s.quota = q
+            return .success(s)
+        }
+        await source.note(live: false, log: log)
         let root = root()
         var isDir: ObjCBool = false
         guard fileManager.fileExists(atPath: root.path, isDirectory: &isDir), isDir.boolValue else {
@@ -89,7 +125,12 @@ struct CodexPlanProvider: UsageProvider {
                 }
             }
         }
-        if let q = best {
+        if var q = best {
+            if let credits = await loadResetCredits() {
+                q.resetCredits = credits
+            } else {
+                q.resetCredits = await resetCreditsMemory.recall(now: now)
+            }
             var s = Self.emptySnapshot(now: now)
             s.quota = q
             return .success(s)
@@ -137,15 +178,7 @@ struct CodexPlanProvider: UsageProvider {
             windows.append(s)
         }
         var observed = fallbackObservedAt
-        if let ts = root["timestamp"] as? String {
-            let f = ISO8601DateFormatter()
-            f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let d = f.date(from: ts) { observed = d }
-            else {
-                f.formatOptions = [.withInternetDateTime]
-                if let d = f.date(from: ts) { observed = d }
-            }
-        }
+        if let ts = root["timestamp"] as? String, let d = ISODate.parse(ts) { observed = d }
         return .success(Quota(plan: rl["plan_type"] as? String, windows: windows, observedAt: observed))
     }
 }

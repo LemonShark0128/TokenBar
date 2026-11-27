@@ -83,7 +83,9 @@ func registerMultiPlatformStoreTests() {
             for i in 0..<6 {
                 let t = now.addingTimeInterval(-3600 + 600 * Double(i))
                 seed.append(Sample(provider: .deepseek, t: t, balance: nil, cumulativeCost: 5, currency: .cny))
-                seed.append(Sample(provider: .siliconflow, t: t, balance: nil,
+                // 这个假平台建成没有余额（hasBalance: false）；这里给采样一个固定余额，只为让「正在用」走余额口径、
+                // 不受「只有花费的采样看花费上涨」（OpenRouter 规则）影响，本测试只比时速
+                seed.append(Sample(provider: .siliconflow, t: t, balance: 100,
                                    cumulativeCost: 10 + Decimal(i) * Decimal(string: "0.1")!, currency: .usd))
             }
             let ds = FakeProvider([.success(snap(now, month: 5)), .success(snap(now.addingTimeInterval(60), month: 5)),
@@ -110,15 +112,17 @@ func registerMultiPlatformStoreTests() {
         for i in 0..<6 {
             let t = now.addingTimeInterval(-3600 + 600 * Double(i))
             seed.append(Sample(provider: .deepseek, t: t, balance: nil, cumulativeCost: 5 + Decimal(i) * 2, currency: .cny))
-            seed.append(Sample(provider: .siliconflow, t: t, balance: nil,
+            // 这个假平台建成没有余额；采样给固定余额，只为不让「只有花费的采样看花费上涨」（OpenRouter 规则）掺进来，本测试只比时速
+            seed.append(Sample(provider: .siliconflow, t: t, balance: 100,
                                cumulativeCost: 10 + Decimal(i) * Decimal(string: "0.1")!, currency: .usd))
         }
         // DeepSeek ¥15/时，之后断网；硅基流动 约 ¥7–12/时，一直正常
         let ds = FakeProvider([.success(snap(now, month: 20)), .failure(.network("断网")), .failure(.network("断网"))],
                               id: .deepseek)
-        let cl = usdPlatform([.success(usdSnap(now, month: "11")),
-                         .success(usdSnap(now.addingTimeInterval(60), month: "11.1")),
-                         .success(usdSnap(now.addingTimeInterval(660), month: "11.7"))])
+        func withBalance(_ s: ProviderSnapshot) -> ProviderSnapshot { var s = s; s.balance = usd("100"); return s }
+        let cl = usdPlatform([.success(withBalance(usdSnap(now, month: "11"))),
+                         .success(withBalance(usdSnap(now.addingTimeInterval(60), month: "11.1"))),
+                         .success(withBalance(usdSnap(now.addingTimeInterval(660), month: "11.7")))])
         let store = try multiStore([ds, cl], clock: clock, settings: ProviderSettings(), seed: seed)
         await store.refresh()
         clock.now = now.addingTimeInterval(60)
@@ -150,7 +154,7 @@ func registerMultiPlatformStoreTests() {
     testAsync("oneProviderFailureIsolated") {
         let clock = FakeClock()
         let ds = FakeProvider([.success(snap(clock.now)), .success(snap(clock.now.addingTimeInterval(121)))], id: .deepseek)
-        let cl = usdPlatform(Array(repeating: .failure(.rateLimited(retryAfter: nil)), count: 5))
+        let cl = usdPlatform(Array(repeating: .failure(.rateLimited), count: 5))
         let sf = FakeProvider(Array(repeating: .failure(.network("断网")), count: 5), id: .codexPlan)
         let store = try multiStore([ds, cl, sf], clock: clock, settings: ProviderSettings())
         await store.refresh()

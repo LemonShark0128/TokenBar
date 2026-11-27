@@ -6,6 +6,8 @@ enum ClaudePlanSource: String, Equatable {
     case desktop
     /// 终端版 Claude Code 的状态栏钩子写的 claude-ratelimits.json
     case terminal
+    /// App 内登录 claude.ai，用网页登录 Cookie 问 claude.ai 的额度接口（ClaudeWebUsage；用户 11/6 选，新用户推荐）
+    case web
 
     static let defaultsKey = "claudePlan.source"
 
@@ -26,14 +28,26 @@ enum ClaudePlanSource: String, Equatable {
     func save(_ d: UserDefaults) { d.set(rawValue, forKey: Self.defaultsKey) }
 
     /// 设置「平台」页 Claude 套餐那一行第二行的来源说明
-    var label: String { self == .desktop ? L("claude.source.desktop") : L("claude.source.terminal") }
-    /// 切换到另一种来源的操作名
-    var switchTitle: String { self == .desktop ? L("claude.switch.toTerminal") : L("claude.switch.toDesktop") }
+    var label: String {
+        switch self {
+        case .desktop: return L("claude.source.desktop")
+        case .terminal: return L("claude.source.terminal")
+        case .web: return L("claude.source.web")
+        }
+    }
+    /// 改用这种来源的操作名（设置「···」菜单）
+    var switchToTitle: String {
+        switch self {
+        case .desktop: return L("claude.switch.toDesktop")
+        case .terminal: return L("claude.switch.toTerminal")
+        case .web: return L("claude.switch.toWeb")
+        }
+    }
 }
 
 /// Claude 套餐：按来源查询；桌面命令行失败时补查，保留最后的可靠读数。
 /// 终端：读状态栏钩子写的 claude-ratelimits.json（{"writtenAt": <Unix 秒>, "rate_limits": {…}}）；
-/// 桌面：优先跑本机的 `claude -p /usage`（真实额度和重置时间，不花 token）；失败后补查两次；仅没有 claude 命令时
+/// 桌面：优先跑本机 claude 命令行查额度（先走控制协议，老版本退回 `claude -p /usage`；真实额度和重置时间，不花 token）；失败后补查两次；仅没有 claude 命令时
 /// 退回 Claude 桌面 App 的 plan-usage-history.json（重置时间是推算的；记录过旧就只写停在什么时候）。
 /// Token Bar 自己不联网、不登录，不读 ~/.claude/.credentials.json、~/.claude.json（命令行的登录由 claude 进程自己处理）
 struct ClaudePlanProvider: UsageProvider {
@@ -44,7 +58,13 @@ struct ClaudePlanProvider: UsageProvider {
     /// 桌面来源先问命令行（测试里替换；默认当作没装）
     let cli: @Sendable (Date) async throws -> ClaudeCLIUsage.Outcome
 
+    let loginExpiry: @Sendable (Date) async -> Date?
+
+    let route: @Sendable () -> ClaudeAPIRoute
     let desktopInstalled: @Sendable () -> Bool
+    /// 网页来源的登录 Cookie（TokenBar 自己钥匙串里的 claudePlan.webToken；没登录为 nil）
+    let webKey: @Sendable () -> String?
+    let http: HTTPClient
 
     let retryDelays: [TimeInterval]
     let sleep: @Sendable (TimeInterval) async -> Void
@@ -52,25 +72,32 @@ struct ClaudePlanProvider: UsageProvider {
     init(quotaFile: URL, desktopFile: URL = ClaudeAppUsageSource.standardURL,
          source: @escaping @Sendable () -> ClaudePlanSource = { .terminal },
          cli: @escaping @Sendable (Date) async throws -> ClaudeCLIUsage.Outcome = { _ in .notInstalled },
+         loginExpiry: @escaping @Sendable (Date) async -> Date? = { _ in nil },
          desktopInstalled: @escaping @Sendable () -> Bool = { true },   // 测试默认当作装了，不看本机；真 App 由 ProviderRegistry 传实际检查
+         route: @escaping @Sendable () -> ClaudeAPIRoute = { .subscription },
+         webKey: @escaping @Sendable () -> String? = { nil },
+         http: HTTPClient = URLSessionHTTPClient(),
          retryDelays: [TimeInterval] = [5, 25],
          sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }) {
         self.quotaFile = quotaFile
         self.desktopFile = desktopFile
         self.source = source
         self.cli = cli
+        self.loginExpiry = loginExpiry
         self.desktopInstalled = desktopInstalled
+        self.route = route
+        self.webKey = webKey
+        self.http = http
         self.retryDelays = retryDelays
         self.sleep = sleep
     }
 
     var id: ProviderID { .claudePlan }
-    var displayName: String { L("provider.claudePlan") }
     var capabilities: Capabilities {
-        Capabilities(hasBalance: false, currency: .cny, minPollInterval: 60, dayBoundary: .local,
-                     meter: .quota, needsCredentials: false)
+        var c = ProviderRegistry.capabilities(.claudePlan)
+        c.credentialRetryInterval = source() == .web ? nil : 300
+        return c
     }
-    var loginSteps: [LoginStep] { [] }
 
     func validate(_ c: Credentials) async -> ValidationResult { .ok(summary: "") }
 
@@ -85,7 +112,7 @@ struct ClaudePlanProvider: UsageProvider {
     static func cliHint(_ o: ClaudeCLIUsage.Outcome) -> String? {
         switch o {
         case .notInstalled: return cliMissingHint
-        case .failed(let why): return L("claude.cliFailed", why)
+        case .failed(let why): return ClaudeCLIUsage.isLoginProblem(o) ? why : L("claude.cliFailed", why)
         case .unrecognized: return L("claude.cliUnrecognized")
         case .quota: return nil
         }
@@ -105,10 +132,23 @@ struct ClaudePlanProvider: UsageProvider {
     func fetch(_ c: Credentials, now: Date, timeZone: TimeZone) async -> Result<ProviderSnapshot, ProviderError> {
         var s = ProviderSnapshot(provider: .claudePlan, balance: nil, today: nil, month: nil, byModel: [],
                                  trend7: [], source: .quota, fetchedAt: now, credential: .ok)
-        if source() == .desktop {
-            var viaCLI = (try? await cli(now)) ?? .failed(L("claude.cliError"))
+        let src = source()
+        if src == .web {
+            // 没登录（或移除后钥匙串里没了）：按登录问题报，界面给「登录 claude.ai」
+            guard let key = webKey(), !key.isEmpty else { return .failure(.auth(L("claudeWeb.notLoggedIn"))) }
+            switch await ClaudeWebUsage.fetch(http: http, sessionKey: key, now: now) {
+            case .success(let q): s.quota = q; return .success(s)
+            case .failure(let e): return .failure(e)
+            }
+        }
+        let route = route()
+        if src == .desktop {
+            // A relay/API route cannot return plan quota; skip the CLI and its retries.
+            var viaCLI: ClaudeCLIUsage.Outcome = route.hasPlanQuota
+                ? ((try? await cli(now)) ?? .failed(L("claude.cliError"))) : .notInstalled
             for delay in retryDelays {
-                if viaCLI == ClaudeCLIUsage.throttled { break }
+                // 限流、没登录：马上再查也一样，不重试
+                if viaCLI == ClaudeCLIUsage.throttled || ClaudeCLIUsage.isLoginProblem(viaCLI) { break }
                 switch viaCLI {
                 case .quota, .notInstalled: break
                 case .failed, .unrecognized:
@@ -120,21 +160,30 @@ struct ClaudePlanProvider: UsageProvider {
             }
             if case .quota(let q) = viaCLI {
                 s.quota = q
+                if let expiry = await loginExpiry(now) {
+                    let remain = expiry.timeIntervalSince(now)
+                    if remain > 0 && remain <= 3 * 86400 {
+                        // 不到一天写「今天到期」；一天以上向上取整（剩 2.9 天写「3 天后」，不少说）
+                        s.credential = .expiring(days: remain < 86400 ? 0 : Int((remain / 86400).rounded(.up)))
+                        s.credentialExpiresAt = expiry
+                    }
+                }
                 return .success(s)
             }
+            if ClaudeCLIUsage.isLoginProblem(viaCLI) { return .failure(.auth(Self.cliHint(viaCLI)!)) }
             guard case .notInstalled = viaCLI else {
                 return .failure(.unavailable(Self.cliHint(viaCLI)!))
             }
-            let hint: String? = Self.cliMissingHint
-            func note(_ base: String) -> String { [base, hint].compactMap { $0 }.joined(separator: L("common.sentenceSep")) }
+            func note(_ base: String) -> String { [base, route.cliHint ?? Self.cliMissingHint].joined(separator: L("common.sentenceSep")) }
             switch ClaudeAppUsageSource.read(desktopFile, now: now) {
             case .missing:
-                s.quotaNote = desktopInstalled() ? note(Self.desktopWaitingNote) : L("claude.nothingInstalled")
+                s.quotaNote = desktopInstalled() ? note(Self.desktopWaitingNote) : (route.note ?? L("claude.nothingInstalled"))
             case .noRecentData: s.quotaNote = note(Self.desktopWaitingNote)
             case .stale(let t): s.quotaNote = note(Self.staleNote(t, now: now, timeZone: timeZone))
             case .quota(var q):
                 q.estimated = true
                 s.quota = q
+                s.quotaNote = route.cliHint
             case .tooLarge: return .failure(.unavailable(L("claude.desktopTooLarge")))
             case .corrupt: return .failure(.schemaChanged(L("claude.desktopCorrupt")))
             case .unknownVersion: return .failure(.schemaChanged(L("claude.desktopUnknownVersion")))
@@ -148,13 +197,13 @@ struct ClaudePlanProvider: UsageProvider {
             guard !FileManager.default.fileExists(atPath: quotaFile.path) else {
                 return .failure(.unavailable(L("provider.cantRead", quotaFile.path)))
             }
-            s.quotaNote = Self.waitingNote
+            s.quotaNote = route.note ?? Self.waitingNote
             return .success(s)
         }
         switch Self.read(data) {
         case .failure(let e): return .failure(e)
-        case .notJSON: s.quotaNote = Self.waitingNote
-        case .noWindows: s.quotaNote = Self.noWindowsNote
+        case .notJSON: s.quotaNote = route.note ?? Self.waitingNote
+        case .noWindows: s.quotaNote = route.note ?? Self.noWindowsNote
         case .quota(let q): s.quota = q
         }
         return .success(s)

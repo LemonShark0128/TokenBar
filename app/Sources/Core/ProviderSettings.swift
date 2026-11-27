@@ -7,11 +7,11 @@ struct ProviderSettings: Equatable {
     var lowAlerts: [ProviderID: Decimal] = [:]
     /// 每小时花费超过多少提醒（按量付费平台；键不存在 = 关，用户 2026-10-17 定默认关）
     var hourlyAlerts: [ProviderID: Decimal] = [:]
-    /// 套餐重置前会用完时提醒（默认开）
-    var quotaRunoutAlert = true
+    /// 套餐额度恢复时提醒（默认开）
+    var quotaRecoveredAlert = true
 
     static let usdToCnyKey = "usdToCny"
-    static let quotaRunoutAlertKey = "quotaRunoutAlert"
+    static let quotaRecoveredAlertKey = "quotaRecoveredAlert"
     static func lowAlertKey(_ id: ProviderID) -> String { "lowAlert.\(id.rawValue)" }
     static func hourlyAlertKey(_ id: ProviderID) -> String { "hourlyAlert.\(id.rawValue)" }
 
@@ -29,7 +29,7 @@ struct ProviderSettings: Equatable {
         for id in ProviderID.allCases where ProviderRegistry.meter(id) == .money {
             if let a = decimal(d, hourlyAlertKey(id)), a > 0 { s.hourlyAlerts[id] = a }
         }
-        if d.object(forKey: quotaRunoutAlertKey) != nil { s.quotaRunoutAlert = d.bool(forKey: quotaRunoutAlertKey) }
+        if d.object(forKey: quotaRecoveredAlertKey) != nil { s.quotaRecoveredAlert = d.bool(forKey: quotaRecoveredAlertKey) }
         // 套餐平台预警线按百分比，键不存在时默认 10
         for id in ProviderID.allCases where ProviderRegistry.meter(id) == .quota && d.object(forKey: lowAlertKey(id)) == nil {
             s.lowAlerts[id] = 10
@@ -55,6 +55,6 @@ struct ProviderSettings: Equatable {
             if let h = hourlyAlerts[id], h > 0 { d.set("\(h)", forKey: Self.hourlyAlertKey(id)) }
             else { d.removeObject(forKey: Self.hourlyAlertKey(id)) }
         }
-        d.set(quotaRunoutAlert, forKey: Self.quotaRunoutAlertKey)
+        d.set(quotaRecoveredAlert, forKey: Self.quotaRecoveredAlertKey)
     }
 }

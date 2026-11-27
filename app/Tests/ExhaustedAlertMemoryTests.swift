@@ -24,7 +24,7 @@ func registerExhaustedAlertMemoryTests() {
         try checkEqual(fired(&m, [plan(.deepseek, used: [100]), plan(.claudePlan, used: [100], status: .notAdded)], t0), [])
     }
     test("exhaustedMemorySurvivesReload") {
-        let d = UserDefaults(suiteName: "tb-test-\(UUID().uuidString)")!
+        let d = freshDefaults()
         var m = ExhaustedAlertMemory.load(d)
         try checkEqual(fired(&m, [plan(.codexPlan, used: [100])], t0).count, 1)
         m.save(d)

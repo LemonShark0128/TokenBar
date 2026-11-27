@@ -2,10 +2,8 @@ import Foundation
 
 // 界面文案里要用、又需要在 Core 里测试的格式化函数
 
-func fmtCNY(_ v: Double?, _ digits: Int = 2) -> String {
-    guard let v = v, v.isFinite else { return "¥ —" }
-    return "¥" + fixed(v, digits)
-}
+/// 人民币金额：同 fmtMoney(v, nil)
+func fmtCNY(_ v: Double?, _ digits: Int = 2) -> String { fmtMoney(v, nil, digits) }
 
 /// 定点小数：中文界面照旧（不分组，1234.56）；英文界面按 en_US 习惯千位分组（1,234.56）
 func fixed(_ v: Double, _ digits: Int) -> String {
@@ -33,6 +31,7 @@ func sourceLabel(_ s: String?) -> String? {
     case nil: return nil
     case "平台账单": return L("source.bill")
     case "只有余额": return L("source.balanceOnly")
+    case "余额估算": return L("source.balanceEstimate")
     case "离线": return L("source.offline")
     case "无": return L("source.none")
     default: return s
@@ -85,12 +84,6 @@ func menuBarAmount(_ v: Double?, currency: String? = nil) -> String {
     return sym + s + String(repeating: "\u{2007}", count: max(0, 2 - intDigits))
 }
 
-/// 百分比读数：四舍五入到整数；没有数据为「—%」（菜单栏、面板、读屏共用）
-func quotaPercent(_ v: Double?) -> String {
-    guard let v = v, v.isFinite else { return "—%" }
-    return "\(Int(v.rounded()))%"
-}
-
 /// 剩余不夸大，与提醒同口径：夹到 0…100 后向下取整。
 func quotaRemainingPercent(_ v: Double?) -> String {
     guard let v = v, v.isFinite else { return "—%" }
@@ -101,4 +94,27 @@ func quotaRemainingPercent(_ v: Double?) -> String {
 func quotaUsedPercent(remaining: Double?) -> String {
     guard let remaining, remaining.isFinite else { return "—%" }
     return "\(Int(100 - min(100, max(0, remaining)).rounded(.down)))%"
+}
+
+func quotaLeftText(_ remaining: Double?) -> String {
+    L("quota.leftPct", quotaRemainingPercent(remaining).dropLast())
+}
+
+/// ISO 8601 时间戳解析：先试带毫秒，再试整秒。
+/// formatter 复用一份：ISO8601DateFormatter 线程安全，创建后不再改选项，可在后台线程并发调用
+enum ISODate {
+    nonisolated(unsafe) private static let fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    nonisolated(unsafe) private static let whole: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    static func parse(_ s: String) -> Date? {
+        fractional.date(from: s) ?? whole.date(from: s)
+    }
 }

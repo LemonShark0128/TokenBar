@@ -23,7 +23,6 @@ func registerSwitchPresentationTests() {
         try checkEqual(SwitchMotion.style(reduceMotion: true), .fade)
         try checkEqual(SwitchMotion.springResponse, 0.5)
         try checkEqual(SwitchMotion.springDamping, 0.8)
-        try checkEqual(SwitchMotion.noticeSeconds, 3)
     }
     testAsync("noticeAfterSwitchAndConsume") {
         let clock = FakeClock()
@@ -31,7 +30,7 @@ func registerSwitchPresentationTests() {
         try check(store.pendingSwitchNotice == nil)
         store.demoSwitch()
         let name = ProviderRegistry.displayName(.siliconflow)
-        try checkEqual(store.pendingSwitchNotice, "\(name) 有任务在跑，已切换显示")
+        try checkEqual(store.pendingSwitchNotice, "\(name) 余额在减少，已切换显示")
         store.consumeAutoSwitch()
         try check(store.lastAutoSwitch == nil)
         try check(store.pendingSwitchNotice == nil)

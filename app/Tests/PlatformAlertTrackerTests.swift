@@ -4,6 +4,52 @@ import Foundation
 @MainActor
 func registerPlatformAlertTrackerTests() {
     let t0 = Date(timeIntervalSince1970: 2_000_000)
+    test("claudeLoginAlertsPersistRearmAndIgnoreOtherProviders") {
+        var tracker = PlatformAlertTracker()
+        var st = PlatformState(id: .claudePlan, snapshot: nil, burn: nil, status: .credentialInvalid)
+        st.errorDetail = L("cli.needsLogin")
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0).count, 1)
+        tracker = try JSONDecoder().decode(PlatformAlertTracker.self, from: JSONEncoder().encode(tracker))
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0).count, 0)
+        st.status = .offline
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0).count, 0)
+        st.status = .credentialInvalid
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0).count, 0)
+        st.status = .ok
+        _ = tracker.claudeLoginAlerts([st], now: t0)
+        st.status = .credentialInvalid
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0).count, 1)
+        st.id = .codexPlan
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0).count, 0)
+        let legacy = try JSONDecoder().decode(PlatformAlertTracker.self, from: Data("{}".utf8))
+        try checkEqual(legacy, PlatformAlertTracker())
+    }
+    // 11-18 审核：疑似掉线标题不说死；网页来源（在 TokenBar 里登录）不发这条通知
+    test("claudeLoginAlertSuspectedTitleAndWebSourceSilent") {
+        var tracker = PlatformAlertTracker()
+        var st = PlatformState(id: .claudePlan, snapshot: nil, burn: nil, status: .credentialInvalid)
+        st.errorDetail = L("cli.suspectedLogin")
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0, cliSource: false).count, 0)
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0).first?.title, L("alert.claudeLogin.suspectedTitle"))
+        st.status = .ok
+        _ = tracker.claudeLoginAlerts([st], now: t0)
+        st.status = .credentialInvalid
+        st.errorDetail = L("cli.needsLogin")
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0).first?.title, L("alert.claudeLogin.title"))
+    }
+    test("claudeExpiryAlertOncePerExactExpiryAcrossDaysAndRestart") {
+        var tracker = PlatformAlertTracker()
+        var snapshot = snap(t0)
+        snapshot.credential = .expiring(days: 2)
+        snapshot.credentialExpiresAt = t0.addingTimeInterval(2 * 86400 + 123)
+        var st = PlatformState(id: .claudePlan, snapshot: snapshot, burn: nil, status: .ok)
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0).first?.title, L("alert.claudeExpiry.title", 2))
+        tracker = try JSONDecoder().decode(PlatformAlertTracker.self, from: JSONEncoder().encode(tracker))
+        st.snapshot?.credential = .expiring(days: 0)
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0.addingTimeInterval(2 * 86400)).count, 0)
+        st.snapshot?.credentialExpiresAt = t0.addingTimeInterval(3 * 86400)
+        try checkEqual(tracker.claudeLoginAlerts([st], now: t0).first?.title, L("alert.claudeExpiry.today"))
+    }
     test("trackerExhaustedCoversLowButNotOtherPlatforms") {
         var tr = PlatformAlertTracker()
         let low: [Anomaly] = [.lowTank(.codexPlan), .lowTank(.deepseek)]

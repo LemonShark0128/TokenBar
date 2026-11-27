@@ -9,8 +9,10 @@ enum ValidationCopy {
         case .ok(let summary):
             if provider == .siliconflow, let n = expiresInDays { return L("valid.loginExpiresIn", summary, n) }
             return summary
-        case .failed(.auth):
+        case .failed(.auth(let detail)):
             if provider == .siliconflow { return L("valid.sfLoginFailed") }
+            // 本地就能看出的格式问题（用户 ID 不是数字、没填令牌）照实说，免得用户以为令牌不对去重新生成（旧令牌会失效）
+            if provider == .packyapi { return PackyAPIProvider.localCredentialProblems.contains(detail) ? detail : L("valid.packyTokenInvalid") }
             return L("valid.keyInvalid")
         case .failed(.network): return L("valid.network", name)
         case .failed(.rateLimited): return L("valid.rateLimited")
@@ -34,7 +36,7 @@ struct ReloginNote: Equatable {
     var isError: Bool
 
     /// message 是 openWebLogin 回调给的话（验证文案或钥匙串错误）
-    static func make(provider: ProviderID, ok: Bool, message: String) -> ReloginNote {
+    static func make(ok: Bool, message: String) -> ReloginNote {
         if ok { return ReloginNote(text: message == L("relogin.signedIn") ? L("relogin.done") : L("relogin.doneWith", message), isError: false) }
         // 验证文案本身已说明「登录没有成功」时不再加前缀
         return ReloginNote(text: message.contains(L("relogin.failedMarker")) ? message : L("relogin.failed", message), isError: true)

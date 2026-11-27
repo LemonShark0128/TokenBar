@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 
 // ---------------------------------------------------------------- C：近 7 天柱图、模型占比、Token 明细、单日详情
@@ -20,6 +19,15 @@ struct TrendStrip: View {
     var picked: String? = nil
     /// 点柱子：传选中的日期，选回今天时传 nil
     var onSelect: ((String?) -> Void)? = nil
+    /// false：只画柱子和日期行（「今天」中号卡放不下模型图例时用）
+    var showLegend = true
+    /// 图例最多列几个模型（「今天合计」照常显示）；格子小时少列几行
+    var legendRows = Int.max
+    /// 中号「今天」卡（用户 2026-11-06 选丁）：不写下面的「今天合计」（和日期行右边的当天合计重复、还占地方），
+    /// 模型列不完时最后一行改成「另 N 个模型 · x」
+    var compact = false
+    /// 中号卡「另 N 个模型」点开全部模型（弹窗挂在整张卡上，由卡片管）；nil 时这一行只是文字
+    var onShowAllModels: (() -> Void)? = nil
 
     /// 选中的柱子下标
     private var sel: Int { chart.bars.firstIndex { $0.iso == picked } ?? max(chart.bars.count - 1, 0) }
@@ -33,8 +41,10 @@ struct TrendStrip: View {
         return dark ? [hex(0x3987E5), hex(0xD95926), hex(0x199E70), hex(0xC98500)]
                     : [hex(0x2A78D6), hex(0xEB6834), hex(0x1BAF7A), hex(0xEDA100)]
     }
-    func color(_ i: Int) -> Color {
-        chart.series[i].isOther ? p.sub.opacity(0.55) : Self.colors(dark: p.dark)[min(i, 3)]
+    func color(_ i: Int) -> Color { Self.color(chart, i, p) }
+    /// 序列 i 的分段色（「其他」灰色）；点开的全部模型列表也用它，颜色和柱子对得上
+    static func color(_ chart: TokenChart, _ i: Int, _ p: Palette) -> Color {
+        chart.series[i].isOther ? p.sub.opacity(0.55) : colors(dark: p.dark)[min(i, 3)]
     }
 
     var body: some View {
@@ -87,8 +97,16 @@ struct TrendStrip: View {
                 }
                 Spacer()
                 let b = bars.indices.contains(sel) ? bars[sel] : nil
-                Text("\(selIsToday ? L("chart.today") : b?.date ?? "") \(cnCount(b?.total ?? 0))").font(.num(11, .regular)).foregroundColor(p.text)
-                    .accessibilityLabel(A11yText.selectedDay(iso: b?.iso ?? "", total: b?.total ?? 0, isToday: selIsToday))
+                // 中号不写下面的合计行：纯套餐时「 · 套餐」挪到这里，免得看不出是套餐用量（其余情况写法不变，大号 / 详情页像素一致）
+                Group {
+                    if compact && showLegend && chart.planOnly(bar: sel) {
+                        Text("\(selIsToday ? L("chart.today") : b?.date ?? "") \(cnCount(b?.total ?? 0))\(L("chart.planDot"))")
+                    } else {
+                        Text("\(selIsToday ? L("chart.today") : b?.date ?? "") \(cnCount(b?.total ?? 0))")
+                    }
+                }.font(.num(11, .regular)).foregroundColor(p.text)
+                    .accessibilityLabel(A11yText.selectedDay(iso: b?.iso ?? "", total: b?.total ?? 0, isToday: selIsToday)
+                                        + (compact && showLegend && chart.planOnly(bar: sel) ? L("chart.planDot") : ""))
                 if onSelect != nil, let b, let day = days.first(where: { $0.iso == b.iso }) {
                     Button { onPick(day) } label: {
                         LT("chart.details").font(.system(size: 11)).foregroundColor(Accent.blue)
@@ -97,7 +115,7 @@ struct TrendStrip: View {
                 }
             }
             // 图例有两部分（模型行、「今天合计」）：包一层再加 padding，否则 padding 会分别加到每一部分上
-            VStack(alignment: .leading, spacing: 4) { legend }.padding(.top, 4)
+            if showLegend { VStack(alignment: .leading, spacing: 4) { legend }.padding(.top, compact ? 2 : 4) }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(A11yText.trendChart(summary: chart.a11yLabel(incomplete: incomplete),
@@ -130,9 +148,16 @@ struct TrendStrip: View {
     /// 图例：今天用量最多的模型，每个都写名字、token 和今日花费（色块只是辅助）；
     /// 单平台时柱子是单色，图例不画色块，只列模型（替代原来面板里的模型占比条）
     @ViewBuilder private var legend: some View {
-        let items = chart.legend(bar: sel)
+        let all = chart.legend(bar: sel)
+        // 紧凑模式列不完：留一行写「另 N 个模型」，前面少列一个
+        // 只放得下 1 行时不折叠（只列第 1 名）：「另 N 个 · x」单独一行几乎就是当天合计，又重复了
+        let folds = compact && legendRows >= 2 && all.count > legendRows
+        let items = Array(all.prefix(max(0, folds ? legendRows - 1 : legendRows)))
+        let rest = folds ? Array(all.dropFirst(items.count)) : []
         let multi = chart.multiPlatform
-        if items.isEmpty {
+        if legendRows <= 0 {
+            EmptyView()
+        } else if items.isEmpty {
             if multi { Text(selIsToday ? L("chart.noUsageToday") : L("chart.noUsageThatDay")).font(.system(size: 11)).foregroundColor(p.sub) }
         } else {
             // 一行一个模型：名字写全（两栏会把「硅基 · Qwen3-Coder-480B」截断）
@@ -159,10 +184,36 @@ struct TrendStrip: View {
                     .accessibilityLabel(A11yText.speak("\(chart.series[it.series].label) \(cnCount(it.tokens))", separators: false)
                                         + (costs[i].map { "，" + A11yText.speak($0) } ?? ""))
                 }
+                if !rest.isEmpty {
+                    let restTokens = rest.reduce(0) { $0 + $1.tokens }
+                    let n = chart.modelCount(rest, bar: sel)
+                    let row = HStack(spacing: 6) {
+                        if multi { Color.clear.frame(width: 8, height: 8) }
+                        Text(L(onShowAllModels != nil ? "chart.otherModelsOpen" : "chart.otherModels", n)).font(.system(size: 11))
+                            .foregroundColor(onShowAllModels != nil ? Accent.blue : p.sub).lineLimit(1)
+                        Spacer(minLength: 8)
+                        Text(cnCount(restTokens)).font(.num(11, .regular)).foregroundColor(p.sub).lineLimit(1)
+                        if hasCost { Color.clear.frame(width: 44, height: 1) }
+                    }
+                    let spoken = A11yText.speak(L("chart.otherModels", n) + "，" + cnCount(restTokens), separators: false)
+                    if let onShowAllModels {
+                        // 整行都能点（不只是文字）；读屏读成按钮，提示点了会列出全部模型
+                        Button(action: onShowAllModels) { row.contentShape(Rectangle()) }
+                            .buttonStyle(.plain)
+                            .help(L("chart.allModelsHint"))
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel(spoken)
+                            .accessibilityHint(L("chart.allModelsHint"))
+                            .accessibilityAddTraits(.isButton)
+                            .accessibilityAction { onShowAllModels() }
+                    } else {
+                        row.accessibilityElement(children: .ignore).accessibilityLabel(spoken)
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        if let s = chart.daySummary(bar: sel, incomplete: incomplete) {
+        if !compact, let s = chart.daySummary(bar: sel, incomplete: incomplete) {
             // 上下对称：图例 → 分隔线 → 文字 → 下一条分隔线，三段留白都是 PanelLayout.sectionGap
             let gaps = PanelLayout.todaySummaryGaps(stripSpacing: 4)    // 4 = 上面包住图例的 VStack 的间距
             VStack(spacing: gaps.lineToText) {
@@ -182,6 +233,57 @@ struct TrendStrip: View {
                                                    + (s.change.map { " · " + $0 } ?? "")))
             }
             .padding(.top, gaps.lineAbove)
+        }
+    }
+}
+
+/// 「另 N 个模型」点开后的全部模型：标题写哪天、几个模型和当天合计，下面一行一个模型（「其他」拆开逐个列）
+struct TrendAllModelsList: View {
+    let chart: TokenChart
+    /// 柱子下标（选中的那天）
+    let bar: Int
+    let p: Palette
+
+    var body: some View {
+        let rows = chart.allModels(bar: bar)
+        let isToday = bar == chart.bars.count - 1
+        let b = chart.bars.indices.contains(bar) ? chart.bars[bar] : nil
+        let plan = chart.planOnly(bar: bar)
+        let hasCost = rows.contains { $0.cost != nil }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(L("chart.allModelsTitle", isToday ? L("chart.today") : b?.date ?? "", rows.count))
+                    .font(.system(size: 12, weight: .semibold)).foregroundColor(p.text).lineLimit(1)
+                Spacer(minLength: 8)
+                Text(cnCount(b?.total ?? 0) + (plan ? L("chart.planDot") : "")).font(.num(11, .regular)).foregroundColor(p.text)
+                    .lineLimit(1)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityLabel(A11yText.speak(L("chart.allModelsTitle", isToday ? L("chart.today") : A11yText.spokenDate(iso: b?.iso ?? ""), rows.count)
+                                               + "，" + cnCount(b?.total ?? 0) + (plan ? L("chart.planDot") : ""), separators: false))
+            Hairline(p: p)
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, r in
+                    HStack(spacing: 6) {
+                        if chart.multiPlatform {
+                            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                                .fill(TrendStrip.color(chart, r.series, p))
+                                .frame(width: 8, height: 8)
+                        }
+                        Text(r.label).font(.system(size: 11)).foregroundColor(p.sub).lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 8)
+                        Text(cnCount(r.tokens)).font(.num(11, .regular)).foregroundColor(p.text).lineLimit(1)
+                        if hasCost {
+                            Text(r.cost ?? "").font(.num(11, .regular)).foregroundColor(p.sub).lineLimit(1)
+                                .frame(minWidth: 44, alignment: .trailing)
+                        }
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(A11yText.speak("\(r.label) \(cnCount(r.tokens))", separators: false)
+                                        + (r.cost.map { "，" + A11yText.speak($0) } ?? ""))
+                }
+            }
         }
     }
 }
@@ -233,14 +335,12 @@ struct ModelShare: View {
 struct TokenDetailCard: View {
     let models: [AppData.ModelUse]
     @Binding var picked: String?
-    var title: String? = nil
     let p: Palette
 
     var body: some View {
         let sel = models.first(where: { $0.key == (picked ?? models.first?.key) }) ?? models.first
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                if let t = title { SectionTitle(text: t, p: p) }
                 Spacer()
                 if models.count > 1 {
                     SegmentPicker(items: models.map { ($0.key, $0.label) }, selected: sel?.key, p: p) {
@@ -290,10 +390,10 @@ struct DayDetail: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(cnCount(day.totalTokens)).font(.num(26, .semibold)).foregroundColor(p.text)
-                Text("token · \(fmtMoney(cost, currency))").font(.num(12, .regular)).foregroundColor(p.sub)
+                Text(L("chart.dayTokensCost", fmtMoney(cost, currency))).font(.num(12, .regular)).foregroundColor(p.sub)
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("\(A11yText.spokenDate(iso: day.iso))，\(A11yText.count(day.totalTokens)) token，\(A11yText.money(cost, currency: currency))")
+            .accessibilityLabel(L("chart.dayA11y", A11yText.spokenDate(iso: day.iso), A11yText.count(day.totalTokens), A11yText.money(cost, currency: currency)))
             GeometryReader { g in
                 HStack(spacing: 1.5) {
                     ForEach(Array(segs.enumerated()), id: \.offset) { _, s in

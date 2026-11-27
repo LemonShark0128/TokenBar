@@ -21,10 +21,22 @@ func registerRiskRankerTests() {
         try checkEqual(ranked.map(\.id), [ids[3], ids[2], ids[1], ids[0]])
         try checkEqual(ranked.map(\.hours), [0, 2.0 / 3, 5, nil])
         try checkEqual(ranked.first?.kind, .belowThreshold)
-        try checkEqual(RiskRanker.mostAtRisk(inputs)?.id, ids[3])
+        try check(ranked.first?.atRisk == true)
         try checkEqual(RiskRanker.rank([riskInput(ids[0]), riskInput(ids[1], status: .offline)]).map(\.id), [ids[1], ids[0]])
         try checkEqual(RiskRanker.rank([riskInput(ids[1], hours: 5), riskInput(ids[0], hours: 5)]).map(\.id), [ids[0], ids[1]])
         try checkEqual(RiskRanker.rank([riskInput(ids[1]), riskInput(ids[0])]).map(\.id), [ids[0], ids[1]])
+    }
+    test("riskRankerExhaustedQuotaBeatsAlertLine") {
+        let w = QuotaWindow(kind: .session, usedPercent: 100, resetsAt: nil, windowMinutes: 300)
+        let used = QuotaRunway(window: w, remainingPercent: 0, risePP: 0, hoursToEmpty: 0, resetsAt: nil,
+                               state: .exhausted, severity: .danger)
+        let r = RiskRanker.risk(riskInput(.codexPlan, quota: used, low: true))
+        try checkEqual(r.kind, .quota(used))
+        try check(r.atRisk); try checkEqual(r.severity, .danger); try checkEqual(r.hours, 0)
+        try checkEqual(MenuBarText.riskTooltip(r, name: "Codex", now: Date(), timeZone: .current), L("menuText.exhausted", "Codex"))
+        try check(MenuBarText.alertBadge(mode: "icon", spike: false, risk: r))
+        var soon = used; soon.state = .runsOut; soon.remainingPercent = 10; soon.hoursToEmpty = 1
+        try checkEqual(RiskRanker.risk(riskInput(.codexPlan, quota: soon, low: true)).kind, .belowThreshold)
     }
     test("riskRankerIgnoresOldNumbersAndLoading") {
         for status: PlatformStatus in [.offline, .credentialInvalid, .schemaChanged, .stale(minutes: 5)] {
@@ -38,8 +50,7 @@ func registerRiskRankerTests() {
             try checkEqual(RiskRanker.risk(riskInput(.deepseek, status: status, hours: 1, low: true)).kind, .none)
         }
         try checkEqual(RiskRanker.rank([riskInput(.deepseek, status: .notAdded)]), [])
-        try checkEqual(RiskRanker.mostAtRisk([riskInput(.deepseek, hours: 12), riskInput(.siliconflow, status: .offline)]), nil)
-        try checkEqual(RiskRanker.mostAtRisk([]), nil)
+        try check(!RiskRanker.rank([riskInput(.deepseek, hours: 12), riskInput(.siliconflow, status: .offline)]).contains { $0.atRisk })
     }
     test("riskRankerPreservesQuotaAndPaygReadings") {
         for state: QuotaRunway.State in [.idle, .enough, .runsOut, .exhausted] {

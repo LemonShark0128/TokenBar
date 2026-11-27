@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 状态：汇率刷新、检查更新（定时器 fxTimer / updateLaunchTimer 是存储属性，留在 Model.swift）
 
@@ -42,8 +41,7 @@ extension UsageModel {
         Task { @MainActor in
             let rate = await ExchangeRate.refresh(client: URLSessionHTTPClient(systemProxy: true), defaults: .standard, now: Date(), log: logLine)
             guard rate != nil else { return }
-            // 汇率变了：今日合计等按新汇率重算
-            self.objectWillChange.send()
+            // 汇率变了：今日合计等按新汇率重算（applyStore 赋值 @Published，界面随之刷新）
             self.applyStore()
         }
     }

@@ -5,7 +5,16 @@ enum AgentDirKind: String, Sendable { case codex, claude }
 struct AgentDirs: Equatable, Sendable {
     var codexHome: URL
     var claudeConfig: URL
+    var antigravityBrain: URL
     var codexSessions: URL { codexHome.appendingPathComponent("sessions", isDirectory: true) }
+
+    init(codexHome: URL, claudeConfig: URL,
+         antigravityBrain: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+             .appendingPathComponent(".gemini/antigravity/brain", isDirectory: true)) {
+        self.codexHome = codexHome
+        self.claudeConfig = claudeConfig
+        self.antigravityBrain = antigravityBrain
+    }
 
     private static func nonempty(_ value: String?) -> String? {
         guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
@@ -20,7 +29,8 @@ struct AgentDirs: Equatable, Sendable {
             return URL(fileURLWithPath: path, isDirectory: true)
         }
         return AgentDirs(codexHome: directory(.codex, "CODEX_HOME", ".codex"),
-                         claudeConfig: directory(.claude, "CLAUDE_CONFIG_DIR", ".claude"))
+                         claudeConfig: directory(.claude, "CLAUDE_CONFIG_DIR", ".claude"),
+                         antigravityBrain: home.appendingPathComponent(".gemini/antigravity/brain", isDirectory: true))
     }
 
     /// 设置里选的目录；选回默认位置（~/.codex、~/.claude）不算自定义——否则会给 claude 传 CLAUDE_CONFIG_DIR，

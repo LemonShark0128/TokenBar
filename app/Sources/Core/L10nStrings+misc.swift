@@ -1,5 +1,12 @@
 extension L10nStrings {
     static let misc: [L10n.Entry] = [
+        .init("edit.menu", "编辑", "Edit"),
+        .init("edit.undo", "撤销", "Undo"),
+        .init("edit.redo", "重做", "Redo"),
+        .init("edit.cut", "剪切", "Cut"),
+        .init("edit.copy", "拷贝", "Copy"),
+        .init("edit.paste", "粘贴", "Paste"),
+        .init("edit.selectAll", "全选", "Select All"),
         .init("agentDir.invalidCodex", "这个文件夹里没有 sessions 子目录，请选择 Codex 的数据目录", "This folder has no sessions subfolder. Choose the Codex data folder"),
         .init("agentDir.invalidClaude", "这个文件夹里没有 projects 子目录或 settings.json，请选择 Claude 的数据目录", "This folder has no projects subfolder or settings.json. Choose the Claude data folder"),
         .init("action.dataDir", "数据目录…", "Data Folder…"),

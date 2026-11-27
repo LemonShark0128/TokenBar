@@ -8,14 +8,14 @@ func registerQuotaModelTests() {
     }
     test("displayWindowPrefersSessionAndKeepsAlertTightest") {
         var q = Quota(plan: nil, windows: [w(.weekly, 80, resetsIn: 600), w(.session, 20, resetsIn: 60)], observedAt: now)
-        try checkEqual(q.displayWindow?.kind, .session)
+        try checkEqual(q.displayWindow(at: now)?.kind, .session)
         try checkEqual(q.displayRemainingPercent(at: now), 80)
         try checkEqual(q.remainingPercent(at: now), 20)
         try checkEqual(q.displayRemainingPercent(at: now.addingTimeInterval(60)), 100)
         q.windows.removeLast()
         try checkEqual(q.displayRemainingPercent(at: now), 20)
         q.windows.insert(w(.weeklyModel("opus"), 90, resetsIn: 600), at: 0)
-        try checkEqual(q.displayWindow?.kind, .weekly)
+        try checkEqual(q.displayWindow(at: now)?.kind, .weekly)
         q.windows.removeLast()
         try checkEqual(q.displayRemainingPercent(at: now), 10)
         q.windows = []
@@ -51,6 +51,27 @@ func registerQuotaModelTests() {
         }
         try checkEqual(QuotaActivity.risePP(s, now: now), 14)
         try checkEqual(QuotaActivity.risePP([], now: now), 0)
+    }
+    test("riseIgnoresWindowSwitch") {
+        // 5 小时窗口 10 → 20，之后只剩每周窗口 60 → 61：涨幅只按最新的每周窗口算 = 1，不能把 20 → 60 当涨幅
+        func s(_ dt: Double, _ used: Double, _ k: QuotaWindow.Kind) -> Sample {
+            Sample(provider: .deepseek, t: now.addingTimeInterval(dt), balance: nil, cumulativeCost: nil, currency: .cny,
+                   quotaUsed: used, quotaWindow: k.sampleKey)
+        }
+        try checkEqual(QuotaActivity.risePP([s(-2400, 10, .session), s(-1800, 20, .session),
+                                            s(-900, 60, .weekly), s(-60, 61, .weekly)], now: now), 1)
+        // 切回 5 小时窗口：基准 10（1 小时前以外）→ 20 → 25 = 15，中间的每周读数不参与
+        try checkEqual(QuotaActivity.risePP([s(-4000, 10, .session), s(-1800, 20, .session),
+                                            s(-900, 60, .weekly), s(-60, 25, .session)], now: now), 15)
+        // 老库里没记窗口的采样（升级前留下的）照旧参与，升级后的第一个小时不丢涨幅
+        let legacy = Sample(provider: .deepseek, t: now.addingTimeInterval(-1800), balance: nil, cumulativeCost: nil,
+                            currency: .cny, quotaUsed: 30)
+        try checkEqual(QuotaActivity.risePP([legacy, s(-60, 34, .session)], now: now), 4)
+    }
+    test("windowSampleKeys") {
+        try checkEqual(QuotaWindow.Kind.session.sampleKey, "session")
+        try checkEqual(QuotaWindow.Kind.weekly.sampleKey, "weekly")
+        try checkEqual(QuotaWindow.Kind.weeklyModel("opus").sampleKey, "weeklyModel:opus")
     }
     test("quotaSnapshotRoundTripsAndOldCacheDecodes") {
         let q = Quota(plan: "plus", windows: [w(.session, 35, resetsIn: 60), w(.weeklyModel("opus"), 7, resetsIn: nil)], observedAt: now)

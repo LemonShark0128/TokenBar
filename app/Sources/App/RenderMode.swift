@@ -1,7 +1,5 @@
 import AppKit
-import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 离屏渲染（自检用）
 
@@ -24,19 +22,27 @@ enum RenderMode {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let model = UsageModel()
         let originalTheme = model.themeMode
-        // 渲染会改主题、小组件页等偏好；这些是用户的真实设置，结束时一律恢复
-        let saved = (full: model.fuelFullCny, mb: model.mbMode, page: model.widgetPage, glass: Glass.shared.transparency)
+        // 渲染会改主题、小组件页等；渲染时这些 didSet 不写偏好（savePref），这里只把内存里的值改回去
+        let saved = (full: model.fuelFullCny, mb: model.mbMode, page: model.widgetPage, glass: Glass.shared.transparency,
+                     style: model.mbStyle, slots: model.mbSlots, running: model.mbShowRunning)
         // 注意不能用 defer：exit() 会直接结束进程，defer 不会执行
         let restore = {
             model.fuelFullCny = saved.full; model.mbMode = saved.mb; model.widgetPage = saved.page
             Glass.shared.transparency = saved.glass
+            model.mbStyle = saved.style; model.mbSlots = saved.slots; model.mbShowRunning = saved.running
             model.themeMode = originalTheme
             UserDefaults.standard.synchronize()
+            forgetDevCopy()
         }
+        // 预览只用默认设置画，不随用户真实的刷新间隔、突增提醒、提醒间隔、开机启动、面板首页、菜单栏样式变化
+        //（渲染时这些 didSet 不写偏好，见 savePref）
+        model.refreshSeconds = 60; model.spikeAlertsOn = false; model.alertRepeatHours = AlertRepeat.defaultHours
+        model.launchAtLogin = true; model.panelHome = "today"
+        model.mbStyle = "bars"; model.mbSlots = "single"; model.mbShowRunning = true
+        model.fuelFullCny = 50; model.mbMode = "balance"; Glass.shared.transparency = 0.55
         let checkDir = args.firstIndex(of: "--render-check").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
         if checkDir != nil {
-            // 截图对比用固定数据和固定设置，结果才可重复
-            model.fuelFullCny = 50; model.mbMode = "balance"; Glass.shared.transparency = 0.55
+            // 截图对比用固定数据（设置已在上面固定），结果才可重复
             model.data = sampleData()
             renderAll(model: model, dir: dir, originalTheme: originalTheme)
             restore()
@@ -51,8 +57,46 @@ enum RenderMode {
         exit(0)
     }
 
+    static func renderMenuBarStyles(dir: URL) {
+        let now = sampleSnapshot().fetchedAt
+        let ds = deepseekMainState(now: now)
+        var sf = ds
+        sf.id = .siliconflow; sf.snapshot?.provider = .siliconflow
+        sf.snapshot?.balance = Money(amount: 12, currency: .cny)
+        var codex = quotaMainState(now: now)
+        codex.snapshot?.quota = Quota(plan: nil, windows: [
+            QuotaWindow(kind: .session, usedPercent: 99, resetsAt: now.addingTimeInterval(11640), windowMinutes: 300),
+            QuotaWindow(kind: .weekly, usedPercent: 95, resetsAt: now.addingTimeInterval(4 * 86400), windowMinutes: 10080)
+        ], observedAt: now)
+        var claude = codex
+        claude.id = .claudePlan; claude.snapshot?.provider = .claudePlan
+        claude.snapshot?.quota = Quota(plan: nil, windows: [
+            QuotaWindow(kind: .session, usedPercent: 31, resetsAt: now.addingTimeInterval(11640), windowMinutes: 300),
+            QuotaWindow(kind: .weekly, usedPercent: 80, resetsAt: now.addingTimeInterval(4 * 86400), windowMinutes: 10080)
+        ], observedAt: now)
+        let d = AppDataMapping.appData(main: ds, others: [sf, codex, claude], now: now, timeZone: .current)
+        let cells = MenuBarCells.cells(d, main: .deepseek, now: now)
+        for dark in [true, false] {
+            let preview = MenuBarStylesPreview(cells: cells, dark: dark)
+            render(preview, name: "menubar-styles-\(dark ? "dark" : "light")", size: CGSize(width: 520, height: 360), dir: dir)
+            if dark { render(preview, name: "menubar-styles", size: CGSize(width: 520, height: 360), dir: dir) }
+        }
+    }
+
+    /// 运行渲染时系统会登记这份开发副本；跑完去掉，免得通知中心挑中它（见 DevCopy）
+    static func forgetDevCopy() {
+        let bundle = Bundle.main.bundleURL
+        guard DevCopy.shouldForget(bundle: bundle, home: URL(fileURLWithPath: NSHomeDirectory())) else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: DevCopy.lsregister)
+        p.arguments = ["-u", bundle.path]
+        try? p.run()
+        p.waitUntilExit()
+    }
+
     static func renderAll(model: UsageModel, dir: URL, originalTheme: UsageModel.ThemeMode) {
 
+        renderMenuBarStyles(dir: dir)
         let detailDay = model.data?.trend7.last(where: { ($0.detail?.isEmpty == false) })
         let detailKey = model.trendModelKey      // 与真 App 同口径：传模型 key，不是 label
 
@@ -78,10 +122,10 @@ enum RenderMode {
             // 设置四页（方案 A 侧栏）：DeepSeek（主）正常、硅基流动 3 天后过期、Codex 套餐正常、Claude 套餐未添加
             let settingsInput = multiPlatformInput(snap: sampleSnapshot())
             renderSettings(model, page: .platform, input: settingsInput, name: "settings-platform-\(tag)", p: p, bg: bg, dir: dir)
-            var follow = settingsInput
-            follow.menuBarAuto = true
-            follow.menuBar = .codexPlan
-            renderSettings(model, page: .menuBar, input: follow, name: "settings-menubar-\(tag)", p: p, bg: bg, dir: dir)
+            model.mbStyle = "bars"
+            model.mbShowRunning = true
+            model.mbSlots = "single"
+            renderSettings(model, page: .display, input: settingsInput, name: "settings-menubar-\(tag)", p: p, bg: bg, dir: dir)
             renderSettings(model, page: .alerts, input: settingsInput, name: "settings-alerts-\(tag)", p: p, bg: bg, dir: dir)
             // 代理提醒：DeepSeek 每小时花费超过 ¥2（硅基流动保持默认「关」），套餐重置前会用完默认开
             var agent = settingsInput
@@ -102,11 +146,9 @@ enum RenderMode {
                 var claude = quotaMainState(now: sampleSnapshot().fetchedAt)
                 claude.id = .claudePlan; claude.snapshot?.provider = .claudePlan; claude.snapshot?.quota?.plan = nil
                 four.platforms.append(claude)
-                four.menuBarAuto = false
-                four.menuBar = .claudePlan
                 four.auto = false
                 renderSettings(model, page: .platform, input: four, name: "settings-four-platforms", p: p, bg: bg, dir: dir)
-                renderSettings(model, page: .menuBar, input: four, name: "settings-four-platforms-display", p: p, bg: bg, dir: dir)
+                renderSettings(model, page: .display, input: four, name: "settings-four-platforms-display", p: p, bg: bg, dir: dir)
                 renderSettings(model, page: .alerts, input: four, name: "settings-four-platforms-alerts", p: p, bg: bg, dir: dir)
                 // 各种账号状态：DeepSeek 只有余额（主）、硅基流动已失效、Codex 套餐正在连接
                 var states = settingsInput
@@ -115,6 +157,7 @@ enum RenderMode {
                                     PlatformState(id: .siliconflow, snapshot: nil, burn: nil, status: .credentialInvalid),
                                     PlatformState(id: .codexPlan, snapshot: nil, burn: nil, status: .loading)]
                 renderSettings(model, page: .platform, input: states, name: "settings-platform-states", p: p, bg: bg, dir: dir)
+                renderSettings(model, page: .alerts, input: states, name: "settings-alerts-states", p: p, bg: bg, dir: dir)
             }
             // 「今日/本月费用」卡片单独渲染：口径徽标（账单/估算）要看得到才算验过
             // 旧的 CostPair 单卡自检已随 A 版移除（口径改为 SourceTag，随面板一起渲染）
@@ -135,7 +178,7 @@ enum RenderMode {
                                 HStack(spacing: 14) {
                                     Image(nsImage: PlatformGlyph.image(id, size: 48, tint: dark ? .white : .black))
                                     Image(nsImage: PlatformGlyph.image(id, size: 16, tint: dark ? .white : .black))
-                                    Image(nsImage: PlatformGlyph.image(id, size: 16, tint: .systemRed))
+                                    Image(nsImage: PlatformGlyph.image(id, size: 16, tint: AlertColor.danger(dark: dark)))
                                     Text(ProviderRegistry.displayName(id)).font(.system(size: 11))
                                         .foregroundColor(dark ? .white : .black)
                                     Spacer()
@@ -144,7 +187,7 @@ enum RenderMode {
                         }
                         .padding(14).frame(width: 260).background(dark ? Color(white: 0.12) : Color(white: 0.95))
                     }
-                }, name: "platform-glyphs", size: CGSize(width: 520, height: 290), dir: dir)
+                }, name: "platform-glyphs", size: CGSize(width: 520, height: 512), dir: dir)
             }
             render(LogoBoard(model: model, p: p),
                    name: "logo-\(tag)", size: CGSize(width: 470, height: 300), dir: dir)
@@ -223,20 +266,46 @@ enum RenderMode {
             renderFit(OnboardingView(model: model, initialStep: .pick, p: p,
                                      preview: OnboardingPreview(picked: Set(ProviderRegistry.all))),
                       name: "onboarding-pick-\(tag)", width: 420, bg: bg, dir: dir)
-            // 用户反馈：已添加 DeepSeek，再来勾 Claude 套餐时，DeepSeek 勾着、不用再验证
+            // 用户 11/6 选乙：老用户进来是管理页（已添加写读数 + 移除，可添加写说明 + 添加）
+            let readings: [ProviderID: AccountReading] = [.deepseek: .money(5.35, currency: "CNY"), .siliconflow: .money(9.05, currency: "CNY"),
+                                                          .kimi: .money(15, currency: "CNY"), .openrouter: .keyLimit(12.4, currency: "USD"),
+                                                          .packyapi: .money(108.32, currency: "CNY"),
+                                                          .codexPlan: .session(90), .claudePlan: .session(59), .geminiPlan: .session(92)]
             renderFit(OnboardingView(model: model, initialStep: .pick, p: p,
-                                     preview: OnboardingPreview(picked: [.deepseek, .claudePlan], added: [.deepseek])),
-                      name: "onboarding-pick-added-\(tag)", width: 420, bg: bg, dir: dir)
-            // 第三批反馈：已添加的平台可以取消勾选（取消等于移除）
+                                     preview: OnboardingPreview(picked: Set(ProviderRegistry.all), added: Set(ProviderRegistry.all),
+                                                                readings: readings)),
+                      name: "onboarding-manage-all-\(tag)", width: 420, bg: bg, dir: dir)
             renderFit(OnboardingView(model: model, initialStep: .pick, p: p,
-                                     preview: OnboardingPreview(picked: [.deepseek], added: [.deepseek, .codexPlan])),
-                      name: "onboarding-pick-remove-\(tag)", width: 420, bg: bg, dir: dir)
-            // 第四批第 2 条：已连接的平台绿勾；硅基流动登录失效时灰勾并写原因；新勾的 Claude 套餐蓝勾
+                                     preview: OnboardingPreview(picked: [.deepseek, .claudePlan], added: [.deepseek], readings: readings)),
+                      name: "onboarding-manage-mixed-\(tag)", width: 420, bg: bg, dir: dir)
+            // 管理页：已添加 DeepSeek、Codex 套餐
+            renderFit(OnboardingView(model: model, initialStep: .pick, p: p,
+                                     preview: OnboardingPreview(picked: [.deepseek], added: [.deepseek, .codexPlan], readings: readings)),
+                      name: "onboarding-manage-two-\(tag)", width: 420, bg: bg, dir: dir)
+            // 管理页：硅基流动登录失效时写橙色原因
             renderFit(OnboardingView(model: model, initialStep: .pick, p: p,
                                      preview: OnboardingPreview(picked: Set(ProviderRegistry.all),
                                                                 added: [.deepseek, .siliconflow, .codexPlan],
-                                                                states: [.siliconflow: .invalid])),
-                      name: "onboarding-pick-states-\(tag)", width: 420, bg: bg, dir: dir)
+                                                                states: [.siliconflow: .invalid], readings: readings)),
+                      name: "onboarding-manage-states-\(tag)", width: 420, bg: bg, dir: dir)
+            // 管理页：Kimi 暂时隐藏（用户 11/6 选 proposal-hide-platform 乙）：写「已隐藏 · 不刷新」，多一个「显示」
+            renderFit(OnboardingView(model: model, initialStep: .pick, p: p,
+                                     preview: OnboardingPreview(picked: Set(ProviderRegistry.all),
+                                                                added: [.deepseek, .kimi, .codexPlan],
+                                                                states: [.kimi: .hidden], readings: readings)),
+                      name: "onboarding-manage-hidden-\(tag)", width: 420, bg: bg, dir: dir)
+            // OpenRouter（11/6 新平台）：管理页已添加写美元读数；登录页只填 API Key，底部说明 UTC 日界和普通 Key 看不到余额
+            renderFit(OnboardingView(model: model, initialStep: .pick, p: p,
+                                     preview: OnboardingPreview(picked: [.deepseek, .openrouter], added: [.deepseek, .openrouter],
+                                                                readings: readings)),
+                      name: "onboarding-manage-openrouter-\(tag)", width: 420, bg: bg, dir: dir)
+            renderFit(OnboardingView(model: model, initialStep: .login, p: p, only: .openrouter),
+                      name: "onboarding-login-openrouter-\(tag)", width: 420, bg: bg, dir: dir)
+            // PackyAPI（11/9 新平台，用户选甲）：登录页填用户 ID + 系统访问令牌，底部说明为什么不用 API Key、按人民币显示
+            renderFit(OnboardingView(model: model, initialStep: .login, p: p, only: .packyapi),
+                      name: "onboarding-login-packyapi-\(tag)", width: 420, bg: bg, dir: dir)
+            renderFit(OnboardingView(model: model, initialStep: .login, p: p, only: .geminiPlan),
+                      name: "onboarding-login-gemini-\(tag)", width: 420, bg: bg, dir: dir)
             // 没有添加任何平台的设置（平台页只有「＋ 添加平台」）
             model.mainState = nil; model.needsSetup = true
             renderSettings(model, page: .platform, input: nil, name: "settings-platform-empty-\(tag)", p: p, bg: bg, dir: dir)
@@ -248,13 +317,17 @@ enum RenderMode {
                       name: "onboarding-menubar-all-\(tag)", width: 420, bg: bg, dir: dir)
             // 重新登录的结果：硅基流动验证没通过（橙）、DeepSeek 控制台重新登录成功（绿）
             model.reloginNotes = [
-                .siliconflow: ReloginNote.make(provider: .siliconflow, ok: false, message: "登录没有成功，请重新登录硅基流动"),
-                .deepseek: ReloginNote.make(provider: .deepseek, ok: true, message: "已登录")]
+                .siliconflow: ReloginNote.make(ok: false, message: L("valid.sfLoginFailed")),
+                .deepseek: ReloginNote.make(ok: true, message: L("relogin.signedIn"))]
             renderSettings(model, page: .platform, input: multi, name: "settings-relogin-\(tag)", p: p, bg: bg, dir: dir)
             model.reloginNotes = [:]
             model.mainState = nil; model.needsSetup = true
             let keepData = model.data; model.data = nil
             renderFit(PanelView(model: model, p: p), name: "panel-empty-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            // 添加过的平台全都隐藏了：写「平台都隐藏了」+ 显示入口，不是「添加第一个平台」
+            model.hiddenIDs = [.deepseek, .kimi]
+            renderFit(PanelView(model: model, p: p), name: "panel-allhidden-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            model.hiddenIDs = []
             model.data = keepData
         }
         model.mainState = keepState; model.needsSetup = keepSetup
@@ -264,7 +337,44 @@ enum RenderMode {
         renderExhausted(model: model, dir: dir, originalTheme: originalTheme)
         renderRunway(model: model, dir: dir)
         renderRunningTasks(model: model, dir: dir)
+        renderAstryxCards(model: model, dir: dir)
         renderClaudePlan(model: model, dir: dir, originalTheme: originalTheme)
+    }
+
+    private static func renderAstryxCards(model: UsageModel, dir: URL) {
+        let saved = (model.data, model.mainState, model.fixedNow, model.runningTasks, model.menuBarPaygActive)
+        defer { (model.data, model.mainState, model.fixedNow, model.runningTasks, model.menuBarPaygActive) = saved }
+
+        let now = sampleSnapshot().fetchedAt
+        let zone = TimeZone(secondsFromGMT: 8 * 3600)!
+        var deepseek = deepseekMainState(now: now)
+        deepseek.burn?.runwayDays = 4
+        var codex = quotaMainState(now: now)
+        codex.snapshot?.quota?.windows[0].usedPercent = 100
+        var claude = quotaMainState(now: now)
+        claude.id = .claudePlan
+        claude.snapshot?.provider = .claudePlan
+
+        var data = AppDataMapping.appData(main: deepseek, others: [codex, claude], now: now, timeZone: zone)
+        data.yesterdaySameTimeCny = data.totalTodayCny.map { $0 / 1.32 }
+        model.data = data
+        model.mainState = deepseek
+        model.fixedNow = now
+        model.menuBarPaygActive = [.deepseek]
+        model.runningTasks = [
+            RunningTask(provider: .claudePlan, sessionKey: "astryx", project: "token-bar", model: "opus",
+                        startedAt: now.addingTimeInterval(-480), lastActivity: now.addingTimeInterval(-8), tokens: 12_300)
+        ]
+        for dark in [false, true] {
+            let p = Palette.of(dark)
+            let tag = dark ? "dark" : "light"
+            let scheme: ColorScheme = dark ? .dark : .light
+            renderFit(TodayGrid(model: model, d: data, p: p).padding(12).environment(\.colorScheme, scheme),
+                      name: "astryx-today-\(tag)", width: kPanelWidth, bg: p.bgTop, dir: dir)
+            renderFit(MenuInfoCard(model: model, hover: HoverState()).environment(\.colorScheme, scheme),
+                      name: "astryx-menu-\(tag)", width: MenuCardHost.width,
+                      bg: dark ? Color(white: 0.17) : Color(white: 0.965), dir: dir)
+        }
     }
 
     /// 第三期 Task 8 新增预览：Claude 套餐的安装确认页 / settings.json 解析不了 / 状态栏钩子不在了，
@@ -279,8 +389,8 @@ enum RenderMode {
         let deepseek = deepseekMainState(now: now)
 
         let keepData = model.data, keepState = model.mainState, keepSide = model.menuBarSide
-        let keepAlert = model.balanceAlertCny, keepHook = model.claudeHookState, keepNotes = model.reloginNotes
-        model.syncingAlert = true; model.balanceAlertCny = 10; model.syncingAlert = false
+        let keepAlert = model.renderAlert, keepHook = model.claudeHookState, keepNotes = model.reloginNotes
+        model.renderAlert = 10
         model.fixedNow = now
         model.menuBarSide = nil
         model.themeMode = .light
@@ -295,7 +405,7 @@ enum RenderMode {
                                  preview: OnboardingPreview(picked: [.claudePlan], claudeInstalled: true, claudeChoice: .terminal)),
                   name: "claude-terminal-step", width: 420, bg: bg, dir: dir)
         renderFit(OnboardingView(model: model, initialStep: .login, p: p, only: .claudePlan,
-                                 preview: OnboardingPreview(picked: [.claudePlan], claudeSnippet: model.claudeInstaller.manualSnippet,
+                                 preview: OnboardingPreview(picked: [.claudePlan], claudeSnippet: ClaudeStatusLineInstaller.preview.manualSnippet,
                                                             claudeChoice: .terminal)),
                   name: "claude-unparseable", width: 420, bg: bg, dir: dir)
 
@@ -361,18 +471,18 @@ enum RenderMode {
 
         var settings = ProviderSettings()
         settings.lowAlerts = [.deepseek: 10, .claudePlan: 10]
-        let added = AccountsInput(platforms: [deepseek, claude], mainID: .claudePlan, auto: true, menuBar: .claudePlan, settings: settings)
+        let added = AccountsInput(platforms: [deepseek, claude], mainID: .claudePlan, auto: true, settings: settings)
         renderSettings(model, page: .platform, input: added, name: "claude-settings-platform", p: p, bg: bg, dir: dir)
         // 移除时状态栏设置已被改过：没有还原，说明留在（已未添加的）账号行下
         model.claudeHookState = .notInstalled
-        model.reloginNotes = [.claudePlan: ReloginNote(text: "状态栏设置已被改过，Token Bar 没有还原；备份在 ~/.claude/", isError: true)]
-        let removed = AccountsInput(platforms: [deepseek], mainID: .deepseek, auto: true, menuBar: .deepseek, settings: settings)
+        model.reloginNotes = [.claudePlan: ReloginNote(text: L("claude.sw.changedElsewhere"), isError: true)]
+        let removed = AccountsInput(platforms: [deepseek], mainID: .deepseek, auto: true, settings: settings)
         renderSettings(model, page: .platform, input: removed, name: "claude-removed-note", p: p, bg: bg, dir: dir)
 
         model.reloginNotes = [:]
         renderClaudeDesktop(model: model, dir: dir, now: now, tz: tz, deepseek: deepseek, settings: settings)
 
-        model.syncingAlert = true; model.balanceAlertCny = keepAlert; model.syncingAlert = false
+        model.renderAlert = keepAlert
         model.fixedNow = nil
         model.claudeHookState = keepHook; model.reloginNotes = keepNotes
         model.data = keepData; model.mainState = keepState; model.menuBarSide = keepSide
@@ -411,8 +521,23 @@ enum RenderMode {
             renderFit(OnboardingView(model: model, initialStep: .login, p: p, only: .claudePlan,
                                      preview: OnboardingPreview(picked: [.claudePlan], claudeChoice: .desktop, claudeDesktopAdded: true)),
                       name: "claude-desktop-added-\(tag)", width: 420, bg: bg, dir: dir)
-            let added = AccountsInput(platforms: [deepseek, claude], mainID: .claudePlan, auto: true, menuBar: .claudePlan, settings: settings)
+            // 用户 11/6：「登录 claude.ai」来源（登录前 / 登录好）；「用本机 Claude Code 查」没登录时的结果页（proposal-claude-source-copy 乙）
+            renderFit(OnboardingView(model: model, initialStep: .login, p: p, only: .claudePlan,
+                                     preview: OnboardingPreview(picked: [.claudePlan], claudeChoice: .web)),
+                      name: "claude-web-login-\(tag)", width: 420, bg: bg, dir: dir)
+            renderFit(OnboardingView(model: model, initialStep: .login, p: p, only: .claudePlan,
+                                     preview: OnboardingPreview(picked: [.claudePlan], claudeChoice: .web, claudeWebDone: true)),
+                      name: "claude-web-done-\(tag)", width: 420, bg: bg, dir: dir)
+            renderFit(OnboardingView(model: model, initialStep: .login, p: p, only: .claudePlan,
+                                     preview: OnboardingPreview(picked: [.claudePlan], claudeChoice: .desktop, claudeDesktopAdded: true,
+                                                                claudeCLIResult: .needsLogin)),
+                      name: "claude-desktop-needslogin-\(tag)", width: 420, bg: bg, dir: dir)
+            let added = AccountsInput(platforms: [deepseek, claude], mainID: .claudePlan, auto: true, settings: settings)
             renderSettings(model, page: .platform, input: added, name: "claude-desktop-settings-\(tag)", p: p, bg: bg, dir: dir)
+            let keepSource = model.claudeSource
+            model.claudeSource = .web
+            renderSettings(model, page: .platform, input: added, name: "claude-web-settings-\(tag)", p: p, bg: bg, dir: dir)
+            model.claudeSource = keepSource
             model.data = previewData(main: claude, others: [deepseek], now: now, timeZone: tz); model.mainState = claude
             renderFit(PanelView(model: model, p: p), name: "claude-desktop-panel-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
             model.widgetPage = "balance"
@@ -432,11 +557,11 @@ enum RenderMode {
         // 固定示例时间；不读取本机记录，也不运行命令行。
         var staleSnap = noSnap
         staleSnap.quotaNote = ClaudePlanProvider.staleNote(Date(timeIntervalSince1970: 1_791_988_620), now: now, timeZone: tz)
-            + "。" + ClaudePlanProvider.cliMissingHint
+            + L("common.sentenceSep") + ClaudePlanProvider.cliMissingHint
         let stale = PlatformState(id: .claudePlan, snapshot: staleSnap, burn: nil, status: .ok, lastSampleAt: now, lastSample: nil)
         model.data = previewData(main: stale, others: [deepseek], now: now, timeZone: tz); model.mainState = stale
         renderFit(PanelView(model: model, p: p), name: "claude-desktop-stale", width: kPanelWidth, bg: bg, dir: dir)
-        let addedWaiting = AccountsInput(platforms: [deepseek, waiting], mainID: .claudePlan, auto: true, menuBar: .claudePlan, settings: settings)
+        let addedWaiting = AccountsInput(platforms: [deepseek, waiting], mainID: .claudePlan, auto: true, settings: settings)
         renderSettings(model, page: .platform, input: addedWaiting, name: "claude-desktop-settings-nodata", p: p, bg: bg, dir: dir)
         model.data = previewData(main: waiting, others: [deepseek], now: now, timeZone: tz); model.mainState = waiting
         renderFit(PanelView(model: model, p: p), name: "claude-desktop-nodata", width: kPanelWidth, bg: bg, dir: dir)
@@ -458,9 +583,9 @@ enum RenderMode {
         let withSide = previewData(main: codex, others: [deepseek], now: now, timeZone: tz)
 
         let keepData = model.data, keepState = model.mainState, keepSide = model.menuBarSide, keepPage = model.widgetPage
-        let keepAlert = model.balanceAlertCny
+        let keepAlert = model.renderAlert
         // 预警线按套餐的默认 10%；只改镜像，不回写用户设置
-        model.syncingAlert = true; model.balanceAlertCny = 10; model.syncingAlert = false
+        model.renderAlert = 10
         model.fixedNow = now
         model.menuBarSide = nil
         for dark in [false, true] {
@@ -503,14 +628,14 @@ enum RenderMode {
 
         var settings = ProviderSettings()
         settings.lowAlerts = [.deepseek: 10, .codexPlan: 10]
-        let accounts = AccountsInput(platforms: [deepseek, codex], mainID: .codexPlan, auto: true, menuBar: .codexPlan, settings: settings)
+        let accounts = AccountsInput(platforms: [deepseek, codex], mainID: .codexPlan, auto: true, settings: settings)
         // 主平台是套餐：油箱按百分比，没有「油箱满盘」
         model.data = mainOnly
         renderSettings(model, page: .alerts, input: accounts, name: "settings-alerts-quota", p: p, bg: bg, dir: dir, alert: 10)
         renderFit(OnboardingView(model: model, initialStep: .login, p: p, only: .codexPlan), name: "quota-onboarding-login",
                   width: 420, bg: bg, dir: dir)
 
-        model.syncingAlert = true; model.balanceAlertCny = keepAlert; model.syncingAlert = false
+        model.renderAlert = keepAlert
         model.fixedNow = nil
         model.data = keepData; model.mainState = keepState; model.menuBarSide = keepSide; model.widgetPage = keepPage
         model.themeMode = originalTheme
@@ -519,12 +644,12 @@ enum RenderMode {
     /// 预览只使用合成状态；涨幅直接传给纯函数，不读取 UsageStore 的采样或本机记录。
     static func previewData(main: PlatformState, others: [PlatformState], now: Date, timeZone: TimeZone,
                             localUsage: [ProviderID: DailyModelTokens] = [:],
-                            quotaRise: [ProviderID: Double] = [:]) -> AppData {
+                            quotaRise: [ProviderID: Double] = [:], below: Set<ProviderID> = []) -> AppData {
         var d = AppDataMapping.appData(main: main, others: others, now: now, timeZone: timeZone, localUsage: localUsage)
         let risks = RiskRanker.rank(([main] + others).map { st in
             RiskInput(id: st.id, status: st.status,
                       payg: Runway.payg(balance: st.snapshot?.balance?.amount, burn: st.burn),
-                      quota: Runway.quota(st.snapshot?.quota, risePP: quotaRise[st.id], now: now), belowThreshold: false)
+                      quota: Runway.quota(st.snapshot?.quota, risePP: quotaRise[st.id], now: now), belowThreshold: below.contains(st.id))
         })
         AppDataMapping.applyRisks(&d, main: main.id, risks: risks, now: now, timeZone: timeZone, currency: d.balance.currency)
         return d
@@ -559,6 +684,8 @@ enum RenderMode {
         let sf = PlatformState(id: .siliconflow, snapshot: sfSnap,
                                burn: BurnStats(perHourRecent: 0.05, perHourDay: 0.075, avgPerDayWeek: 1.8,
                                                runwayDays: 6.7, spike: false), status: .ok)
+        var sfLow = sf
+        sfLow.burn?.perHourRecent = 4; sfLow.burn?.spike = true   // 用量突增 ¥4/时：¥12 约 3 小时用完 → 按量付费风险出横幅
         model.fixedNow = now; model.menuBarSide = nil; model.switchNotice = nil
         model.mainPinned = false; model.detailOpen = false
         for dark in [false, true] {
@@ -569,7 +696,8 @@ enum RenderMode {
             for (name, main, others) in [
                 ("panel-runway-spike", deepseek, [sf, codex, claude]),
                 ("panel-runway-quota", claude, [normal, sf, codex]),
-                ("panel-risk-banner", normal, [sf, codex, claude])
+                // 2026-11-06 起套餐平台不出顶部横幅：用快没钱的硅基流动验证横幅样式
+                ("panel-risk-banner", normal, [sfLow, codex, claude])
             ] {
                 model.mainState = main
                 model.data = previewData(main: main, others: others, now: now, timeZone: tz,
@@ -583,6 +711,14 @@ enum RenderMode {
                 }
             }
         }
+        // 套餐低于预警线、近 1 小时没用（11/6 round7-scout 第 2 条乙）：表盘下胶囊写「低于预警线」（红）
+        model.themeMode = .light
+        let keepPage = model.widgetPage
+        model.widgetPage = "balance"
+        model.mainState = claude
+        model.data = previewData(main: claude, others: [normal], now: now, timeZone: tz, below: [.claudePlan])
+        renderFit(WidgetView(model: model), name: "quota-below-widget", width: 270, bg: Color(white: 0.95), dir: dir)
+        model.widgetPage = keepPage
     }
 
     /// 正在跑的任务：面板 1 个 / 4 个（含停住、「还有 1 个」）、右键卡
@@ -706,10 +842,21 @@ enum RenderMode {
             model.mainState = badMain
             renderFit(WidgetView(model: model), name: "widget-multi-relogin-\(tag)", width: 270, bg: bg, dir: dir)
             model.mainState = deepseekMainState(now: now)
+            // 读不到钥匙串（11/6 proposal-keychain-error-ui 乙）：横幅带「重试」；只是锁着时不带
+            let denied = [PlatformState(id: .deepseek, snapshot: nil, burn: nil, status: .keychainUnreadable(status: -128)),
+                          PlatformState(id: .kimi, snapshot: nil, burn: nil, status: .keychainUnreadable(status: -128))]
+            model.keychainBanner = StatusPresenter.keychainBanner(denied)
+            renderFit(PanelView(model: model, p: p), name: "panel-keychain-denied-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            if !dark {
+                model.keychainBanner = StatusPresenter.keychainBanner([PlatformState(id: .deepseek, snapshot: nil, burn: nil,
+                                                                                     status: .keychainUnreadable(status: -25308))])
+                renderFit(PanelView(model: model, p: p), name: "panel-keychain-locked-light", width: kPanelWidth, bg: bg, dir: dir)
+            }
+            model.keychainBanner = nil
 
             // 切换提示（自动切到硅基流动后第一次打开面板）与「已固定」
             model.data = sfData; model.mainState = sfMain
-            model.switchNotice = "\(ProviderRegistry.displayName(.siliconflow)) 近 1 小时花得最快，已切为主平台"
+            model.switchNotice = L("switch.noticePayg", ProviderRegistry.displayName(.siliconflow))  // 同 UsageStore.pendingSwitchNotice
             renderFit(PanelView(model: model, p: p), name: "panel-switch-notice-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
             model.switchNotice = nil
             model.mainPinned = true
@@ -723,8 +870,226 @@ enum RenderMode {
         }
         model.data = keepData; model.mainState = keepState; model.menuBarSide = keepSide; model.widgetPage = keepPage
         model.themeMode = originalTheme
+        renderToday(model: model, dir: dir)
         renderTokenChart(model: model, dir: dir, originalTheme: originalTheme)
         renderTrendPick(model: model, dir: dir, originalTheme: originalTheme)
+        renderTrendAllModels(model: model, dir: dir, originalTheme: originalTheme)
+        renderClaudeLogin(model: model, dir: dir, originalTheme: originalTheme)
+    }
+
+    /// 今天首页与小组件总览；只用合成数据，不读取本机任务。
+    static func renderToday(model: UsageModel, dir: URL) {
+        let savedData = model.data, savedState = model.mainState, savedTasks = model.runningTasks
+        let savedPage = model.widgetPage, savedHome = model.panelHome, savedNow = model.fixedNow, savedTheme = model.themeMode
+        let savedLayout = model.todayLayout, savedEditing = model.todayEditing
+        let savedResize = model.todayResizePreview
+        let savedDetail = model.panelDetailModel, savedID = model.detailPlatform
+        let savedWidgetDetail = model.widgetDetailModel, savedWidgetID = model.widgetDetailPlatform
+        defer {
+            model.todayLayout = savedLayout; model.todayEditing = savedEditing; model.todayResizePreview = savedResize
+            model.data = savedData; model.mainState = savedState; model.runningTasks = savedTasks
+            model.widgetPage = savedPage; model.panelHome = savedHome; model.fixedNow = savedNow; model.themeMode = savedTheme
+            model.panelDetailModel = savedDetail; model.detailPlatform = savedID
+            model.widgetDetailModel = savedWidgetDetail; model.widgetDetailPlatform = savedWidgetID
+        }
+        let now = Date(timeIntervalSince1970: 1_792_022_400)
+        let tz = TimeZone(secondsFromGMT: 28800)!
+        let deepseek = deepseekMainState(now: now), codex = quotaMainState(now: now)
+        var claude = codex
+        claude.id = .claudePlan; claude.snapshot?.provider = .claudePlan; claude.snapshot?.quota?.plan = "max"
+        var sf = deepseek
+        sf.id = .siliconflow; sf.snapshot?.provider = .siliconflow
+        sf.snapshot?.balance = Money(amount: 28, currency: .cny)
+        sf.snapshot?.today = Money(amount: Decimal(string: "0.50")!, currency: .cny)
+        var d = previewData(main: deepseek, others: [codex, claude, sf], now: now, timeZone: tz)
+        if let i = d.sides.firstIndex(where: { $0.id == "codexPlan" }) {
+            d.sides[i].riskText = L("today.previewRisk"); d.sides[i].riskSeverity = 1
+            d.sides[i].resetCreditsCount = 1
+            d.sides[i].resetCredits = ResetCredits(available: 1, expiresAt: now.addingTimeInterval(47 * 86400)).text(timeZone: tz)
+        }
+        if let i = d.sides.firstIndex(where: { $0.id == "siliconflow" }) { d.sides[i].runwayDays = 3008 }
+        d.totalTodayCny = 6.77; d.totalIsApprox = true
+        d.apiValue = ApiValue(todayUSD: 23.1, weekUSD: 148, perProvider: ["codexPlan": 8.1, "claudePlan": 15], partial: true)
+        let tasks = [ProviderID.claudePlan, .codexPlan].enumerated().map { i, id in
+            RunningTask(provider: id, sessionKey: "preview-\(i)", project: i == 0 ? "token-bar" : "api-server",
+                        model: i == 0 ? "opus 4.7" : "gpt-5.5", startedAt: now.addingTimeInterval(-724 - Double(i) * 40),
+                        lastActivity: now.addingTimeInterval(-5), tokens: 18234,
+                        usage: TokenBreakdown(input: 10000, output: 18234), rawModel: i == 0 ? "claude-opus-4-7" : "gpt-5.5")
+        }
+        model.panelHome = "today"; model.fixedNow = now; model.panelDetailModel = nil; model.detailPlatform = nil
+        model.widgetDetailModel = nil; model.widgetDetailPlatform = nil
+        for dark in [true, false] {
+            model.themeMode = dark ? .dark : .light
+            let tag = dark ? "dark" : "light", p = Palette.of(dark)
+            let bg = LinearGradient(colors: [p.bgTop, p.bgBottom], startPoint: .top, endPoint: .bottom)
+            model.todayLayout = TodayLayout.defaultLayout(platformIDs: ["deepseek", "siliconflow", "codexPlan", "claudePlan"])
+            model.mainState = deepseek; model.data = d; model.runningTasks = tasks
+            renderFit(PanelView(model: model, p: p), name: "panel-today-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            let mixed: [TodayLayoutItem] = [
+                .init(id: "codexPlan", size: .medium), .init(id: "claudePlan", size: .small),
+                .init(id: "spend", size: .small), .init(id: "running", size: .large),
+                .init(id: "trend", size: .medium), .init(id: "deepseek", size: .small)
+            ]
+            model.data = previewData(main: deepseek, others: [codex, claude], now: now, timeZone: tz)
+            model.data?.apiValue = d.apiValue
+            model.todayLayout = mixed
+            renderFit(PanelView(model: model, p: p), name: "panel-today-mixed-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            // 暂时隐藏了 Kimi：「添加 / 移除平台」右边「已隐藏 1 ⌄」（用户 11/6 选 proposal-hidden-bottom 丁）
+            model.data = d
+            model.todayLayout = TodayLayout.defaultLayout(platformIDs: ["deepseek", "siliconflow", "codexPlan", "claudePlan"])
+            model.hiddenIDs = [.kimi]
+            renderFit(PanelView(model: model, p: p), name: "panel-today-hidden-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            model.hiddenIDs = []
+            // 点「已隐藏 2 ⌄」弹出的列表（弹窗本身离屏画不出，单独画内容；用户 11/6 选 proposal-hidden-bottom 丁）
+            renderFit(HiddenPlatformsList(ids: [.siliconflow, .kimi], p: p, onShow: { _ in }).padding(12),
+                      name: "hidden-popover-\(tag)", width: 220, bg: p.dark ? Color(white: 0.2) : Color.white, dir: dir)
+            model.data = previewData(main: deepseek, others: [codex, claude], now: now, timeZone: tz)
+            model.data?.apiValue = d.apiValue
+            model.todayLayout = mixed
+            if dark {
+                model.todayEditing = true
+                renderFit(PanelView(model: model, p: p), name: "panel-today-edit-dark", width: kPanelWidth, bg: bg, dir: dir)
+                model.todayEditing = false
+                model.mainState = codex
+                model.data = previewData(main: codex, others: [deepseek, claude], now: now, timeZone: tz)
+                model.data?.apiValue = d.apiValue
+                renderFit(PanelView(model: model, p: p), name: "panel-today-mainswitch-dark", width: kPanelWidth, bg: bg, dir: dir)
+            }
+            model.mainState = deepseek
+            model.data = previewData(main: deepseek, others: [codex], now: now, timeZone: tz)
+            model.data?.apiValue = d.apiValue
+            model.data?.tokenSources = [.init(provider: .codexPlan, byDay: ["2026-10-15": ["gpt-5.5": 18000], "2026-10-14": ["gpt-5.5": 12000]])]
+            model.runningTasks = tasks
+            model.todayLayout = [.init(id: "codexPlan", size: .large), .init(id: "deepseek", size: .medium),
+                                 .init(id: "spend", size: .medium), .init(id: "running", size: .small), .init(id: "trend", size: .medium)]
+            renderFit(PanelView(model: model, p: p), name: "panel-today-large-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            if dark {
+                model.todayLayout = [.init(id: "deepseek", size: .large), .init(id: "spend", size: .large),
+                                     .init(id: "codexPlan", size: .small), .init(id: "running", size: .small), .init(id: "trend", size: .medium)]
+                renderFit(PanelView(model: model, p: p), name: "panel-today-large-payg-dark", width: kPanelWidth, bg: bg, dir: dir)
+                model.todayLayout = TodayLayout.defaultLayout(platformIDs: ["codexPlan", "deepseek"])
+                model.todayEditing = true; model.todayResizePreview = "codexPlan"
+                renderFit(PanelView(model: model, p: p), name: "panel-today-resize-dark", width: kPanelWidth, bg: bg, dir: dir)
+                model.todayEditing = false; model.todayResizePreview = nil
+            }
+            // OpenRouter（11/6 新平台，美元）：今天页一张卡；单独作主平台时只写今日 / 本月，没有 token 柱图和缓存命中
+            var openrouter = deepseek
+            openrouter.id = .openrouter
+            openrouter.snapshot = ProviderSnapshot(provider: .openrouter, balance: Money(amount: Decimal(string: "18.42")!, currency: .usd),
+                                                   today: Money(amount: Decimal(string: "0.86")!, currency: .usd),
+                                                   month: Money(amount: Decimal(string: "12.30")!, currency: .usd),
+                                                   byModel: [], trend7: [], source: .bill, fetchedAt: now, credential: .ok)
+            // 普通 Key 读不到账户余额：显示的是 Key 剩余额度（用户 11/7 选乙：卡片底注、表盘上方小字都写明）
+            openrouter.snapshot?.balanceIsKeyLimit = true
+            openrouter.burn = BurnStats(perHourRecent: 0, perHourDay: Decimal(string: "0.04"), avgPerDayWeek: Decimal(string: "0.95")!,
+                                        runwayDays: Decimal(string: "19.4"), spike: false)
+            model.mainState = deepseek
+            model.data = previewData(main: deepseek, others: [openrouter, codex], now: now, timeZone: tz)
+            model.todayLayout = TodayLayout.defaultLayout(platformIDs: ["deepseek", "openrouter", "codexPlan"])
+            renderFit(PanelView(model: model, p: p), name: "panel-today-openrouter-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            // 人民币主平台 + 美元辅助平台：表盘刻度按 ¥，OpenRouter 的 $18.42 先换成约 ¥131 再画（审查后续 2）
+            model.panelHome = "single"
+            model.data = previewData(main: deepseek, others: [openrouter], now: now, timeZone: tz)
+            renderFit(PanelView(model: model, p: p), name: "panel-mixed-usd-side-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            model.panelHome = "today"
+            model.mainState = openrouter
+            model.data = previewData(main: openrouter, others: [], now: now, timeZone: tz)
+            model.todayLayout = TodayLayout.defaultLayout(platformIDs: ["openrouter"])
+            renderFit(PanelView(model: model, p: p), name: "panel-openrouter-only-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            // PackyAPI（11/9 新平台，人民币）：单独作主平台，有按模型明细（只有总 token，没有缓存命中）和近 7 天趋势
+            var packy = deepseek
+            packy.id = .packyapi
+            func yuan(_ v: String) -> Money { Money(amount: Decimal(string: v)!, currency: .cny) }
+            let opus = ModelUsage(model: "claude-opus-5-5", cacheHit: 0, cacheMiss: 0, output: 1_840_000, requests: 61, cost: yuan("2.10"))
+            let sonnet = ModelUsage(model: "claude-sonnet-5", cacheHit: 0, cacheMiss: 0, output: 920_000, requests: 109, cost: yuan("1.14"))
+            let packyDays = ["2026-10-09", "2026-10-10", "2026-10-11", "2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15"]
+                .enumerated().map { i, day in
+                    DayUsage(day: day, tokens: [0, 0, 0, 0, 1_200_000, 2_100_000, 2_760_000][i],
+                             cost: yuan(["0", "0", "0", "0", "1.62", "2.95", "3.24"][i]), models: i == 6 ? [opus, sonnet] : [])
+                }
+            packy.snapshot = ProviderSnapshot(provider: .packyapi, balance: yuan("108.32"), today: yuan("3.24"), month: yuan("12.68"),
+                                              byModel: [opus, sonnet], trend7: packyDays, source: .bill, fetchedAt: now, credential: .ok)
+            packy.burn = BurnStats(perHourRecent: Decimal(string: "0.31"), perHourDay: Decimal(string: "0.27"), avgPerDayWeek: Decimal(string: "2.60")!,
+                                   runwayDays: Decimal(string: "41.7"), spike: false)
+            model.mainState = packy
+            model.data = previewData(main: packy, others: [], now: now, timeZone: tz)
+            model.todayLayout = TodayLayout.defaultLayout(platformIDs: ["packyapi"])
+            renderFit(PanelView(model: model, p: p), name: "panel-packyapi-only-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            // Gemini 套餐（通过 agy CLI 查额度）：5 小时 + 每周 + Claude/GPT 组周窗口
+            let geminiQuota = Quota(plan: "pro", windows: [
+                QuotaWindow(kind: .session, usedPercent: 7.84, resetsAt: now.addingTimeInterval(4 * 3600 + 53 * 60), windowMinutes: 300),
+                QuotaWindow(kind: .weekly, usedPercent: 2.46, resetsAt: now.addingTimeInterval(6 * 86400 + 23 * 3600), windowMinutes: 10080),
+                QuotaWindow(kind: .weeklyModel("Claude / GPT"), usedPercent: 0, resetsAt: now.addingTimeInterval(7 * 86400), windowMinutes: 10080)
+            ], observedAt: now)
+            let gemini = PlatformState(id: .geminiPlan,
+                                       snapshot: ProviderSnapshot(provider: .geminiPlan, balance: nil, today: nil, month: nil,
+                                                                  byModel: [], trend7: [], source: .quota, fetchedAt: now,
+                                                                  credential: .ok, quota: geminiQuota),
+                                       burn: nil, status: .ok)
+            model.mainState = gemini
+            model.data = previewData(main: gemini, others: [], now: now, timeZone: tz)
+            model.todayLayout = TodayLayout.defaultLayout(platformIDs: ["geminiPlan"])
+            renderFit(PanelView(model: model, p: p), name: "panel-gemini-only-\(tag)", width: kPanelWidth, bg: bg, dir: dir)
+            model.mainState = deepseek; model.data = d
+            model.todayLayout = TodayLayout.defaultLayout(platformIDs: ["deepseek", "siliconflow", "codexPlan", "claudePlan"])
+            model.widgetPage = "overview"
+            renderFit(WidgetView(model: model), name: "widget-overview-\(tag)", width: 270, bg: bg, dir: dir)
+            if !dark {
+                var kimi = sf
+                kimi.id = .kimi; kimi.snapshot?.provider = .kimi
+                kimi.snapshot?.balance = Money(amount: Decimal(string: "45.30")!, currency: .cny)
+                kimi.snapshot?.today = Money(amount: Decimal(string: "1.20")!, currency: .cny)
+                model.data = previewData(main: deepseek, others: [codex, claude, sf, kimi], now: now, timeZone: tz)
+                renderFit(WidgetView(model: model), name: "widget-overview-5-light", width: 270, bg: bg, dir: dir)
+                model.data = d
+                let peek = UsageModel(passive: true)
+                peek.mainState = codex; peek.fixedNow = now
+                peek.data = previewData(main: codex, others: [deepseek, claude, sf], now: now, timeZone: tz)
+                model.widgetDetailModel = peek; model.widgetDetailPlatform = .codexPlan
+                renderFit(WidgetView(model: model), name: "widget-peek-light", width: 270, bg: bg, dir: dir)
+                model.widgetDetailModel = nil; model.widgetDetailPlatform = nil
+            }
+            if dark {
+                var three = previewData(main: claude, others: [codex, deepseek], now: now, timeZone: tz)
+                if let codexCard = d.sides.first(where: { $0.id == "codexPlan" }),
+                   let i = three.sides.firstIndex(where: { $0.id == "codexPlan" }) { three.sides[i] = codexCard }
+                if let i = three.sides.firstIndex(where: { $0.id == "deepseek" }) { three.sides[i].runwayDays = 4 }
+                three.apiValue = d.apiValue
+                model.mainState = claude; model.data = three
+                renderFit(PanelView(model: model, p: p), name: "panel-today-3-dark", width: kPanelWidth, bg: bg, dir: dir)
+                // 隐藏了两个：「添加 / 移除平台」右边写「已隐藏 2 ⌄」
+                model.hiddenIDs = [.siliconflow, .kimi]
+                renderFit(PanelView(model: model, p: p), name: "panel-today-hidden2-dark", width: kPanelWidth, bg: bg, dir: dir)
+                model.hiddenIDs = []
+                model.mainState = deepseek; model.data = d
+                model.runningTasks = []
+                renderFit(PanelView(model: model, p: p), name: "panel-today-notasks-dark", width: kPanelWidth, bg: bg, dir: dir)
+                // 5 个任务：小号「正在跑」和旁边等高，放不下的收进左下角「显示全部」
+                let projects = ["token-bar", "api-server", "scratchpad", "个人站点", "docs"]
+                var many: [RunningTask] = []
+                for i in 0..<5 {
+                    let claudeTask = i % 2 == 0
+                    let started: Date = now.addingTimeInterval(Double(-900 - i * 60))
+                    let active: Date = now.addingTimeInterval(i < 2 ? -5 : -1500)
+                    let written: Int = 5200 * (i + 1)
+                    many.append(RunningTask(provider: claudeTask ? .claudePlan : .codexPlan, sessionKey: "many-\(i)",
+                                            project: projects[i], model: claudeTask ? "opus 5.5" : "gpt-5.5",
+                                            startedAt: started, lastActivity: active, tokens: written,
+                                            usage: TokenBreakdown(input: 1000, output: written),
+                                            rawModel: claudeTask ? "claude-opus-4-7" : "gpt-5.5"))
+                }
+                model.runningTasks = many
+                renderFit(PanelView(model: model, p: p), name: "panel-today-running-many-dark", width: kPanelWidth, bg: bg, dir: dir)
+                model.runningTasks = []
+                let detail = UsageModel(passive: true)
+                detail.mainState = codex
+                detail.data = previewData(main: codex, others: [deepseek, claude, sf], now: now, timeZone: tz)
+                detail.fixedNow = now; detail.runningTasks = tasks
+                model.detailPlatform = .codexPlan; model.panelDetailModel = detail
+                renderFit(PanelView(model: model, p: p), name: "panel-today-detail-dark", width: kPanelWidth, bg: bg, dir: dir)
+                model.panelDetailModel = nil; model.detailPlatform = nil
+            }
+        }
     }
 
     /// 第二批第 8 条：近 7 天 token 合并图。多平台堆叠柱（DeepSeek 主 + 硅基流动 + 本机 Claude Code / Codex，用量都是编的）、
@@ -787,7 +1152,7 @@ enum RenderMode {
         settings.lowAlerts = [.deepseek: 10, .siliconflow: 5, .codexPlan: 10]
         return AccountsInput(platforms: [state(.deepseek, .ok), state(.siliconflow, .ok, credential: .expiring(days: 3)),
                                          quotaMainState(now: snap.fetchedAt)],
-                             mainID: .deepseek, auto: true, menuBar: .deepseek, settings: settings)
+                             mainID: .deepseek, auto: true, settings: settings)
     }
 
     /// 截图对比：基准目录里的每张图都要与刚渲染的同名图逐字节一致
@@ -849,14 +1214,14 @@ enum RenderMode {
     /// 平台行的套餐读数按示例快照自己的时间算（不随渲染当天变），画完恢复
     static func renderSettings<B: View>(_ model: UsageModel, page: SettingsPage, input: AccountsInput?,
                                         name: String, p: Palette, bg: B, dir: URL, alert: Double = 5) {
-        let keep = (page: model.settingsPage, alert: model.balanceAlertCny, now: model.fixedNow)
+        let keep = (page: model.settingsPage, alert: model.renderAlert, now: model.fixedNow)
         model.settingsPage = page
         model.fixedNow = keep.now ?? input?.platforms.first { $0.snapshot?.quota != nil }?.snapshot?.fetchedAt
             ?? sampleSnapshot().fetchedAt
-        model.syncingAlert = true; model.balanceAlertCny = alert; model.syncingAlert = false
+        model.renderAlert = alert
         renderFit(SettingsView(model: model, p: p, input: input), name: name, width: kSettingsWidth, bg: bg, dir: dir)
         model.settingsPage = keep.page; model.fixedNow = keep.now
-        model.syncingAlert = true; model.balanceAlertCny = keep.alert; model.syncingAlert = false
+        model.renderAlert = keep.alert
     }
 
     /// 宽度固定、高度取内容自然高度 —— 与真窗口的按内容定高一致，图里能直接看出留白/溢出

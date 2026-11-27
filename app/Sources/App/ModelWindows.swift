@@ -1,7 +1,5 @@
 import AppKit
-import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 状态：浮动窗口（面板之外：设置 / 小组件 / 详情）
 
@@ -36,6 +34,7 @@ extension UsageModel {
             logLine("小组件被关闭键关掉，开关已同步为关")
         }
         defer { UserDefaults.standard.set(widgetVisible, forKey: "widgetVisible") }   // 记住开关，重启后恢复（自查第 5 条）
+        showWidgetOverview()   // 「看一眼」是临时状态：关掉再打开回到总览
         widgetVisible = Hud.toggle(key: "widget", title: L("win.widget"),
                                    size: CGSize(width: 270, height: 300),
                                    themed: (self, { _ in AnyView(WidgetView(model: self)) }),
@@ -48,7 +47,6 @@ extension UsageModel {
 
     /// 点趋势柱 -> 打开独立的“详情”窗口
     func openDetail(_ day: AppData.Day) {
-        openedDay = day
         // 窗口标题直接写日期（「10 月 15 日」），内容里不再重复
         let parts = day.iso.split(separator: "-").compactMap { Int($0) }
         let title = parts.count == 3 ? (L10n.isZh ? L("win.dayTitle", parts[1], parts[2]) : A11yText.spokenDate(iso: day.iso)) : day.iso

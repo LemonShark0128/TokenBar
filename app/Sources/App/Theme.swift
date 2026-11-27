@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 主题
 
@@ -41,19 +40,34 @@ struct Palette {
     }
 }
 
+/// 提醒色：全 App 只有这一套橙 / 红（用户 11-05 定「中间色」），进度条、图标、菜单栏、文字都用它，同一个「警告」处处同色。
+/// 浅色比系统橙 / 红深一档，深色比系统色亮一点。
+/// 对比度：浅色橙在白底约 3.8:1、灰卡底约 3.3:1（低于正文 4.5:1，用户选了文字和图标同色，有意接受）；红约 5.4 / 4.5
+enum AlertColor {
+    static let warnLight = NSColor(srgbRed: 0.80, green: 0.40, blue: 0.0, alpha: 1)
+    static let warnDark = NSColor(srgbRed: 1.0, green: 0.62, blue: 0.24, alpha: 1)
+    static let dangerLight = NSColor(srgbRed: 0.80, green: 0.16, blue: 0.12, alpha: 1)
+    static let dangerDark = NSColor(srgbRed: 1.0, green: 0.40, blue: 0.34, alpha: 1)
+    static func warn(dark: Bool) -> NSColor { dark ? warnDark : warnLight }
+    static func danger(dark: Bool) -> NSColor { dark ? dangerDark : dangerLight }
+    /// 跟着绘制时的外观自动取深 / 浅（AppKit 绘制、菜单栏图标、没有 Palette 的地方用）
+    static let warn = NSColor(name: "TokenBarWarn") { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? warnDark : warnLight }
+    static let danger = NSColor(name: "TokenBarDanger") { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dangerDark : dangerLight }
+}
+
 extension Palette {
-    /// 橙 / 红色**文字**：浅色模式下系统橙、系统红对比度不到 4.5:1，换深一档；深色模式照用系统色（图标、色点不受影响）
-    var warnText: Color { dark ? Accent.orange : Color(red: 0.64, green: 0.32, blue: 0) }
-    var dangerText: Color { dark ? Accent.red : Color(red: 0.78, green: 0.13, blue: 0.10) }
+    /// 橙 / 红色文字：和进度条、图标同一套提醒色（AlertColor）
+    var warnText: Color { Color(nsColor: AlertColor.warn(dark: dark)) }
+    var dangerText: Color { Color(nsColor: AlertColor.danger(dark: dark)) }
     var okText: Color { dark ? Accent.green : Color(red: 0.10, green: 0.47, blue: 0.20) }
 }
 
 /// 只有一个强调色（系统蓝）；绿/橙只表示状态（可用·账单 / 预警·估算），不再给数字上色
 enum Accent {
     static let blue = Color(nsColor: .systemBlue)
-    static let orange = Color(nsColor: .systemOrange)
+    static let orange = Color(nsColor: AlertColor.warn)
     static let green = Color(nsColor: .systemGreen)
-    static let red = Color(nsColor: .systemRed)
+    static let red = Color(nsColor: AlertColor.danger)
 }
 
 extension Font {
@@ -87,7 +101,7 @@ final class Glass: ObservableObject {
     static let shared = Glass()
     /// 0 = 不透明，1 = 最透
     @Published var transparency: Double {
-        didSet { UserDefaults.standard.set(transparency, forKey: "glassTransparency") }
+        didSet { savePref(transparency, forKey: "glassTransparency") }
     }
     private init() {
         transparency = (UserDefaults.standard.object(forKey: "glassTransparency") as? Double) ?? 0.55

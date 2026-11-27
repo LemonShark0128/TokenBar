@@ -45,6 +45,24 @@ struct TokenChart: Equatable {
         var total: Int
         /// 与 series 一一对应
         var parts: [Int]
+        /// 「其他」这一段那天包含几个有用量的模型（「另 N 个模型」要数真实个数）
+        var otherModels = 0
+        /// 「其他」这一段那天的每个模型，用量从多到少（「另 N 个模型」点开后逐个列出）
+        var otherBreakdown: [OtherPart] = []
+    }
+    /// 「其他」里的一个模型
+    struct OtherPart: Equatable {
+        var label: String
+        var tokens: Int
+        var cost: Cost?
+    }
+    /// 「另 N 个模型」点开后的一行：series 是颜色用的序列下标（「其他」里的模型都是「其他」的下标）
+    struct ModelRow: Equatable {
+        var series: Int
+        var label: String
+        var tokens: Int
+        /// 「¥2.68」「套餐」；看不到花费、或单平台全是套餐（标题写一次）时 nil
+        var cost: String?
     }
     struct LegendItem: Equatable {
         var series: Int
@@ -151,9 +169,43 @@ struct TokenChart: Equatable {
             let c = cells[a.iso] ?? [:]
             var parts = top.map { c[$0] ?? 0 }
             if !rest.isEmpty { parts.append(c.filter { rest.contains($0.key) }.values.reduce(0, +)) }
-            return Bar(iso: a.iso, date: a.date, total: parts.reduce(0, +), parts: parts)
+            let members = c.filter { rest.contains($0.key) && $0.value > 0 }
+                .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+            let breakdown = members.map { k, v -> OtherPart in
+                let m = meta[k]!
+                return OtherPart(label: label(provider: m.provider, model: m.model, multi: multi), tokens: v, cost: cost(k, a.iso))
+            }
+            return Bar(iso: a.iso, date: a.date, total: parts.reduce(0, +), parts: parts,
+                       otherModels: members.count, otherBreakdown: breakdown)
         }
         return TokenChart(series: series, bars: bars, dayCosts: dayCosts, multiPlatform: multi)
+    }
+
+    /// 图例里这几项一共是几个模型：「其他」按它那天实际包含的模型数算（中号卡折叠行「另 N 个模型」用）
+    func modelCount(_ items: [LegendItem], bar i: Int) -> Int {
+        guard bars.indices.contains(i) else { return items.count }
+        return items.reduce(0) { $0 + (series[$1.series].isOther ? max(bars[i].otherModels, 1) : 1) }
+    }
+
+    /// 某一天的全部模型（「另 N 个模型」点开后列出）：顺序同图例，「其他」拆成里面的每个模型、按用量从多到少
+    func allModels(bar i: Int) -> [ModelRow] {
+        guard bars.indices.contains(i) else { return [] }
+        let plan = planOnly(bar: i)
+        func text(_ c: Cost?) -> String? {
+            guard !plan else { return nil }
+            switch c {
+            case let .money(v, cur)?: return fmtMoney(v, cur)
+            case .plan?: return L("chart.plan")
+            case nil: return nil
+            }
+        }
+        return legend(bar: i).flatMap { it -> [ModelRow] in
+            guard series[it.series].isOther else {
+                return [ModelRow(series: it.series, label: series[it.series].label, tokens: it.tokens,
+                                 cost: costText(series: it.series, bar: i))]
+            }
+            return bars[i].otherBreakdown.map { ModelRow(series: it.series, label: $0.label, tokens: $0.tokens, cost: text($0.cost)) }
+        }
     }
 
     /// 今天的图例：用量从多到少，「其他」放最后，0 的不列
@@ -247,8 +299,12 @@ struct TokenChart: Equatable {
         switch p {
         case .deepseek: return "DeepSeek"
         case .siliconflow: return L("provider.siliconflowShort")
+        case .kimi: return "Kimi"
+        case .openrouter: return "OpenRouter"
+        case .packyapi: return "PackyAPI"
         case .claudePlan: return "Claude"
         case .codexPlan: return "Codex"
+        case .geminiPlan: return "Gemini"
         }
     }
 
@@ -261,7 +317,7 @@ struct TokenChart: Equatable {
             var s = name.hasPrefix("claude-") ? String(name.dropFirst(7)) : name
             if let r = s.range(of: "-[0-9]{8}$", options: .regularExpression) { s.removeSubrange(r) }
             return s
-        case .codexPlan: return name
+        case .codexPlan, .geminiPlan, .kimi, .openrouter, .packyapi: return name
         }
     }
 

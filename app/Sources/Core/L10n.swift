@@ -37,7 +37,7 @@ enum L10n {
     /// 全部条目（各区域的表拼起来）；测试检查 key 不重复、两列都不为空
     static let entries: [Entry] = L10nStrings.common + L10nStrings.status + L10nStrings.quota + L10nStrings.a11y
         + L10nStrings.settings + L10nStrings.onboarding + L10nStrings.panel + L10nStrings.menu + L10nStrings.providers
-        + L10nStrings.alerts + L10nStrings.misc
+        + L10nStrings.alerts + L10nStrings.misc + L10nStrings.today
 
     /// key → 条目；重复的 key 取第一条（测试会报出来）
     static let table: [String: Entry] = Dictionary(entries.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })

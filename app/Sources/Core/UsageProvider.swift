@@ -10,10 +10,16 @@ protocol HTTPClient: Sendable {
 struct URLSessionHTTPClient: HTTPClient {
     let session: URLSession
 
-    init(systemProxy: Bool = false) {
+    /// cookies = false：不存、不自动带 Cookie（claude.ai 网页来源自己写 Cookie 头，系统的 Cookie 罐会混进旧的、盖掉新的）
+    init(systemProxy: Bool = false, cookies: Bool = true) {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 25
         if !systemProxy { cfg.connectionProxyDictionary = [:] }
+        if !cookies {
+            cfg.httpCookieStorage = nil
+            cfg.httpShouldSetCookies = false
+            cfg.httpCookieAcceptPolicy = .never
+        }
         session = URLSession(configuration: cfg)
     }
 
@@ -29,9 +35,7 @@ struct URLSessionHTTPClient: HTTPClient {
 /// Sendable：UsageStore 在主线程上持有它，取数（validate / fetch）在后台跑
 protocol UsageProvider: Sendable {
     var id: ProviderID { get }
-    var displayName: String { get }
     var capabilities: Capabilities { get }
-    var loginSteps: [LoginStep] { get }
     func validate(_ c: Credentials) async -> ValidationResult
     func fetch(_ c: Credentials, now: Date, timeZone: TimeZone) async -> Result<ProviderSnapshot, ProviderError>
 }

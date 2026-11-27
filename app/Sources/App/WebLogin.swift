@@ -16,6 +16,8 @@ final class WebLoginController: NSObject, ObservableObject, WKNavigationDelegate
         /// 从 WKHTTPCookieStore 读一枚 Cookie（硅基流动的 session-token）
         /// → ["webToken", "subjectId", "webTokenExpiresAt"]，三项凑齐才回调
         case cookie(name: String, domain: String)
+        /// claude.ai 的登录 Cookie sessionKey（ClaudeWebUsage.sessionKey）→ ["webToken": …]
+        case claudeSession
     }
 
     static var current: WebLoginController?
@@ -82,6 +84,7 @@ final class WebLoginController: NSObject, ObservableObject, WKNavigationDelegate
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { loadError = nil }
 
     func stop() {
+        finished = true
         timer?.invalidate()
         timer = nil
         webView.stopLoading()
@@ -102,6 +105,15 @@ final class WebLoginController: NSObject, ObservableObject, WKNavigationDelegate
             checking = true
             webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
                 DispatchQueue.main.async { self?.cookiePolled(cookies, name: name, domain: domain) }
+            }
+        case .claudeSession:
+            checking = true
+            webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.checking = false
+                    if let key = ClaudeWebUsage.sessionKey(from: cookies) { self.finish([ClaudeWebUsage.credentialKey: key]) }
+                }
             }
         }
     }

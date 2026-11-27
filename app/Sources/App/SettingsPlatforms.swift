@@ -21,16 +21,16 @@ extension SettingsView {
         let name = ProviderRegistry.displayName(id)
         let hookGone = id == .claudePlan && model.claudeHookGone
         let snap = c.inp.platforms.first { $0.id == id }?.snapshot
-        let reading = AccountReading.from(balance: snap?.balance, quota: snap?.quota, meter: ProviderRegistry.meter(id),
-                                          now: model.fixedNow ?? Date())
+        let reading = AccountReading.from(snapshot: snap, meter: ProviderRegistry.meter(id), now: model.fixedNow ?? Date())
         let kind = agentKind(id)
         let custom = kind.flatMap { (input?.customDirs ?? AgentDirs.custom(.standard))[$0] }
         let customPath = custom.map {
             AgentDirs.displayPath(URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath),
                                   home: URL(fileURLWithPath: NSHomeDirectory()))
         }
-        let detail = SettingsLayout.accountDetail(id, state: st, reading: reading, stale: hookGone, claudeSource: model.claudeSource, customDir: customPath)
-        let urgent = SettingsLayout.urgentAction(id, state: st, hookGone: hookGone)
+        let loginDetail = (id == .claudePlan || id == .geminiPlan) && st == .invalid ? c.inp.platforms.first { $0.id == id }?.errorDetail : nil
+        let detail = loginDetail ?? SettingsLayout.accountDetail(id, state: st, reading: reading, stale: hookGone, claudeSource: model.claudeSource, customDir: customPath)
+        let urgent = SettingsLayout.urgentAction(id, state: st, hookGone: hookGone, claudeSource: model.claudeSource)
         let actions = SettingsLayout.menuActions(id, state: st, isMain: c.main == id,
                                                  claudeSource: model.claudeSource, hookGone: hookGone, customDir: custom != nil)
         let items: () -> [PopMenu.Item] = {
@@ -69,11 +69,11 @@ extension SettingsView {
 
     func perform(_ kind: AccountAction.Kind, _ id: ProviderID) {
         switch kind {
-        case .setMain: model.usageStore?.pinMain(id); model.objectWillChange.send()
+        case .setMain: model.chooseMain(id.rawValue)     // 与设置下拉同语义：固定并关掉自动切换（用户 11-05）
         case .apiKey: model.openOnboarding(at: .login, platform: id)
         case .console, .webRelogin: webRelogin(id)
         case .reinstallHook: model.reinstallClaudeHook()
-        case .switchClaudeSource: model.switchClaudeSource()
+        case .switchClaudeSource(let to): model.switchClaudeSource(to: to)
         case .dataDir: chooseDataDir(id)
         case .resetDataDir:
             guard let kind = agentKind(id) else { return }
@@ -119,9 +119,13 @@ extension SettingsView {
 
     /// 网页重新登录：结果（含验证没通过、存钥匙串失败）写在账号行下
     func webRelogin(_ id: ProviderID) {
+        if id == .claudePlan {
+            model.openOnboarding(at: .login, platform: .claudePlan, claudeChoice: .web)
+            return
+        }
         model.reloginNotes[id] = nil
         model.openWebLogin(id) { ok, msg in
-            model.reloginNotes[id] = ReloginNote.make(provider: id, ok: ok, message: msg)
+            model.reloginNotes[id] = ReloginNote.make(ok: ok, message: msg)
         }
     }
 

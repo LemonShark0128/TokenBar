@@ -37,7 +37,8 @@ func registerMenuBarFollowTests() {
         store.setRunningTasks([.deepseek: clock.now, .siliconflow: clock.now])
         clock.now = clock.now.addingTimeInterval(10)
         store.advanceMainRotation()
-        try checkEqual(store.mainProvider, .deepseek)
+        // 2026-11-06 乙：几个同时在用不再轮流，留在正在显示的那个
+        try checkEqual(store.mainProvider, .siliconflow)
         try checkEqual(store.menuBarProvider, store.mainProvider)
         store.pinMain(.siliconflow)
         store.setAutoMain(false)
@@ -62,24 +63,13 @@ func registerMenuBarFollowTests() {
         }
     }
 
-    // 主平台「当前使用」轮流用到的列表工具
-    test("rotationRunningWindow") {
-        let now = f0
-        let last: [ProviderID: Date] = [.claudePlan: now.addingTimeInterval(-600), .codexPlan: now.addingTimeInterval(-601)]
-        try checkEqual(MenuBarRotation.running(last, now: now), [.claudePlan])
-        try checkEqual(MenuBarRotation.next([.deepseek, .codexPlan], after: .deepseek), .codexPlan)
-        try checkEqual(MenuBarRotation.next([.deepseek, .codexPlan], after: .codexPlan), .deepseek)
-        try checkEqual(MenuBarRotation.next([.deepseek, .codexPlan], after: .claudePlan), .deepseek)
-        try checkEqual(MenuBarRotation.keep([.deepseek, .codexPlan], current: .codexPlan), .codexPlan)
-        try checkEqual(MenuBarRotation.keep([.deepseek, .codexPlan], current: .claudePlan), .deepseek)
-    }
-
     test("menuBarRiskTitleAndTooltip") {
         let utc = TimeZone(secondsFromGMT: 0)!
         let payg = PaygRunway(hours: 5.6, basis: .recentSpike, severity: .warn, perHourRecent: 4.8, multiple: 21)
         let r1 = PlatformRisk(id: .deepseek, kind: .payg(payg), hours: 5.6, atRisk: true, severity: .warn)
-        try checkEqual(MenuBarText.riskTitle(r1, mode: "balance"), "5h36m")
-        try checkEqual(MenuBarText.riskTitle(r1, mode: "cost"), "5h36m")
+        // 用户 10-27：按量付费的可用时长随任务多少一直跳，菜单栏只写余额；时长留在悬停提示和面板里
+        try check(MenuBarText.riskTitle(r1, mode: "balance") == nil)
+        try check(MenuBarText.riskTitle(r1, mode: "cost") == nil)
         try check(MenuBarText.riskTitle(r1, mode: "icon") == nil)
         try checkEqual(MenuBarText.riskTooltip(r1, name: "DeepSeek", now: f0, timeZone: utc), "DeepSeek 预计可用时间：5 小时 36 分")
         var short = payg; short.hours = 0.5
@@ -158,7 +148,7 @@ func registerMenuBarFollowTests() {
         let r = MenuBarText.quotaReading(q, now: f0, timeZone: tz)
         try checkEqual(r?.usedPercent, 30)
         try checkEqual(r?.window, "本周")
-        try checkEqual(r?.tighter, "本周（Opus）已用 64%")
+        try checkEqual(r?.tighter, "本周（Opus）剩 36%")
         try check(r?.reset == nil)
         try check(MenuBarText.quotaReading(nil, now: f0, timeZone: tz) == nil)
         try check(MenuBarText.quotaReading(quota([]), now: f0, timeZone: tz) == nil)
@@ -176,41 +166,41 @@ func registerMenuBarFollowTests() {
         try checkEqual(side.quotaRemaining, 77)        // 油箱使用 5 小时显示窗口
     }
 
-    // 最紧的是别的窗口时，补充那个窗口的已用读数
+    // 最紧的是别的窗口时，补充那个窗口的剩余读数
     test("menuQuotaReadingNotesTighterWindow") {
         let tz = TimeZone(secondsFromGMT: 28800)!
         let q = quota([QuotaWindow(kind: .weekly, usedPercent: 92, resetsAt: nil, windowMinutes: nil),
                        QuotaWindow(kind: .session, usedPercent: 3, resetsAt: fat(3600), windowMinutes: 300)])
         let r = MenuBarText.quotaReading(q, now: f0, timeZone: tz)
         try checkEqual(r?.usedPercent, 3)
-        try checkEqual(r?.tighter, "本周已用 92%")
+        try checkEqual(r?.tighter, "本周剩 8%")
         try checkEqual(MenuBarText.quotaTooltip(provider: "Claude 套餐", reading: r),
-                       "Claude 套餐 当前会话已用 3% · 本周已用 92% · 1 小时后重置")
+                       "Claude 套餐 当前会话剩 97% · 本周剩 8% · 1 小时后重置")
         try checkEqual(A11yText.menuBarQuotaValue(provider: "Claude 套餐", reading: r, low: true, dim: false),
-                       "Claude 套餐 当前会话已用 3%，剩余 97%，本周已用 92%，1 小时后重置，低于预警线")
+                       "Claude 套餐 当前会话剩 97%，本周剩 8%，1 小时后重置，低于预警线")
         // 会话本身最紧：不另写
         let q2 = quota([QuotaWindow(kind: .weekly, usedPercent: 20, resetsAt: nil, windowMinutes: nil),
                         QuotaWindow(kind: .session, usedPercent: 60, resetsAt: nil, windowMinutes: 300)])
         try check(MenuBarText.quotaReading(q2, now: f0, timeZone: tz)?.tighter == nil)
-        // 剩余向下取整后取互补：已用 90.4% 写「已用 91%」
+        // 剩余向下取整：已用 90.4% 写「剩 9%」
         let q3 = quota([QuotaWindow(kind: .weekly, usedPercent: 90.4, resetsAt: nil, windowMinutes: nil),
                         QuotaWindow(kind: .session, usedPercent: 3, resetsAt: nil, windowMinutes: 300)])
-        try checkEqual(MenuBarText.quotaReading(q3, now: f0, timeZone: tz)?.tighter, "本周已用 91%")
+        try checkEqual(MenuBarText.quotaReading(q3, now: f0, timeZone: tz)?.tighter, "本周剩 9%")
     }
 
     // ---------------------------------------------------------------- 读屏
 
     test("menuBarQuotaA11y") {
         let r = AppData.MenuQuota(usedPercent: 23.4, window: "当前会话", reset: "2 小时 13 分后重置")
-        try checkEqual(MenuBarText.quotaUsedText(provider: "Claude 套餐", reading: r), "Claude 套餐 当前会话已用 24%")
+        try checkEqual(MenuBarText.quotaReadingText(provider: "Claude 套餐", reading: r), "Claude 套餐 当前会话剩 76%")
         try checkEqual(A11yText.menuBarQuotaValue(provider: "Claude 套餐", reading: r, low: false, dim: false),
-                       "Claude 套餐 当前会话已用 24%，剩余 76%，2 小时 13 分后重置")
+                       "Claude 套餐 当前会话剩 76%，2 小时 13 分后重置")
         try checkEqual(A11yText.menuBarQuotaValue(provider: "Codex 套餐", reading: AppData.MenuQuota(usedPercent: 95, window: "本周", reset: nil),
                                              low: true, dim: true),
-                       "Codex 套餐 本周已用 95%，剩余 5%，低于预警线，数据不是最新")
+                       "Codex 套餐 本周剩 5%，低于预警线，数据不是最新")
         try checkEqual(A11yText.menuBarQuotaValue(provider: "Claude 套餐", reading: nil, low: false, dim: false),
                        "Claude 套餐 额度未知")
-        try checkEqual(MenuBarText.quotaTooltip(provider: "Claude 套餐", reading: r), "Claude 套餐 当前会话已用 24% · 2 小时 13 分后重置")
+        try checkEqual(MenuBarText.quotaTooltip(provider: "Claude 套餐", reading: r), "Claude 套餐 当前会话剩 76% · 2 小时 13 分后重置")
         try checkEqual(MenuBarText.quotaTooltip(provider: "Claude 套餐", reading: nil), "Claude 套餐 额度未知")
     }
 }

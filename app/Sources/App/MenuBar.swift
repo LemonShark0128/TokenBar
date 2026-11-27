@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 状态栏控制器（左键面板 / 右键菜单）
 
@@ -12,10 +11,19 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     var statusButton: NSStatusBarButton? { statusItem.button }
     private let popover = NSPopover()
     private var subs = Set<AnyCancellable>()
-    private let iconSize: CGFloat = 11
     private var lastMenuBarSig = ""
+    private var lastMenuBarShown: Set<ProviderID> = []
+    private var appearanceObservation: NSKeyValueObservation?
     /// 上一次画在菜单栏上的平台；换平台（轮流、切换）时才播过渡动画，数字刷新不播
     private var lastMenuBarPlatform: ProviderID?
+    private var lastSecondary: ProviderID?
+    private var lastMainShown: ProviderID?
+    /// 上次刷新时有任务在跑的平台：任务消失那一刻记下时间，停留 60 秒从这里起算
+    private var lastLive: Set<ProviderID> = []
+    private var activityHistory: [ProviderID: Date] = [:]
+    private var secondaryRotationTimer: Timer?
+    private var secondaryLingerTimer: Timer?
+    private var secondaryLingerUntil: Date?
     private var outsideClickMonitor: Any?
     private var reminderClock = PanelReminderTimer()
     private var reminderTimer: Timer?
@@ -46,6 +54,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             b.sendAction(on: [.leftMouseUp, .rightMouseUp])
             b.imagePosition = .imageLeading
             b.font = kStatusFont
+            appearanceObservation = b.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+                Task { @MainActor in self?.refresh() }
+            }
         }
         refresh()
         // 数据一变就重画状态栏，保证「顶部实时」
@@ -58,6 +69,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     }
 
     isolated deinit {
+        secondaryRotationTimer?.invalidate()
+        secondaryLingerTimer?.invalidate()
         reminderTimer?.invalidate()
         reminderRefit?.cancel()
         if let monitor = outsideClickMonitor { NSEvent.removeMonitor(monitor) }
@@ -67,13 +80,23 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     /// 菜单栏：一个数字 + 平台标志，不轮播。
     /// 颜色交给系统：文字用 labelColor、图标用 template —— 实测按钮的外观跟随菜单栏本身（本机是 VibrantDark），
     /// 不受 App 主题影响，所以不必再写死白色（写死白色在浅色菜单栏上看不见）。
-    /// 只有异常才上色：低于预警线 → 图标和数字变橙；花费飙升 → 加一个橙点；数据不新鲜 → 整体变灰。
+    /// 只有异常才上色，而且只给图标（用户 10-27：数字一律正常颜色）：低于预警线 / 花费飙升 → 图标变橙；
+    /// 套餐快用完 → 图标橙 / 红；数据不新鲜 → 整体变灰。
     private func refresh() {
         guard let b = statusItem.button else { return }
+        if model.mbStyle != "classic" {
+            refreshStyle(b)
+            return
+        }
+        secondaryRotationTimer?.invalidate(); secondaryRotationTimer = nil
+        secondaryLingerTimer?.invalidate(); secondaryLingerTimer = nil
+        secondaryLingerUntil = nil; activityHistory = [:]; lastSecondary = nil; lastMainShown = nil; lastLive = []
+        b.layer?.removeAnimation(forKey: "menuBarSecondarySwitch")
         let sig = model.menuSignal
         let d = model.data
         // 数字取「菜单栏平台」（固定的那个，或自动跟随到的那个）；没有 store（离屏）时取主平台
         let mb = model.menuBarSide
+        syncMenuBarShown(model.needsSetup ? [] : [mb.flatMap { ProviderID(rawValue: $0.id) } ?? model.mainID])
         let cur = mb?.currency ?? d?.balance.currency
         let mbTank = mb != nil ? mb?.tank : d?.balance.cny
         // 主平台只有余额（没登录控制台）或离线时花费未知：不写 ¥0.00
@@ -83,32 +106,33 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         // 菜单栏平台是套餐平台：「余额/用量」「今日花费」两种模式都写当前会话（5 小时窗口）已用百分比，不加角标；
         // 按量付费的「今日花费」不写「今日」，靠图标右下角的「日」角标区分
         let quota = model.menuBarQuotaSide
+        let loginHint = quota.flatMap { MenuBarCells.quotaLoginHint(for: $0) }
         // 有任务在跑时，悬停提示末尾多一行「当前 N 个任务」（图标和读数不变）；轮流显示时再加一行「轮流显示：A、B」
         let rotation = model.usageStore?.menuBarRotation ?? []
         let running = (RunningTaskText.tooltipLine(count: model.runningTasks.count).map { "\n" + $0 } ?? "")
             + (rotation.count > 1 ? L("menu.rotating", rotation.map(ProviderRegistry.displayName).joined(separator: L("common.listSep"))) : "")
         let text = MenuBarText.title(mode: model.mbMode, isQuota: quota != nil, balance: mbTank, today: mbToday,
                                      quotaUsed: quota?.menuQuota?.usedPercent, currency: cur, exhausted: quota?.menuQuota?.exhausted)
-        // 自动跟随到有风险的平台：数字换成可用时长（「5h36m」），红 / 橙按严重程度；只图标模式加「!」角标
+        // 有风险时：套餐平台写已用（红 / 橙按严重程度）；按量付费照常写余额 / 今日花费（用户 10-27：时长会一直跳），只图标模式加「!」角标
         let risk = model.usageStore?.menuBarRisk
         let exhausted = quota?.menuQuota?.exhausted != nil
         let riskText = exhausted ? nil : risk.flatMap { MenuBarText.riskTitle($0, mode: model.mbMode) }
         let badge = MenuBarText.alertBadge(mode: model.mbMode, spike: sig.spike, risk: risk)
         let riskTint: NSColor? = (riskText != nil || badge) && risk?.atRisk == true
-            ? (risk?.severity == .danger ? .systemRed : .systemOrange) : nil
+            ? (risk?.severity == .danger ? AlertColor.danger : AlertColor.warn) : nil
         let quotaSeverity = MenuBarText.quotaSeverity(isQuota: quota != nil, usedPercent: quota?.menuQuota?.usedPercent,
                                                        risk: riskText != nil ? risk : nil)
-        let quotaColor: NSColor? = quotaSeverity == .danger ? .systemRed : (quotaSeverity == .warn ? .systemOrange : nil)
+        let quotaColor: NSColor? = quotaSeverity == .danger ? AlertColor.danger : (quotaSeverity == .warn ? AlertColor.warn : nil)
         // 套餐只看显示窗口的剩余；按量付费沿用风险、低余额和异常的颜色。
         // 用完时恢复正常标志和文字（用户 10-19 选白，不选灰）。
-        let tint: NSColor? = exhausted ? nil
-            : quotaSeverity != nil ? quotaColor : (riskTint ?? (sig.low || sig.spike ? NSColor.systemOrange : nil))
-        let shown = riskText ?? text
+        let tint: NSColor? = loginHint != nil || exhausted ? nil
+            : quotaSeverity != nil ? quotaColor : (riskTint ?? (sig.low || sig.spike ? AlertColor.warn : nil))
+        let shown = loginHint != nil ? L("menu.needsLogin") : riskText ?? BalanceEstimatePresentation.menuTitle(text, mode: model.mbMode, source: d?.today.source, hasAmount: mbToday != nil && quota == nil)
         // 风险读数优先显示风险平台，否则跟随菜单栏平台；未设置时保留油量表
         let platformID: ProviderID? = model.needsSetup ? nil
             : (riskText != nil ? risk?.id : nil)
                 ?? mb.flatMap { ProviderID(rawValue: $0.id) } ?? model.mainState?.id
-        let key = "\(model.mbMode)|\(shown)|\(sig)|\(Int(level * 100))|\(quota != nil)|\(badge)|\(String(describing: tint))|\(String(describing: platformID))|\(String(describing: quotaSeverity))"
+        let key = "classic|\(b.effectiveAppearance.name.rawValue)|\(model.mbMode)|\(shown)|\(sig)|\(Int(level * 100))|\(quota != nil)|\(badge)|\(String(describing: tint))|\(String(describing: platformID))|\(String(describing: quotaSeverity))"
         if key != lastMenuBarSig {
             lastMenuBarSig = key
             // 用户 10-19：轮流时不要一下跳到新平台。新平台从下往上推入（减弱动态效果时只淡入淡出）
@@ -135,9 +159,16 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             let t = NSMutableAttributedString(
                 string: shown,                        // 不加前导空格：图文之间系统本来就留间距
                 attributes: [.font: kStatusFont,
-                             .foregroundColor: quotaSeverity != nil ? (tint ?? .labelColor) : (riskText != nil ? (riskTint ?? .labelColor) : (sig.low ? NSColor.systemOrange : NSColor.labelColor))])
+                             // 用户 10-27：所有平台统一，橙 / 红只给图标，数字一律正常颜色
+                             .foregroundColor: NSColor.labelColor])
             b.attributedTitle = t
-            b.appearsDisabled = sig.dim
+            b.appearsDisabled = sig.dim || loginHint != nil
+        }
+        if let loginHint {
+            b.setAccessibilityLabel(A11yText.menuBarLabel)
+            b.setAccessibilityValue(barName + " " + loginHint)
+            b.toolTip = barName + " " + loginHint + running
+            return
         }
         if let r = risk, let tip = MenuBarText.riskTooltip(r, name: barName, now: Date(), timeZone: .autoupdatingCurrent) {
             b.setAccessibilityLabel(A11yText.menuBarLabel)
@@ -156,17 +187,121 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
                                                       balanceCny: mbTank, runwayDays: mb == nil ? d?.burn?.runwayDays : nil,
                                                       todayCny: mbToday, showsTodayCost: model.mbMode == "cost",
                                                       low: sig.low, spike: sig.spike, dim: sig.dim,
-                                                      currency: cur == "USD" ? .usd : .cny))
+                                                      currency: cur == "USD" ? .usd : .cny, allHidden: !model.hiddenIDs.isEmpty))
         b.toolTip = (d.map { dd in
             let c = dd.balance.currency
             // 只有一个平台时保持原文案（不写平台名、不写合计）
             let multi = !dd.sides.isEmpty
-            let head = L("menu.tip.balance", multi ? model.mainName + L("menu.tip.nameSep") : "", fmtMoney(dd.balance.cny, c))
+            let head = L(dd.mainCardSide?.tankIsKeyLimit == true ? "menu.tip.keyLimit" : "menu.tip.balance", multi ? model.mainName + L("menu.tip.nameSep") : "", fmtMoney(dd.balance.cny, c))
                 + (dd.today.known ? L("menu.tip.today", fmtMoney(dd.today.costCny, c), sourceTagLabel(costSourceTag(dd.today.source)))
                     + L("menu.tip.month", fmtMoney(dd.month.costCny, c)) : L("menu.tip.source", sourceLabel(dd.today.source) ?? "—"))
             let total = (multi ? dd.totalTodayCny : nil).map { L("menu.tip.total", dd.totalIsApprox ? "≈" : "", fmtCNY($0)) } ?? ""
-            return head + L("menu.tip.usage", cnCount(dd.today.tokens), model.freshness.1) + total
-        } ?? (model.needsSetup ? L("a11y.noPlatforms") : L("status.connecting", model.mainName))) + running
+            return head + BalanceEstimatePresentation.usageTooltip(source: dd.today.source, tokens: dd.today.tokens, freshness: model.freshness.1) + total
+        } ?? (model.needsSetup ? A11yText.noPlatforms(allHidden: !model.hiddenIDs.isEmpty) : L("status.connecting", model.mainName))) + running
+    }
+
+    /// 用户 2026-11-13 反馈「刷新慢」：只在显示集合变化时同步，避免重画数字反复排期。
+    private func syncMenuBarShown(_ ids: Set<ProviderID>) {
+        guard ids != lastMenuBarShown, let store = model.usageStore else { return }
+        lastMenuBarShown = ids
+        Task { @MainActor in await store.setMenuBarShown(ids) }
+    }
+
+    private func refreshStyle(_ b: NSStatusBarButton) {
+        let now = model.fixedNow ?? Date()
+        let main = model.needsSetup ? nil : model.mainID
+        let stale = Set((model.usageStore?.platforms ?? []).filter { MenuBarCells.isStale($0, now: now) }.map(\.id))
+        // 主平台首次取数失败时 model.data 为 nil，仍显示其他已添加平台。
+        let data = model.data ?? model.mainState.flatMap { state -> AppData? in
+            guard state.status.isShown else { return nil }
+            return AppDataMapping.appData(main: state,
+                others: model.usageStore?.platforms.filter { $0.id != state.id } ?? [],
+                now: now, timeZone: .autoupdatingCurrent)
+        }
+        let cells = data.map {
+            MenuBarCells.cells($0, main: main,
+                               lowAlerts: ProviderSettings.load(.standard).lowAlerts.mapValues(AppDataMapping.double),
+                               staleIDs: stale, now: now)
+        } ?? []
+        let mode = SettingsLayout.menuBarSlotMode(model.mbSlots)
+        // 与 MenuBarSelection 同口径：停了 5 分钟以上的任务不算在跑，从它变成「已停」时起停留 60 秒
+        let liveNow = Set(model.runningTasks.filter { !RunningTaskText.isStale($0, now: now) }.map(\.provider))
+        for id in lastLive.subtracting(liveNow) { activityHistory[id] = max(activityHistory[id] ?? now, now) }
+        lastLive = liveNow
+        let history = activityHistory.merging(model.menuBarLastActivity, uniquingKeysWith: { max($0, $1) })
+        // 用户 2026-11-13：跳过非平台卡片；选择器再按当前 cells 排除隐藏或未添加平台。
+        let order = model.resolvedTodayLayout.compactMap { ProviderID(rawValue: $0.id) }
+        let result = MenuBarSelection.select(cells: cells, order: order, paygActive: model.menuBarPaygActive,
+            tasks: model.runningTasks, showRunning: model.mbShowRunning, mode: mode,
+            lastActivity: history, now: now)
+        let slots = result.slots
+        let previous = [lastMainShown, lastSecondary].compactMap { $0 }
+        let current = [slots.main?.id, slots.secondary?.id].compactMap { $0 }
+        syncMenuBarShown(Set(current))
+        // 用户 2026-11-13：整套组合变化才切换；任一平台退出组合时沿用淡出。
+        let leaving = previous.contains { !current.contains($0) }
+        activityHistory = result.lastActivity
+        let mainDot = slots.main.map { MenuBarSecondary.dot(for: $0.id, tasks: model.runningTasks, now: now) } ?? .none
+        let secondaryDot = slots.secondary.map { MenuBarSecondary.dot(for: $0.id, tasks: model.runningTasks, now: now) } ?? .none
+        updateSecondaryTimers(rotate: result.shouldRotate, lingerUntil: result.expiresAt, now: now)
+        // 11/6 起不轮流；11/13 用户反馈左侧空太大，宽度交给图标按 slots 实际内容计算。
+        let key = "bars|\(b.effectiveAppearance.name.rawValue)|\(slots)|\(mainDot)|\(secondaryDot)|\(L10n.lang)"
+        if key != lastMenuBarSig {
+            lastMenuBarSig = key
+            lastMenuBarPlatform = nil
+            b.layer?.removeAnimation(forKey: "menuBarPlatformSwitch")
+            if MenuBarSecondary.shouldAnimate(from: previous, to: current) {
+                b.wantsLayer = true
+                let transition = CATransition()
+                transition.duration = leaving ? 0.8 : 0.35
+                transition.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                if leaving || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    transition.type = .fade
+                } else {
+                    transition.type = .push
+                    transition.subtype = .fromBottom
+                }
+                b.layer?.add(transition, forKey: "menuBarSecondarySwitch")
+            }
+            lastSecondary = slots.secondary?.id
+            lastMainShown = slots.main?.id
+            b.appearsDisabled = false
+            b.image = slots.main == nil ? GaugeIcon.menuImage(value: 0, template: true, dayBadge: false)
+                : MenuBarStyles.image(slots, appearance: b.effectiveAppearance, mainDot: mainDot, secondaryDot: secondaryDot)
+            b.attributedTitle = NSAttributedString(string: "")
+        }
+        let tip = (cells.isEmpty ? A11yText.noPlatforms(allHidden: model.needsSetup && !model.hiddenIDs.isEmpty) : MenuBarCells.tooltip(cells, now: now))
+            + (RunningTaskText.tooltipLine(count: model.runningTasks.count).map { "\n" + $0 } ?? "")
+        b.toolTip = tip
+        b.setAccessibilityLabel(A11yText.menuBarLabel)
+        b.setAccessibilityValue(A11yText.speak(tip))
+    }
+
+    /// 只重画菜单栏，不触发取数；固定预览时间不启动计时器。
+    private func updateSecondaryTimers(rotate: Bool, lingerUntil: Date?, now: Date) {
+        if rotate && model.fixedNow == nil {
+            if secondaryRotationTimer == nil {
+                let timer = Timer(fire: MenuBarSecondary.nextRotation(after: now), interval: MenuBarSecondary.rotate, repeats: true) { [weak self] _ in
+                    Task { @MainActor in self?.refresh() }
+                }
+                secondaryRotationTimer = timer
+                RunLoop.main.add(timer, forMode: .common)
+            }
+        } else {
+            secondaryRotationTimer?.invalidate(); secondaryRotationTimer = nil
+        }
+        let deadline = model.fixedNow == nil ? lingerUntil : nil
+        if deadline != secondaryLingerUntil {
+            secondaryLingerTimer?.invalidate(); secondaryLingerTimer = nil
+            secondaryLingerUntil = deadline
+            if let deadline {
+                let timer = Timer(fire: deadline, interval: 0, repeats: false) { [weak self] _ in
+                    Task { @MainActor in self?.refresh() }
+                }
+                secondaryLingerTimer = timer
+                RunLoop.main.add(timer, forMode: .common)
+            }
+        }
     }
 
     @objc private func clicked(_ sender: NSStatusBarButton) {
@@ -176,7 +311,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     }
 
     func togglePanel() {
-        logLine("面板：\(popover.isShown ? "收起" : "打开")")
+        // 收起统一由 popoverDidClose 记「面板：已收起」
+        if !popover.isShown { logLine("面板：打开") }
         if popover.isShown {
             popover.performClose(nil)
             return
@@ -208,6 +344,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
+        // 被系统自动收起（transient：点别处、Esc）时其他地方不写日志，这里统一记一笔
+        logLine("面板：已收起")
         removePanelDismissalObservers()
         reminderTimer?.invalidate()
         reminderTimer = nil
@@ -319,36 +457,49 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         _ = item(L("panel.refreshNow"), #selector(menuRefresh), key: "r")
         _ = item(L("menu.openUsagePage", model.mainName), #selector(menuOpenPlatform))
         menu.addItem(.separator())
-        let mb = item(L("set.menuBarShows"), nil)
-        let mbSub = NSMenu()
-        // 选项和设置里「菜单栏显示」「菜单栏平台」两个下拉用同一份（SettingsLayout），两边永远一致
-        for (key, title) in SettingsLayout.menuBarModeOptions {
-            let it = NSMenuItem(title: title, action: #selector(menuSetMBMode(_:)), keyEquivalent: "")
+        // 「菜单栏」一个子菜单分组放：显示哪个平台 / 正在跑的平台 / 样式（经典样式再加「菜单栏显示」）——用户 11/5 选方案甲
+        let bar = item(L("menu.menuBar"), nil)
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        func option(_ title: String, _ action: Selector, _ key: String, on: Bool) {
+            let it = NSMenuItem(title: title, action: action, keyEquivalent: "")
             it.target = self
             it.representedObject = key
-            it.state = model.mbMode == key ? .on : .off
-            mbSub.addItem(it)
+            it.state = on ? .on : .off
+            sub.addItem(it)
         }
-        mb.submenu = mbSub
         if model.usageStore != nil {
-            // 已添加平台和当前选择的算法与设置页（SettingsView.ctx）相同
+            // 已添加平台和当前选择的算法与设置页（SettingsView.ctx）相同；选项和设置下拉同一份（用户 10-19）
             let inp = model.accountsInput
-            var states: [ProviderID: AccountState] = [:]
-            for id in ProviderRegistry.all { states[id] = UsageModel.accountState(for: inp.platforms.first { $0.id == id }) }
-            let added = SettingsLayout.added(states)
-            // 「显示哪个平台」：和设置下拉同一份选项、同一个选中值（面板和菜单栏共用，用户 10-19）
+            let added = SettingsLayout.shown(UsageModel.accountStates(inp).states)   // 隐藏的平台不在选项里
             let selected = SettingsLayout.mainSelection(auto: inp.auto, main: inp.mainID, added: added)
-            let pf = item(L("set.showWhich"), nil)
-            let pfSub = NSMenu()
+            sub.addItem(.sectionHeader(title: L("set.showWhich")))
             for (key, title) in SettingsLayout.mainOptions(added: added) {
-                let it = NSMenuItem(title: title, action: #selector(menuSetMain(_:)), keyEquivalent: "")
-                it.target = self
-                it.representedObject = key
-                it.state = selected == key ? .on : .off
-                pfSub.addItem(it)
+                option(title, #selector(menuSetMain(_:)), key, on: selected == key)
             }
-            pf.submenu = pfSub
+            sub.addItem(.separator())
         }
+        // 正在跑的平台：不显示 / 替换 / 并排三选一（= 原来的「显示正在跑的平台」勾选 + 替换 / 并排）
+        sub.addItem(.sectionHeader(title: L("mb.slots")))
+        let slot = SettingsLayout.menuBarSlotMode(model.mbSlots).rawValue
+        option(L("mb.running.off"), #selector(menuSetRunning(_:)), "off", on: !model.mbShowRunning)
+        for (key, title) in SettingsLayout.menuBarSlotOptions {
+            option(title, #selector(menuSetRunning(_:)), key, on: model.mbShowRunning && slot == key)
+        }
+        sub.addItem(.separator())
+        sub.addItem(.sectionHeader(title: L("mb.styleHeader")))
+        for (key, title) in SettingsLayout.menuBarStyleOptions {
+            option(title, #selector(menuSetMBStyle(_:)), key, on: model.mbStyle == key)
+        }
+        if model.mbStyle == "classic" {
+            // 选项和设置里「菜单栏显示」下拉用同一份（SettingsLayout），两边永远一致
+            sub.addItem(.separator())
+            sub.addItem(.sectionHeader(title: L("set.menuBarShows")))
+            for (key, title) in SettingsLayout.menuBarModeOptions {
+                option(title, #selector(menuSetMBMode(_:)), key, on: model.mbMode == key)
+            }
+        }
+        bar.submenu = sub
         _ = item(L("menu.settings"), #selector(menuSettings), key: ",")
         menu.addItem(.separator())
         _ = item(L("menu.quit", AppName.display), #selector(menuQuit), key: "q")
@@ -363,13 +514,23 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     }
     /// 调试：走和右键菜单信息行完全相同的路径
     func debugMenuOpenPanel() { menuOpenPanel() }
-    @objc private func menuRefresh() { model.fetch() }
+    @objc private func menuRefresh() { model.fetch(resetSlowdown: true) }
     @objc private func menuOpenRelease() {
         guard let r = model.availableUpdate else { return }
         logLine("右键菜单：打开新版本 \(r.version) 的下载页")
         NSWorkspace.shared.open(r.url)
     }
     @objc private func menuOpenPlatform() { NSWorkspace.shared.open(ProviderRegistry.usageURL(model.mainID)) }
+    @objc private func menuSetMBStyle(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        model.mbStyle = key
+    }
+    @objc private func menuSetRunning(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        if key == "off" { model.mbShowRunning = false; return }
+        model.mbShowRunning = true
+        model.mbSlots = key
+    }
     @objc private func menuSetMBMode(_ sender: NSMenuItem) {
         guard let k = sender.representedObject as? String else { return }
         model.mbMode = k

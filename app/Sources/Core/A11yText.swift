@@ -2,30 +2,32 @@ import Foundation
 
 /// VoiceOver 朗读文案：油量表、菜单栏按钮。与界面上看到的说法一致（续航规则与油量表下方的说明共用）
 enum A11yText {
-    /// 续航：不到 1 天按小时说，满 100 天说「可用很久」
+    /// 续航：不到 1 天按小时说（不到 1 小时、余额为负说「可用不到 1 小时」，不再说「约可用 0 小时」），满 100 天说「可用很久」
     static func runway(_ days: Double) -> String {
-        days < 1 ? L("a11y.runwayHours", String(format: "%.0f", days * 24))
-            : days >= 100 ? L("a11y.runwayLong") : L("a11y.runwayDays", String(format: "%.0f", days))
+        days >= 100 ? L("a11y.runwayLong")
+            : Runway.paygDays(days, days: "a11y.runwayDays", hours: "a11y.runwayHours", underHour: "a11y.runwayUnderHour")
     }
 
-    private static func yuan(_ v: Double, _ cur: Currency = .cny) -> String {
+    /// 金额读法：「12.35 元」「1.20 美元」（A11yPanelText.money 也用它）
+    static func yuan(_ v: Double, _ cur: Currency = .cny) -> String {
         L(cur == .usd ? "a11y.dollars" : "a11y.yuan", String(format: "%.2f", v))
     }
 
     /// 如「DeepSeek 余额 55.95 元，约可用 5 天」
+    /// keyLimit：金额是 API Key 的剩余花费上限（OpenRouter），读「Key 剩余额度」
     static func gauge(provider: String, balanceCny: Double?, runwayDays: Double?,
-                      currency: Currency = .cny) -> String {
+                      currency: Currency = .cny, keyLimit: Bool = false) -> String {
         guard let b = balanceCny, b.isFinite else { return L("a11y.balanceUnknown", provider) }
-        var parts = [L("a11y.balance", provider, yuan(b, currency))]
+        var parts = [L(keyLimit ? "a11y.keyLimit" : "a11y.balance", provider, yuan(b, currency))]
         if let d = runwayDays { parts.append(runway(d)) }
         return parts.joined(separator: L("a11y.sep"))
     }
 
-    /// 套餐版，如「Codex 套餐 已用 41%，5 小时窗口 2 小时 13 分后重置」
+    /// 套餐版，如「Codex 套餐 剩余 59%，5 小时窗口 2 小时 13 分后重置」
     static func quotaGauge(provider: String, remainingPercent: Double?, reset: String?, exhausted: QuotaExhausted? = nil) -> String {
         if let exhausted { return "\(provider) \(exhausted.a11y)" }
-        guard let r = remainingPercent, r.isFinite else { return L("a11y.usedUnknown", provider) }
-        var parts = [L("a11y.used", provider, quotaUsedPercent(remaining: r))]
+        guard let r = remainingPercent, r.isFinite else { return L("a11y.quotaLeftUnknown", provider) }
+        var parts = [L("a11y.quotaLeft", provider, quotaRemainingPercent(r))]
         if let reset { parts.append(reset) }
         return parts.joined(separator: L("a11y.sep"))
     }
@@ -33,14 +35,13 @@ enum A11yText {
     /// 菜单栏按钮的 label：固定是名字，读数放在 value 里（VoiceOver 读「Token Bar，<value>，按钮」）
     static var menuBarLabel: String { AppName.display }
 
-    /// 菜单栏按钮的 value（套餐平台）：如「Claude 套餐 当前会话已用 23%，剩余 77%，2 小时 13 分后重置」
+    /// 菜单栏按钮的 value（套餐平台）：如「Claude 套餐 当前会话剩 77%，2 小时 13 分后重置」
     static func menuBarQuotaValue(provider: String, reading: AppData.MenuQuota?, low: Bool, dim: Bool) -> String {
         var parts: [String] = []
         if let e = reading?.exhausted {
             parts.append("\(provider) \(e.a11y)")
         } else {
-            parts.append(MenuBarText.quotaUsedText(provider: provider, reading: reading))
-            if let u = reading?.usedPercent, u.isFinite { parts.append(remaining(100 - u)) }
+            parts.append(MenuBarText.quotaReadingText(provider: provider, reading: reading))
             if let t = reading?.tighter { parts.append(t) }
             if let r = reading?.reset { parts.append(r) }
         }
@@ -50,10 +51,13 @@ enum A11yText {
     }
 
     /// 菜单栏按钮的 value（按量付费）：图标和数字读不出来，用一句话说清余额、续航和异常
+    /// 没有平台可显示时的说法：添加过但全隐藏了写「平台都隐藏了」，否则「还没有添加平台」
+    static func noPlatforms(allHidden: Bool) -> String { allHidden ? L("today.allHidden") : L("a11y.noPlatforms") }
+
     static func menuBarValue(provider: String, needsSetup: Bool, balanceCny: Double?, runwayDays: Double?,
                         todayCny: Double?, showsTodayCost: Bool, low: Bool, spike: Bool, dim: Bool,
-                        currency: Currency = .cny) -> String {
-        if needsSetup { return L("a11y.noPlatforms") }
+                        currency: Currency = .cny, allHidden: Bool = false) -> String {
+        if needsSetup { return noPlatforms(allHidden: allHidden) }
         guard balanceCny != nil || todayCny != nil else { return L("a11y.connecting", provider) }
         var parts = [gauge(provider: provider, balanceCny: balanceCny, runwayDays: runwayDays,
                                                            currency: currency)]

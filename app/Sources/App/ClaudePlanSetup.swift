@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 
 // ---------------------------------------------------------------- 账号：Claude 套餐（来源切换、状态栏钩子安装和还原）
@@ -30,7 +29,11 @@ extension UsageModel {
         claudeSource = s
         guard !kRendering else { return }
         s.save(.standard)
-        logLine(s == .desktop ? "已改用 Claude 桌面 App 来源" : "Claude 套餐改为读终端版 Claude Code 的状态栏钩子")
+        switch s {
+        case .desktop: logLine("Claude 套餐改用本机 Claude Code 命令行查询")
+        case .terminal: logLine("Claude 套餐改为读终端版 Claude Code 的状态栏钩子")
+        case .web: logLine("Claude 套餐改用 claude.ai 登录")
+        }
     }
 
     /// 添加 Claude 套餐（桌面来源）：不改任何文件，记下来源后直接添加
@@ -41,12 +44,21 @@ extension UsageModel {
         await addPlanPlatform(.claudePlan)
     }
 
-    /// 设置里的「改用 …」：终端 → 桌面时问要不要顺便还原 settings.json；桌面 → 终端走终端的确认页
+    /// 设置里的「改用 …」（三种来源）：
+    /// - 改用终端钩子：走终端的确认页；改用登录 claude.ai：走登录页（登录成功才换来源）
+    /// - 网页登录 → 本机 Claude Code：直接换；终端 → 本机 Claude Code：问要不要顺便还原 settings.json
     @MainActor
-    func switchClaudeSource() {
-        if claudeSource == .desktop {
-            openOnboarding(at: .login, platform: .claudePlan, claudeChoice: .terminal)
+    func switchClaudeSource(to target: ClaudePlanSource) {
+        switch target {
+        case .terminal, .web:
+            openOnboarding(at: .login, platform: .claudePlan, claudeChoice: target)
             return
+        case .desktop where claudeSource != .terminal:
+            setClaudeSource(.desktop)
+            reloginNotes[.claudePlan] = ReloginNote(text: L("claude.sw.done"), isError: false)
+            Task { @MainActor in await usageStore?.refresh(.claudePlan) }
+            return
+        case .desktop: break
         }
         let a = NSAlert()
         a.messageText = L("claude.sw.title")

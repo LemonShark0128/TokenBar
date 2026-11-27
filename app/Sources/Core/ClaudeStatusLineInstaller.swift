@@ -14,7 +14,22 @@ struct ClaudeStatusLineInstaller: Sendable {
     }
 
     /// settings.json 若是符号链接（常见于 dotfiles 仓库），读写都落在链接指向的真文件上，链接本身保留
-    private var realSettingsURL: URL { settingsURL.resolvingSymlinksInPath() }
+    private var realSettingsURL: URL { Self.resolveSettingsURL(settingsURL) }
+
+    private static func resolveSettingsURL(_ url: URL) -> URL {
+        var current = url
+        for depth in 0...32 {
+            guard let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: current.path) else {
+                return current.resolvingSymlinksInPath()
+            }
+            // 悬空链接也逐级跟随；循环或超长链接退回原路径
+            guard depth < 32 else { return url }
+            current = (destination.hasPrefix("/")
+                ? URL(fileURLWithPath: destination)
+                : current.deletingLastPathComponent().appendingPathComponent(destination)).standardizedFileURL
+        }
+        return url
+    }
 
     var hookURL: URL { supportDir.appendingPathComponent("claude-statusline.sh") }
     var quotaFileURL: URL { supportDir.appendingPathComponent("claude-ratelimits.json") }
@@ -35,6 +50,13 @@ struct ClaudeStatusLineInstaller: Sendable {
         let data = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data()
         return "\"statusLine\": " + String(decoding: data, as: UTF8.self)
     }
+
+    /// 预览图用的安装器：家目录换成占位的 /Users/you，截图里不出现本机用户名；只取文案，不读写文件
+    static let preview: ClaudeStatusLineInstaller = {
+        let home = URL(fileURLWithPath: "/Users/you", isDirectory: true)
+        return ClaudeStatusLineInstaller(settingsURL: home.appendingPathComponent(".claude/settings.json"),
+                                         supportDir: home.appendingPathComponent("Library/Application Support/TokenBar"))
+    }()
 
     /// 写进 settings.json 的命令：Claude Code 经 shell 执行，路径里有空格（Application Support），必须加引号
     var hookCommand: String { Self.shellQuote(hookURL.path) }
@@ -152,10 +174,14 @@ struct ClaudeStatusLineInstaller: Sendable {
         // 走到这里说明当前 statusLine 不是我们的钩子：一律记下当前值（含从「被替换」状态重装），覆盖旧的 original
         let previousOriginal = try? Data(contentsOf: originalURL)
         let orig: [String: Any] = ["statusLine": settings["statusLine"] ?? NSNull()]
-        try JSONSerialization.data(withJSONObject: orig, options: [.prettyPrinted, .withoutEscapingSlashes])
+        try JSONSerialization.data(withJSONObject: orig, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
             .write(to: originalURL, options: .atomic)
 
-        settings["statusLine"] = ["type": "command", "command": hookCommand]
+        // 保留 padding 等用户设置，仅替换钩子命令相关字段。
+        var statusLine = settings["statusLine"] as? [String: Any] ?? [:]
+        statusLine["type"] = "command"
+        statusLine["command"] = hookCommand
+        settings["statusLine"] = statusLine
         do {
             try writeSettings(settings)
         } catch {
@@ -203,9 +229,27 @@ struct ClaudeStatusLineInstaller: Sendable {
             original = v
         }
         if original is NSNull { updated.removeValue(forKey: "statusLine") } else { updated["statusLine"] = original }
-        do { try writeSettings(updated) } catch { throw SettingsWriteError(underlying: error) }
-        if fm.fileExists(atPath: originalURL.path) { try fm.removeItem(at: originalURL) }
-        if fm.fileExists(atPath: quotaFileURL.path) { try fm.removeItem(at: quotaFileURL) }
+        // 先把 original 挪开（挪不动就什么都没改）；写回 settings.json 失败再挪回来。
+        // 否则 settings.json 已还原、删 original 失败才抛错：界面报失败，残留的 original 又让 state() 误报「被替换」
+        let restoring = originalURL.appendingPathExtension("restoring")
+        var moved = false
+        if fm.fileExists(atPath: originalURL.path) {
+            if fm.fileExists(atPath: restoring.path) { try fm.removeItem(at: restoring) }
+            try fm.moveItem(at: originalURL, to: restoring)
+            moved = true
+        }
+        do { try writeSettings(updated) } catch {
+            if moved {
+                do { try fm.moveItem(at: restoring, to: originalURL) }
+                catch { WriteFailureLog.shared.failed("状态栏还原回滚", error) }
+            }
+            throw SettingsWriteError(underlying: error)
+        }
+        // settings.json 已还原：剩下的清理失败只留痕，不再报还原失败
+        for leftover in [restoring, quotaFileURL] where fm.fileExists(atPath: leftover.path) {
+            do { try fm.removeItem(at: leftover) }
+            catch { WriteFailureLog.shared.failed("状态栏还原清理", error) }
+        }
         return .restored
     }
 
@@ -223,7 +267,7 @@ struct ClaudeStatusLineInstaller: Sendable {
 
     private func writeSettings(_ obj: [String: Any]) throws {
         try FileManager.default.createDirectory(at: realSettingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .withoutEscapingSlashes])
+        let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         try data.write(to: realSettingsURL, options: .atomic)
     }
 

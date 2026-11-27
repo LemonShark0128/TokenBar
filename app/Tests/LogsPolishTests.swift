@@ -49,6 +49,18 @@ func registerLogsPolishTests() {
     test("appLoggerSharedIsStandardLogPath") {
         try check(AppLogger.shared.file.url.path.hasSuffix("/Library/Logs/TokenBar/app.log"), AppLogger.shared.file.url.path)
     }
+    test("appLoggerRenderModeKeepsOutOfAppLog") {
+        let home = "/Users/you"
+        try checkEqual(AppLogger.defaultURL(home: home, arguments: ["TokenBar"]).path,
+                       "/Users/you/Library/Logs/TokenBar/app.log")
+        for flag in ["--render", "--render-check"] {
+            try checkEqual(AppLogger.defaultURL(home: home, arguments: ["TokenBar", flag, "/tmp/base"]).path,
+                           "/Users/you/Library/Logs/TokenBar/preview/render.log")
+        }
+        // 只是参数值里带这个字样不算渲染模式
+        try checkEqual(AppLogger.defaultURL(home: home, arguments: ["TokenBar", "--out", "--render-x"]).path,
+                       "/Users/you/Library/Logs/TokenBar/app.log")
+    }
     test("crashReportsNewestThreeTokenBarOnly") {
         let dir = try tempDir("crash")
         let fm = FileManager.default

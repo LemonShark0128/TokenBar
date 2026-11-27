@@ -7,13 +7,7 @@ struct DeepSeekProvider: UsageProvider {
     init(http: HTTPClient = URLSessionHTTPClient()) { self.http = http }
 
     var id: ProviderID { .deepseek }
-    var displayName: String { "DeepSeek" }
-    var capabilities: Capabilities {
-        Capabilities(hasBalance: true, currency: .cny, minPollInterval: 60, dayBoundary: .local)
-    }
-    var loginSteps: [LoginStep] {
-        [.apiKey(required: true), .webLogin(url: URL(string: "https://platform.deepseek.com/sign_in")!, required: false)]
-    }
+    var capabilities: Capabilities { ProviderRegistry.capabilities(.deepseek) }
 
     static let balanceURL = URL(string: "https://api.deepseek.com/user/balance")!
     static let platformBase = "https://platform.deepseek.com/api/v0"
@@ -230,7 +224,7 @@ struct DeepSeekProvider: UsageProvider {
         switch status {
         case 200: return nil
         case 401, 403: return .auth("HTTP \(status)")
-        case 429: return .rateLimited(retryAfter: nil)
+        case 429: return .rateLimited
         default: return .network("HTTP \(status)")
         }
     }

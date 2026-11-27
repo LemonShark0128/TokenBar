@@ -14,18 +14,13 @@ struct PlatformAlertTracker: Equatable, Codable {
     static let spikeCooldown: TimeInterval = 6 * 3600
     private var hourlyAt: [ProviderID: Date] = [:]
     static let hourlyCooldown: TimeInterval = 3600
-    /// 已提醒过「重置前会用完」的窗口：按重置时间区分；没有重置时间记 nil，回到够用后才重新武装
-    private var runoutWindow: [ProviderID: Date?] = [:]
-
+    private var claudeLoginNotified = false
+    private var claudeExpiryDays: Set<Date> = []
+    private var geminiLoginNotified = false
     static let defaultsKey = "platformAlerts.state"
 
     private enum CodingKeys: String, CodingKey {
-        case below, lowAt, spikeAt, hourlyAt, runoutWindow
-    }
-
-    /// 用对象保留 nil 窗口，区别于字典里没有这个平台的记录。
-    private struct RunoutWindow: Codable {
-        var resetsAt: Date?
+        case below, lowAt, spikeAt, hourlyAt, claudeLoginNotified, claudeExpiryDays, geminiLoginNotified
     }
 
     init() {}
@@ -39,11 +34,13 @@ struct PlatformAlertTracker: Equatable, Codable {
                 ProviderID(rawValue: rawID).map { ($0, value) }
             })
         }
+        claudeLoginNotified = try container.decodeIfPresent(Bool.self, forKey: .claudeLoginNotified) ?? false
+        claudeExpiryDays = try container.decodeIfPresent(Set<Date>.self, forKey: .claudeExpiryDays) ?? []
+        geminiLoginNotified = try container.decodeIfPresent(Bool.self, forKey: .geminiLoginNotified) ?? false
         below = try decodeValues(Bool.self, forKey: .below)
         lowAt = try decodeValues(Date.self, forKey: .lowAt)
         spikeAt = try decodeValues(Date.self, forKey: .spikeAt)
         hourlyAt = try decodeValues(Date.self, forKey: .hourlyAt)
-        runoutWindow = try decodeValues(RunoutWindow.self, forKey: .runoutWindow).mapValues { $0.resetsAt }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -51,11 +48,66 @@ struct PlatformAlertTracker: Equatable, Codable {
         func encodeValues<Value: Encodable>(_ values: [ProviderID: Value], forKey key: CodingKeys) throws {
             try container.encode(Dictionary(uniqueKeysWithValues: values.map { ($0.key.rawValue, $0.value) }), forKey: key)
         }
+        try container.encode(claudeLoginNotified, forKey: .claudeLoginNotified)
+        try container.encode(claudeExpiryDays, forKey: .claudeExpiryDays)
+        try container.encode(geminiLoginNotified, forKey: .geminiLoginNotified)
         try encodeValues(below, forKey: .below)
         try encodeValues(lowAt, forKey: .lowAt)
         try encodeValues(spikeAt, forKey: .spikeAt)
         try encodeValues(hourlyAt, forKey: .hourlyAt)
-        try encodeValues(runoutWindow.mapValues { RunoutWindow(resetsAt: $0) }, forKey: .runoutWindow)
+    }
+
+    mutating func forget(_ id: ProviderID) {
+        if id == .claudePlan { claudeLoginNotified = false; claudeExpiryDays = [] }
+        if id == .geminiPlan { geminiLoginNotified = false }
+        below.removeValue(forKey: id)
+        lowAt.removeValue(forKey: id)
+        spikeAt.removeValue(forKey: id)
+        hourlyAt.removeValue(forKey: id)
+    }
+
+    struct LoginAlert {
+        var title: String
+        var body: String
+    }
+
+    /// 只提醒 Claude；未知 / 离线不会重新武装，避免重启或临时失败重复通知。
+    /// cliSource：Claude 套餐用的是 Claude Code（desktop / terminal 来源）。网页来源在 TokenBar 里登录，
+    /// 引导时还没登完就可能先刷新一次，不发这条通知（卡片上照样显示要登录）
+    mutating func claudeLoginAlerts(_ platforms: [PlatformState], now: Date, cliSource: Bool = true) -> [LoginAlert] {
+        guard let st = platforms.first(where: { $0.id == .claudePlan }) else { return [] }
+        if st.status == .credentialInvalid {
+            guard cliSource, !claudeLoginNotified else { return [] }
+            claudeLoginNotified = true
+            // 连续限流升级来的只是「多半」：标题不说死（真限流超过 30 分钟时也会走到这里）
+            let suspected = st.errorDetail == L("cli.suspectedLogin")
+            return [LoginAlert(title: L(suspected ? "alert.claudeLogin.suspectedTitle" : "alert.claudeLogin.title"),
+                               body: st.errorDetail ?? L("cli.needsLogin"))]
+        }
+        guard st.status == .ok else { return [] }
+        claudeLoginNotified = false
+        guard let snapshot = st.snapshot, case .expiring(let days) = snapshot.credential else { return [] }
+        // 新快照带精确到期时间；旧缓存按其采集时刻估算，不能用每轮 now 滚动。
+        let expiry = snapshot.credentialExpiresAt ?? snapshot.fetchedAt.addingTimeInterval(TimeInterval(days) * 86400)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let day = calendar.startOfDay(for: expiry)
+        guard claudeExpiryDays.insert(day).inserted else { return [] }
+        return [LoginAlert(title: days <= 0 ? L("alert.claudeExpiry.today") : L("alert.claudeExpiry.title", days),
+                           body: L("alert.claudeExpiry.body"))]
+    }
+
+    /// Gemini 套餐（本机 Antigravity CLI）登录失效提醒：掉线发一次，恢复 .ok 后重新武装；离线不重置。
+    mutating func geminiLoginAlerts(_ platforms: [PlatformState]) -> [LoginAlert] {
+        guard let st = platforms.first(where: { $0.id == .geminiPlan }) else { return [] }
+        if st.status == .credentialInvalid {
+            guard !geminiLoginNotified else { return [] }
+            geminiLoginNotified = true
+            return [LoginAlert(title: L("alert.geminiLogin.title"),
+                               body: st.errorDetail ?? L("gemini.cli.needsLogin"))]
+        }
+        if st.status == .ok { geminiLoginNotified = false }
+        return []
     }
 
     static func load(_ d: UserDefaults) -> PlatformAlertTracker {
@@ -71,12 +123,12 @@ struct PlatformAlertTracker: Equatable, Codable {
         d.set(data, forKey: Self.defaultsKey)
     }
 
-    /// 与「额度已用完」提醒一致：已添加的套餐平台，任一窗口有效已用达到 100%
+    /// 与「额度已用完」提醒一致：已添加的套餐平台，任一窗口用完（QuotaWindow.isExhausted）
     static func exhaustedPlatforms(_ platforms: [PlatformState], now: Date) -> Set<ProviderID> {
         Set(platforms.compactMap { st in
-            guard ProviderRegistry.meter(st.id) == .quota, st.status != .notAdded,
+            guard ProviderRegistry.meter(st.id) == .quota, st.status.isShown,
                   let q = st.snapshot?.quota,
-                  q.windows.contains(where: { $0.effectiveUsed(at: now) >= 100 }) else { return nil }
+                  q.windows.contains(where: { $0.isExhausted(at: now) }) else { return nil }
             return st.id
         })
     }
@@ -140,32 +192,4 @@ struct PlatformAlertTracker: Equatable, Codable {
         return out
     }
 
-    /// 同一个窗口的重置时间在两次读数之间会抖动（服务器时间带毫秒、桌面记录按读数估算），
-    /// 差 1 小时以内算同一个窗口（窗口至少 5 小时一个，不会误并）
-    static let windowTolerance: TimeInterval = 3600
-    static func sameWindow(_ a: Date?, _ b: Date?) -> Bool {
-        switch (a, b) {
-        case (nil, nil): return true
-        case let (x?, y?): return abs(x.timeIntervalSince(y)) < windowTolerance
-        default: return false
-        }
-    }
-
-    /// 套餐重置前会用完：每个窗口只提醒一次（窗口按重置时间区分）；低于预警线时也看原始读数
-    mutating func runoutToFire(_ risks: [PlatformRisk], now: Date, canFire: (ProviderID) -> Bool = { _ in true }) -> [ProviderID] {
-        var out: [ProviderID] = []
-        for r in risks {
-            guard let q = r.quotaReading else { continue }      // RiskRanker 对套餐平台总会带上原始读数
-            guard q.state == .runsOut else {
-                // 没有重置时间的窗口：恢复够用就重新武装（有重置时间的按窗口记，同一窗口不再提醒）
-                if let w = runoutWindow[r.id], w == nil { runoutWindow.removeValue(forKey: r.id) }
-                continue
-            }
-            if let w = runoutWindow[r.id], Self.sameWindow(w, q.resetsAt) { continue }
-            guard canFire(r.id) else { continue }
-            runoutWindow[r.id] = .some(q.resetsAt)
-            out.append(r.id)
-        }
-        return out
-    }
 }

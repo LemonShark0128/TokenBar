@@ -32,7 +32,9 @@ struct LogFile: Sendable {
         // 新装的机器上日志目录还不存在
         try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let h = try? FileHandle(forWritingTo: url) {
-            h.seekToEndOfFile(); h.write(data); try? h.close()
+            // 会抛错的新接口：磁盘满时不崩；找不到文件尾就不写，免得从开头覆盖
+            if (try? h.seekToEnd()) != nil { try? h.write(contentsOf: data) }
+            try? h.close()
         } else {
             try? data.write(to: url, options: .atomic)
         }
@@ -46,10 +48,16 @@ final class AppLogger: @unchecked Sendable {
     /// ~/Library/Logs/TokenBar/app.log（1.0.0 起；「控制台」App 里能直接看），超过 1 MB 滚动为 app.log.1
     /// 启动阶段有几处「记一行再 exit(0)」（让位、重复实例）：exit 会跑 atexit，在那里刷完，不丢最后几行
     static let shared: AppLogger = {
-        let l = AppLogger(file: LogFile(url: URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/TokenBar/app.log")))
+        let l = AppLogger(file: LogFile(url: defaultURL(home: NSHomeDirectory(), arguments: CommandLine.arguments)))
         atexit { AppLogger.shared.flush() }
         return l
     }()
+
+    /// 离屏渲染（--render / --render-check）写到预览目录的 render.log，不混进正在用的 App 的 app.log
+    static func defaultURL(home: String, arguments: [String]) -> URL {
+        let rendering = arguments.contains { $0 == "--render" || $0 == "--render-check" }
+        return URL(fileURLWithPath: home + (rendering ? "/Library/Logs/TokenBar/preview/render.log" : "/Library/Logs/TokenBar/app.log"))
+    }
 
     let file: LogFile
     private let queue = DispatchQueue(label: "com.lemon.deepseek-tokenbar.log")

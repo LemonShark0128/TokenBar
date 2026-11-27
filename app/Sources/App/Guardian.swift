@@ -1,7 +1,5 @@
 import AppKit
-import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 守护 job / 接管
 

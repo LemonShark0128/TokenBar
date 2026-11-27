@@ -20,7 +20,7 @@ extension A11yText {
     /// 金额：「12.35 元」「1.20 美元」；不知道时读「未知」
     static func money(_ v: Double?, currency: String?) -> String {
         guard let v, v.isFinite else { return L("a11y.unknown") }
-        return L(currency == "USD" ? "a11y.dollars" : "a11y.yuan", String(format: "%.2f", v))
+        return yuan(v, currency == "USD" ? .usd : .cny)
     }
 
     /// 剩余百分比：一律向下取整（与界面「已用」的算法一致）；取整后为 0 就是用完
@@ -97,20 +97,20 @@ extension A11yText {
     static func quotaWindow(_ r: AppData.QuotaRow) -> String {
         if r.isReset { return L("a11y.windowReset", r.name) }
         let left = 100 - r.usedPercent
-        var parts = [r.name]
-        if QuotaText.isExhausted(remaining: left) {
-            parts.append(L("runway.exhausted"))
-        } else {
-            parts.append(L("a11y.usedPct", quotaUsedPercent(remaining: left)))
-            parts.append(remaining(left))
-        }
-        if let reset = r.reset { parts.append(reset) }
+        var parts = [r.name, remaining(left)]     // 用完时 remaining 已读「额度已用完」
+        if let countdown = r.countdown { parts.append(L("quota.countdown.reset", countdown)) }
+        else if let reset = r.reset { parts.append(reset) }
+        if let pace = r.paceRemainingPercent { parts.append(PaceText.short(remaining: left, pace: pace)) }
         return parts.joined(separator: L("a11y.sep"))
     }
 
     /// 其他平台的一行（面板、右键卡）：名称，中间那句（风险 / 异常 / 重置时间 / 今日花费），右边的读数
     static func side(_ s: AppData.Side) -> String {
         var parts = [s.name]
+        if let resets = s.resetCredits { parts.append(resets) }
+        if let loginHint = MenuBarCells.quotaLoginHint(for: s) {
+            return (parts + [loginHint, remaining(s.quotaRemaining), L("a11y.notLatest")]).joined(separator: L("a11y.sep"))
+        }
         if let e = s.quotaExhausted { return (parts + [e.a11y]).joined(separator: L("a11y.sep")) }
         if let risk = s.riskText {
             parts.append(risk)
@@ -122,9 +122,9 @@ extension A11yText {
             parts.append(L("a11y.todayMoney", money(t, currency: s.currency)))
         }
         if s.isQuota {
-            parts.append(s.quotaRemaining == nil ? L("a11y.noData") : L("a11y.usedPct", quotaUsedPercent(remaining: s.quotaRemaining)))
+            parts.append(s.quotaRemaining == nil ? L("a11y.noData") : remaining(s.quotaRemaining))
         } else {
-            parts.append(L("a11y.balanceMoney", money(s.tank, currency: s.currency)))
+            parts.append(L(s.tankIsKeyLimit ? "a11y.keyLimitMoney" : "a11y.balanceMoney", money(s.tank, currency: s.currency)))
         }
         if s.quotaStale { parts.append(L("a11y.notLatest")) }
         return parts.joined(separator: L("a11y.sep"))

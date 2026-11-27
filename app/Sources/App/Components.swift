@@ -1,7 +1,5 @@
 import AppKit
-import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- A：油量表（面板主角）
 
@@ -23,12 +21,11 @@ func levelTint(_ v: Double) -> Color { Color(nsColor: GaugeIcon.levelColor(v)) }
 func quotaTint(_ severity: RunwaySeverity) -> Color {
     switch severity {
     case .ok: return levelTint(1)
-    case .warn: return Color(nsColor: NSColor(red: 0.98, green: 0.62, blue: 0.22, alpha: 1))
-    case .danger: return Color(nsColor: NSColor(red: 0.92, green: 0.26, blue: 0.21, alpha: 1))
+    case .warn: return Color(nsColor: GaugeIcon.warnColor)
+    case .danger: return Color(nsColor: GaugeIcon.dangerColor)
     }
 }
 
-/// 主角油量表：弧 = 余额 ÷ 满盘；指针只画在外圈，不压住中间的余额数字
 /// 主平台切换时名称 / 数字 / 油量表的配对动画：主区与辅助行共用 namespace，
 /// 同一平台的同名元素从一处飞到另一处。减弱动态效果时不配对（淡入淡出由面板整块重建负责）
 struct SwitchMatch {
@@ -49,6 +46,7 @@ extension View {
     }
 }
 
+/// 主角油量表：弧 = 余额 ÷ 满盘；指针只画在外圈，不压住中间的余额数字
 struct FuelGauge: View {
     let level: Double
     let balance: String
@@ -67,7 +65,7 @@ struct FuelGauge: View {
     var overline: String? = nil
 
     var body: some View {
-        let v = GaugeGeometry.arcFraction(level: level, quota: quota)
+        let v = GaugeGeometry.arcFraction(level: level)
         let g = GaugeGeometry(diameter: Double(diameter), big: Double(big))
         let lw = CGFloat(g.lineWidth)
         let r = diameter / 2
@@ -158,18 +156,18 @@ struct FreshDot: View {
 }
 
 /// 油量表下面那句话：还能用几天 + 花得多快（1 小时窗口不可信时退回 24 小时平均）
-/// compact：窄处（右键菜单信息卡）用短写法「¥0.00/时」「均 ¥1.37/时」
-func burnCaption(_ d: AppData, fuelFull: Double, compact: Bool = false) -> (String, Bool) {
+/// fullSymbol：「满格 ¥50」的符号，跟「表盘满格金额」的刻度币种（不一定是主平台的币种）
+func burnCaption(_ d: AppData, fuelFull: Double, fullSymbol: String) -> (String, Bool) {
     var parts: [String] = []
     let b = d.burn
     let sym = currencySymbol(d.balance.currency)
     if let days = b?.runwayDays { parts.append(A11yText.runway(days)) }
     if let h = b?.cnyPerHourRate {
-        parts.append(L(compact ? "burn.compactHour" : "burn.lastHour", sym, String(format: "%.2f", h)))
+        parts.append(L("burn.lastHour", sym, String(format: "%.2f", h)))
     } else if let h = b?.cnyPerDayRate {
-        parts.append(L(compact ? "burn.compactAvg" : "burn.dayAvg", sym, String(format: "%.2f", h)))
+        parts.append(L("burn.dayAvg", sym, String(format: "%.2f", h)))
     }
-    return (parts.isEmpty ? L("burn.fullGauge", sym, String(format: "%.0f", fuelFull)) : parts.joined(separator: " · "), b?.spike == true)
+    return (parts.isEmpty ? L("burn.fullGauge", fullSymbol, String(format: "%.0f", fuelFull)) : parts.joined(separator: " · "), b?.spike == true)
 }
 
 /// 风险文字共用颜色；普通行的正常状态仍使用次要文字色。

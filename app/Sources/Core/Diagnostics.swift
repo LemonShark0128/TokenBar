@@ -8,6 +8,7 @@ enum Diagnostics {
         (#"(?i)\bBearer\s+[^\s"',;]+"#, "Bearer ***"),
         (#"(?i)\b(api[_-]?key|access[_-]?token|user[_-]?token|web[_-]?token|admin[_-]?key|token|secret|password|passwd|authorization|cookie|session)(\s*["']?\s*[:=]\s*["']?)(?!Bearer\b)(?!\*\*\*)(?!(?:true|false|nil|null)\b)[^\s"',;&]+"#, "$1$2***"),
         (#"(?<![A-Za-z0-9])sk-[A-Za-z0-9_*\-]{4,}"#, "sk-***"),
+        (#"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}"#, "***@***"),
     ].map { (try! NSRegularExpression(pattern: $0.0), $0.1) }
 
     /// 32 位以上的字母数字串（含 - _ + =）且同时有字母和数字：多半是 key、token 或 ID，一律打码

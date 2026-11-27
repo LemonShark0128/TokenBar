@@ -22,6 +22,80 @@ func registerClaudeCLIUsageTests() {
       10% of your usage came from subagent-heavy sessions
     """
 
+    test("cliAuthStatusStrictParsing") {
+        for (json, loggedIn, expiry) in [
+            (#"{"loggedIn":true,"loginExpiresAt":"2026-12-17T14:33:14.201Z"}"#, true, ISODate.parse("2026-12-17T14:33:14.201Z")),
+            (#"{"loggedIn":true,"loginExpiresAt":"2026-01-01T00:00:00Z"}"#, true, ISODate.parse("2026-01-01T00:00:00Z")),
+            (#"{"loggedIn":false,"loginExpiresAt":null}"#, false, nil),
+            (#"{"loggedIn":true,"loginExpiresAt":null}"#, true, nil)
+        ] {
+            let auth = ClaudeCLIUsage.parseAuthStatus(Data(json.utf8))
+            try checkEqual(auth?.loggedIn, loggedIn)
+            try checkEqual(auth?.loginExpiresAt, expiry)
+        }
+        for bad in ["乱码", "{}", #"{"loggedIn":1}"#, #"{"loggedIn":true,"loginExpiresAt":"bad"}"#] {
+            try checkEqual(ClaudeCLIUsage.parseAuthStatus(Data(bad.utf8)), nil)
+        }
+    }
+    test("cliThrottleStreakRequiresCountAndTimeAndResets") {
+        var streak = ClaudeCLIUsage.ThrottleStreak()
+        try checkEqual(streak.record(.failed(L("cli.throttled")), auth: nil, now: now), ClaudeCLIUsage.throttled)
+        try checkEqual(streak.record(ClaudeCLIUsage.throttled, auth: nil, now: now.addingTimeInterval(1800)), ClaudeCLIUsage.throttled)
+        try checkEqual(streak.record(ClaudeCLIUsage.throttled, auth: nil, now: now.addingTimeInterval(1800)), ClaudeCLIUsage.suspectedLogin)
+        _ = streak.record(.quota(Quota(plan: nil, windows: [], observedAt: now)), auth: nil, now: now)
+        try checkEqual(streak.count, 0)
+        for seconds in [0.0, 300, 1799] {
+            try checkEqual(streak.record(ClaudeCLIUsage.throttled, auth: nil, now: now.addingTimeInterval(seconds)), ClaudeCLIUsage.throttled)
+        }
+        try checkEqual(streak.record(ClaudeCLIUsage.throttled, auth: nil, now: now.addingTimeInterval(1800)), ClaudeCLIUsage.suspectedLogin)
+        _ = streak.record(.unrecognized, auth: nil, now: now)
+        try checkEqual(streak.count, 0)
+        for auth in [ClaudeCLIUsage.AuthStatus(loggedIn: false, loginExpiresAt: nil),
+                     ClaudeCLIUsage.AuthStatus(loggedIn: true, loginExpiresAt: now.addingTimeInterval(-1))] {
+            try checkEqual(streak.record(ClaudeCLIUsage.throttled, auth: auth, now: now), ClaudeCLIUsage.needsLogin)
+            try checkEqual(streak.count, 0)
+        }
+        try check(ClaudeCLIUsage.isLoginProblem(ClaudeCLIUsage.suspectedLogin))
+    }
+    // 11-18 审核：平时 6 小时查一次；没查到或 3 天内到期 20 分钟就重查（重新登录后「N 天后到期」尽快消失）
+    testAsync("cliAuthCacheTTLDependsOnResult") {
+        actor Box {
+            var count = 0; var next: ClaudeCLIUsage.AuthStatus?
+            func hit() -> ClaudeCLIUsage.AuthStatus? { count += 1; return next }
+            func set(_ s: ClaudeCLIUsage.AuthStatus?) { next = s }
+        }
+        let box = Box(), cache = ClaudeCLIUsage.AuthCache()
+        let load: @Sendable () async -> ClaudeCLIUsage.AuthStatus? = { await box.hit() }
+        // 没查到：20 分钟
+        _ = await cache.read(now: now, load: load)
+        _ = await cache.read(now: now.addingTimeInterval(1199), load: load)
+        try checkEqual(await box.count, 1)
+        // 远期到期：6 小时
+        await box.set(.init(loggedIn: true, loginExpiresAt: now.addingTimeInterval(30 * 86400)))
+        _ = await cache.read(now: now.addingTimeInterval(1200), load: load)
+        try checkEqual(await box.count, 2)
+        _ = await cache.read(now: now.addingTimeInterval(1200 + 21599), load: load)
+        try checkEqual(await box.count, 2)
+        _ = await cache.read(now: now.addingTimeInterval(1200 + 21600), load: load)
+        try checkEqual(await box.count, 3)
+        // 3 天内到期：20 分钟
+        let t = now.addingTimeInterval(1200 + 21600)
+        await box.set(.init(loggedIn: true, loginExpiresAt: t.addingTimeInterval(2 * 86400)))
+        _ = await cache.read(now: t, refresh: true, load: load)
+        _ = await cache.read(now: t.addingTimeInterval(1199), load: load)
+        try checkEqual(await box.count, 4)
+        _ = await cache.read(now: t.addingTimeInterval(1200), load: load)
+        try checkEqual(await box.count, 5)
+    }
+    // 11-18 审核：限流 2 次后睡 8 小时，醒来再限流 1 次，不算连续 30 分钟
+    test("cliThrottleStreakRestartsAfterLongGap") {
+        var streak = ClaudeCLIUsage.ThrottleStreak()
+        _ = streak.record(ClaudeCLIUsage.throttled, auth: nil, now: now)
+        _ = streak.record(ClaudeCLIUsage.throttled, auth: nil, now: now.addingTimeInterval(300))
+        try checkEqual(streak.record(ClaudeCLIUsage.throttled, auth: nil, now: now.addingTimeInterval(8 * 3600)), ClaudeCLIUsage.throttled)
+        try checkEqual(streak.count, 1)
+    }
+
     // MARK: 解析文字
 
     test("cliUsageParsesSessionAndWeek") {
@@ -174,7 +248,7 @@ func registerClaudeCLIUsageTests() {
         let result = "其他文字\n  Current session: 未知\r\ncurrent week: 未知\n" + String(repeating: "字", count: 220)
         let d = ClaudeCLIUsage.diagnostic(stdout: wrap(result))
         try check(d.hasPrefix("Current session: 未知 | current week: 未知；前 200 字："))
-        try check(d.hasSuffix(String(result.prefix(200)).components(separatedBy: .newlines).joined(separator: "⏎")))
+        try check(d.hasSuffix(Diagnostics.redact(String(result.prefix(200))).components(separatedBy: .newlines).joined(separator: "⏎")))
         try check(!d.contains("\n") && !d.contains("\r"))
         try checkEqual(ClaudeCLIUsage.diagnostic(stdout: Data("普通\n文本".utf8)), "；前 200 字：普通⏎文本")
         try checkEqual(ClaudeCLIUsage.diagnostic(stdout: Data("提示\n".utf8) + wrap(result)), d)
@@ -298,6 +372,23 @@ func registerClaudeCLIUsageTests() {
         }
     }
 
+    test("cliRealNeverLoggedInResponse") {
+        let line = control(#"{"subscription_type":null,"rate_limits_available":false,"rate_limits":null}"#)
+        try checkEqual(ClaudeCLIUsage.controlOutcome(line: line, now: now), ClaudeCLIUsage.notPlanLogin)
+    }
+    test("cliRealExpiredLoginResponseNeedsAuthEvidence") {
+        let line = Data(#"{"type":"control_response","response":{"subtype":"success","request_id":"usage","response":{"session":{"total_cost_usd":0,"total_api_duration_ms":0,"total_duration_ms":158,"total_lines_added":0,"total_lines_removed":0,"model_usage":{}},"subscription_type":"max","rate_limits_available":true,"rate_limits":null,"behaviors":null}}}"#.utf8)
+        let outcome = ClaudeCLIUsage.controlOutcome(line: line, now: now)!
+        try checkEqual(outcome, ClaudeCLIUsage.throttled)
+        var streak = ClaudeCLIUsage.ThrottleStreak()
+        try checkEqual(streak.record(outcome, auth: .init(loggedIn: true, loginExpiresAt: now.addingTimeInterval(-1)), now: now), ClaudeCLIUsage.needsLogin)
+    }
+    test("cliRealThrottledResponseWithoutAuthEvidenceStaysThrottled") {
+        let line = control(#"{"subscription_type":"max","rate_limits_available":true,"rate_limits":null}"#)
+        let outcome = ClaudeCLIUsage.controlOutcome(line: line, now: now)!
+        var streak = ClaudeCLIUsage.ThrottleStreak()
+        try checkEqual(streak.record(outcome, auth: .init(loggedIn: true, loginExpiresAt: nil), now: now), ClaudeCLIUsage.throttled)
+    }
     test("cliControlMissingLimitsAreThrottled") {
         for payload in [
             #"{"subscription_type":"pro","rate_limits_available":true,"rate_limits":null}"#,
@@ -360,11 +451,19 @@ func registerClaudeCLIUsageTests() {
         }
         try checkEqual(error("Unsupported control request subtype"), ClaudeCLIUsage.outdated)
         try checkEqual(error("unknown subtype"), ClaudeCLIUsage.outdated)
-        try checkEqual(error("not logged in"), .failed("Claude Code 需要重新登录"))
-        try checkEqual(error("Please sign in"), .failed("Claude Code 需要重新登录"))
+        try checkEqual(error("not logged in"), .failed("Claude Code 需要重新登录：在终端运行 claude，输入 /login"))
+        try checkEqual(error("Please sign in"), .failed("Claude Code 需要重新登录：在终端运行 claude，输入 /login"))
         try checkEqual(error(""), .failed("命令行报错"))
         try checkEqual(error(String(repeating: "错", count: 100)), .failed(String(repeating: "错", count: 80)))
-        try checkEqual(ClaudeCLIUsage.controlOutcome(line: control(#"{"rate_limits_available":false}"#), now: now),
+        // 用户 11/6：命令行退出登录时回复里没有订阅类型；API Key / Bedrock / Vertex 也一样，分不出来——
+        // 写「没有用 Pro/Max 账号登录」加登录方法，不再只说「需要 Pro/Max 登录」
+        let notPlan = ClaudeCLIUsage.Outcome.failed("Claude Code 没有用 Pro/Max 账号登录：在终端运行 claude，输入 /login")
+        try checkEqual(ClaudeCLIUsage.controlOutcome(line: control(#"{"rate_limits_available":false}"#), now: now), notPlan)
+        try checkEqual(ClaudeCLIUsage.controlOutcome(
+            line: control(#"{"subscription_type":null,"rate_limits_available":false,"rate_limits":null,"behaviors":null}"#), now: now), notPlan)
+        try checkEqual(ClaudeCLIUsage.controlOutcome(line: control(#"{"subscription_type":"","rate_limits_available":false}"#), now: now), notPlan)
+        // 登录了、但不是 Pro/Max（免费账号等）：仍写需要 Pro/Max
+        try checkEqual(ClaudeCLIUsage.controlOutcome(line: control(#"{"subscription_type":"free","rate_limits_available":false}"#), now: now),
                        .failed("没有订阅额度数据（需要 Pro/Max 登录）"))
     }
     test("cliControlValidatesWindowsAndDates") {
@@ -404,6 +503,28 @@ func registerClaudeCLIUsageTests() {
         return f
     }
 
+
+    testAsync("cliAuthRunnerUsesFieldsNotExitCodeAndPrivateOutput") {
+        let dir = try tmpDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let exe = try script(dir, """
+        [ "$*" = 'auth status --json' ] || exit 8
+        [ "$DISABLE_AUTOUPDATER" = 1 ] || exit 9
+        [ "${CLAUDECODE+x}" != x ] || exit 10
+        printf '%s' '{"loggedIn":false,"loginExpiresAt":null,"email":"private@example.test"}'
+        exit 1
+        """)
+        let auth = await ClaudeCLIUsage.runAuthStatus(executable: exe, cwd: dir, timeout: 1)
+        try checkEqual(auth?.loggedIn, false)
+        let hung = try script(dir, "trap '' TERM; echo $$ > pid; while :; do :; done")
+        let start = Date()
+        try checkEqual(await ClaudeCLIUsage.runAuthStatus(executable: hung, cwd: dir, timeout: 0.1), nil)
+        try check(Date().timeIntervalSince(start) < 2)
+        let pid = Int32(try String(contentsOf: dir.appendingPathComponent("pid")).trimmingCharacters(in: .whitespacesAndNewlines))!
+        defer { if kill(pid, 0) == 0 { kill(pid, SIGKILL) } }
+        try await Task.sleep(nanoseconds: 2_500_000_000)
+        try check(kill(pid, 0) != 0)
+    }
 
     testAsync("cliControlKillsTermIgnoringProcess") {
         let dir = try tmpDir()
@@ -570,6 +691,23 @@ func registerClaudeCLIUsageTests() {
         try FileManager.default.removeItem(at: dir)
     }
 
+    // 没登录时马上再查也一样：不重试（原来每次刷新多跑 2 次 claude、多等约 30 秒）；别的失败照旧重试
+    testAsync("desktopLoginProblemSkipsRetries") {
+        actor Counter { var n = 0; func hit() { n += 1 } }
+        let dir = try tmpDir()
+        for (outcome, expected) in [(ClaudeCLIUsage.needsLogin, 1), (ClaudeCLIUsage.notPlanLogin, 1), (ClaudeCLIUsage.suspectedLogin, 1), (.failed("超时"), 3)] {
+            let calls = Counter()
+            let p = ClaudePlanProvider(quotaFile: dir.appendingPathComponent("hook.json"),
+                                       desktopFile: dir.appendingPathComponent("none.json"), source: { .desktop },
+                                       cli: { _ in await calls.hit(); return outcome }, sleep: { _ in })
+            let expectedError: ProviderError = ClaudeCLIUsage.isLoginProblem(outcome)
+                ? .auth(ClaudePlanProvider.cliHint(outcome)!) : .unavailable(ClaudePlanProvider.cliHint(outcome)!)
+            try checkEqual(await fetch(p), .failure(expectedError))
+            try checkEqual(await calls.n, expected)
+        }
+        try FileManager.default.removeItem(at: dir)
+    }
+
     testAsync("desktopFallsBackToAppFile") {
         let dir = try tmpDir()
         let app = dir.appendingPathComponent("plan-usage-history.json")
@@ -588,13 +726,17 @@ func registerClaudeCLIUsageTests() {
         try Data("{\"version\":2,\"samples\":[{\"t\":\(ms(at("2026-10-16T22:37:00Z"))),\"u\":{\"fh\":30,\"sd\":10}}]}".utf8).write(to: app)
         guard case .success(let s2) = await fetch(provider(.notInstalled)) else { throw TestFailure(description: "应为 success") }
         try checkEqual(s2.quota, nil)
-        try checkEqual(s2.quotaNote, "Claude 桌面 App 的额度记录停在 10月16日 22:37。装好 Claude Code 命令行后能读到实时额度和准确的重置时间")
+        try checkEqual(s2.quotaNote, "Claude 桌面 App 的额度记录停在 10月16日 22:37。装好并登录 Claude Code 命令行，或在设置里改用登录 claude.ai")
         for outcome in [ClaudeCLIUsage.Outcome.failed("超时"), .unrecognized, ClaudeCLIUsage.outdated] {
             guard case .failure(.unavailable(let reason)) = await fetch(provider(outcome)) else {
                 throw TestFailure(description: "失败不能使用桌面旧记录")
             }
             try checkEqual(reason, ClaudePlanProvider.cliHint(outcome))
         }
+        // 没登录：直接说要重新登录、怎么登，不套「claude 命令行没查到额度：」（两个冒号连着读不顺）
+        try checkEqual(ClaudePlanProvider.cliHint(ClaudeCLIUsage.needsLogin), "Claude Code 需要重新登录：在终端运行 claude，输入 /login")
+        try checkEqual(ClaudePlanProvider.cliHint(ClaudeCLIUsage.notPlanLogin), "Claude Code 没有用 Pro/Max 账号登录：在终端运行 claude，输入 /login")
+        try checkEqual(ClaudePlanProvider.cliHint(.failed("超时")), "claude 命令行没查到额度：超时")
         // 今天停的写「今天」
         try Data("{\"version\":2,\"samples\":[{\"t\":\(ms(at("2026-10-17T08:05:00Z"))),\"u\":{\"fh\":30}}]}".utf8).write(to: app)
         guard case .success(let s5) = await fetch(provider(.notInstalled)) else { throw TestFailure(description: "应为 success") }

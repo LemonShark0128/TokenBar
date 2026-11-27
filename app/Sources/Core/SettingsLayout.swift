@@ -5,6 +5,10 @@ import Foundation
 /// 账号在界面上的状态（设置「账号」分组每行显示）
 enum AccountState: Equatable {
     case notAdded, connecting, ok, balanceOnly, consoleExpired, invalid, offline
+    /// 暂时隐藏（登录保留、不刷新）
+    case hidden
+    /// 读不到钥匙串（凭据本身可能没问题；面板里有「重试」）
+    case keychainUnreadable
     /// 登录会话快到期（硅基流动）
     case expiring(days: Int)
 
@@ -13,8 +17,10 @@ enum AccountState: Equatable {
         guard let st = st else { return .notAdded }
         switch st.status {
         case .notAdded: return .notAdded
+        case .hidden: return .hidden
         case .loading: return .connecting
         case .credentialInvalid: return .invalid
+        case .keychainUnreadable: return .keychainUnreadable
         case .consoleLoginNeeded: return .consoleExpired
         case .schemaChanged, .rateLimited, .stale, .offline:
             // 出错且手里没有这次运行取到的数据（首次就失败）：不能显示「正常」
@@ -30,11 +36,13 @@ enum AccountState: Equatable {
     var label: String {
         switch self {
         case .notAdded: return L("acct.notAdded")
+        case .hidden: return L("acct.hidden")
         case .connecting: return L("acct.connecting")
         case .ok: return L("acct.ok")
         case .balanceOnly: return L("acct.balanceOnly")
         case .consoleExpired: return L("acct.consoleExpired")
         case .invalid: return L("acct.invalid")
+        case .keychainUnreadable: return L("acct.keychainUnreadable")
         case .offline: return L("acct.offline")
         case .expiring(let d): return d <= 0 ? L("acct.expiresToday") : L("acct.expiresInDays", d)
         }
@@ -43,6 +51,14 @@ enum AccountState: Equatable {
     /// 账号行的状态文字：套餐平台读的是本机文件，出错时不说「连不上」
     func label(for id: ProviderID) -> String {
         if self == .offline, ProviderRegistry.meter(id) == .quota { return L("acct.noLocalRecords") }
+        if self == .invalid {
+            switch ProviderRegistry.credentialKind(id) {
+            case .apiKey: return L("acct.keyInvalid")
+            case .accessToken: return L("acct.tokenInvalid")
+            case .webLogin: return L("acct.loginExpired")
+            case .none: break
+            }
+        }
         return label
     }
 
@@ -51,7 +67,7 @@ enum AccountState: Equatable {
     var tone: Tone {
         switch self {
         case .ok: return .good
-        case .balanceOnly, .notAdded, .connecting: return .neutral
+        case .balanceOnly, .notAdded, .connecting, .hidden: return .neutral
         default: return .warn
         }
     }
@@ -59,11 +75,11 @@ enum AccountState: Equatable {
 
 /// 侧栏的四个分类（顺序即侧栏顺序）
 enum SettingsPage: String, CaseIterable {
-    case platform, menuBar, alerts, general
+    case display, alerts, platform, general
     var title: String {
         switch self {
         case .platform: return L("page.platform")
-        case .menuBar: return L("page.menuBar")
+        case .display: return L("page.display")
         case .alerts: return L("page.alerts")
         case .general: return L("page.general")
         }
@@ -72,7 +88,7 @@ enum SettingsPage: String, CaseIterable {
     var symbol: String {
         switch self {
         case .platform: return "square.stack.3d.up"
-        case .menuBar: return "menubar.rectangle"
+        case .display: return "menubar.rectangle"
         case .alerts: return "bell"
         case .general: return "gearshape"
         }
@@ -83,19 +99,31 @@ enum SettingsPage: String, CaseIterable {
 enum AccountReading: Equatable {
     /// 按量付费：余额（currency 为 "USD" 时写 $，其余写 ¥）
     case money(Double, currency: String?)
+    /// 按量付费，但这个数是 API Key 的剩余花费上限（OpenRouter）：写「Key 剩余额度」
+    case keyLimit(Double, currency: String?)
     /// 套餐：5 小时窗口剩余百分比
     case session(Double)
     /// 套餐没有 5 小时窗口：每周窗口（没有则第一个窗口）的剩余百分比
     case remaining(Double)
 
+    /// 从快照取读数：余额是 Key 剩余上限时给 .keyLimit
+    static func from(snapshot: ProviderSnapshot?, meter: Meter, now: Date) -> AccountReading? {
+        let r = from(balance: snapshot?.balance, quota: snapshot?.quota, meter: meter, now: now)
+        if snapshot?.balanceIsKeyLimit == true, case .money(let v, let c)? = r { return .keyLimit(v, currency: c) }
+        return r
+    }
+
     static func from(balance: Money?, quota: Quota?, meter: Meter, now: Date) -> AccountReading? {
         switch meter {
         case .money:
             guard let b = balance else { return nil }
-            return .money(NSDecimalNumber(decimal: b.amount).doubleValue, currency: b.currency.rawValue)
+            return .money(AppDataMapping.double(b.amount), currency: b.currency.rawValue)
         case .quota:
             guard let q = quota else { return nil }
-            if let s = q.windows.first(where: { $0.kind == .session }) { return .session(100 - s.effectiveUsed(at: now)) }
+            // 每周用完时按每周窗口写「剩 0%」，不写 5 小时窗口的余量（同表盘 / 菜单栏）
+            if q.blockingWindow(at: now)?.kind != .weekly, let s = q.windows.first(where: { $0.kind == .session }) {
+                return .session(100 - s.effectiveUsed(at: now))
+            }
             return q.displayRemainingPercent(at: now).map { .remaining($0) }
         }
     }
@@ -103,8 +131,9 @@ enum AccountReading: Equatable {
     var text: String {
         switch self {
         case .money(let v, let c): return L("reading.balance", fmtMoney(v, c))
-        case .session(let v): return L("reading.sessionUsed", quotaUsedPercent(remaining: v))
-        case .remaining(let v): return L("reading.used", quotaUsedPercent(remaining: v))
+        case .keyLimit(let v, let c): return L("reading.keyLimit", fmtMoney(v, c))
+        case .session(let v): return L("reading.sessionLeft", quotaRemainingPercent(v))
+        case .remaining(let v): return L("reading.left", quotaRemainingPercent(v))
         }
     }
 }
@@ -114,14 +143,14 @@ enum SettingsRowID: Equatable {
     case mainPlatform
     case account(ProviderID), addPlatform
     case launchAtLogin, refreshInterval, exchangeRate, updateCheck, diagnostics
-    case menuBarMode
-    case theme, transparency, widget
-    case tank
+    case menuBarStyle, menuBarShowRunning, menuBarMode
+    case theme, transparency, widget, panelHome
+    case alertStatus(ProviderID), hourly(ProviderID)
     case alert(ProviderID), alertCustom(ProviderID), fuelFull
     case alertRepeat
     case spikeAlert
-    /// 提醒表头区分金额与百分比；套餐共用重置前耗尽开关
-    case alertHeader(quota: Bool), runoutAlert
+    case quietHours
+    case recoveredAlert
 }
 
 struct SettingsSection: Equatable {
@@ -132,18 +161,29 @@ struct SettingsSection: Equatable {
 
 /// 「···」菜单里的一项
 struct AccountAction: Equatable {
-    enum Kind: Equatable { case setMain, apiKey, console, webRelogin, reinstallHook, switchClaudeSource, dataDir, resetDataDir, remove }
+    enum Kind: Equatable { case setMain, apiKey, console, webRelogin, reinstallHook, switchClaudeSource(ClaudePlanSource), dataDir, resetDataDir, remove }
     let kind: Kind
     let title: String
     var destructive: Bool { kind == .remove }
 }
 
 enum SettingsLayout {
+    static func menuBarSlotMode(_ raw: String?) -> MenuBarSlotMode {
+        raw.flatMap(MenuBarSlotMode.init(rawValue:)) ?? .single
+    }
+    static var menuBarSlotOptions: [Option] { [("single", L("mb.slots.single")), ("double", L("mb.slots.double"))] }
+    static var panelHomeOptions: [Option] { [("today", L("today.home")), ("single", L("today.single"))] }
+
     typealias Option = (key: String, label: String)
 
     /// 已添加的平台，按界面顺序
     static func added(_ states: [ProviderID: AccountState]) -> [ProviderID] {
         ProviderRegistry.all.filter { (states[$0] ?? .notAdded) != .notAdded }
+    }
+
+    /// 已添加且没隐藏的平台（今天页卡片、菜单栏「显示哪个平台」的选项）
+    static func shown(_ states: [ProviderID: AccountState]) -> [ProviderID] {
+        added(states).filter { states[$0] != .hidden }
     }
 
     /// 还没添加、可以从「＋ 添加平台」加的平台
@@ -159,40 +199,62 @@ enum SettingsLayout {
 
     /// 每页有哪些分组、每组有哪些行。main：主平台（nil = 没有已添加的平台）
     static func sections(_ page: SettingsPage, added: [ProviderID], main: ProviderID?,
-                         customOpen: Set<ProviderID>) -> [SettingsSection] {
+                         customOpen: Set<ProviderID>, style: String = "bars") -> [SettingsSection] {
         switch page {
         case .platform:
             var accounts = added.map { SettingsRowID.account($0) }
             if showsAddPlatform(added: added) { accounts.append(.addPlatform) }
-            return [SettingsSection(title: L("section.display"), rows: [.mainPlatform]),
-                    SettingsSection(title: L("section.addedPlatforms"), rows: accounts)]
-        case .menuBar:
-            return [SettingsSection(title: L("section.menuBar"), rows: [.menuBarMode]),
-                    SettingsSection(title: L("section.panelWindows"), rows: [.theme, .transparency, .widget])]
+            return [SettingsSection(title: L("section.addedPlatforms"), rows: accounts)]
+        case .display:
+            var out = [SettingsSection(title: L("section.showing"), rows: [.mainPlatform]),
+                       SettingsSection(title: L("section.menuBar"), rows: style == "classic" ? [.menuBarStyle, .menuBarMode] : [.menuBarStyle, .menuBarShowRunning]),
+                       SettingsSection(title: L("section.panelWindows"), rows: [.panelHome, .theme, .transparency, .widget])]
+            if added.contains(where: { ProviderRegistry.meter($0) == .money }) {
+                out.append(SettingsSection(title: L("section.scale"), rows: [.fuelFull]))
+            }
+            return out
         case .alerts:
             let platforms = alertPlatforms(added: added)
-            let money = platforms.filter { ProviderRegistry.meter($0) == .money }
-            let quota = platforms.filter { ProviderRegistry.meter($0) == .quota }
-            func rows(_ ids: [ProviderID], quota: Bool) -> [SettingsRowID] {
-                var out: [SettingsRowID] = [.alertHeader(quota: quota)]
-                for id in ids {
-                    out.append(.alert(id))
-                    if customOpen.contains(id) { out.append(.alertCustom(id)) }
-                }
-                if quota { out.append(.runoutAlert) }
-                return out
+            var out = platforms.map { id in
+                var rows: [SettingsRowID] = [.alertStatus(id), .alert(id)]
+                if customOpen.contains(id) { rows.append(.alertCustom(id)) }
+                if ProviderRegistry.meter(id) == .money { rows.append(.hourly(id)) }
+                return SettingsSection(title: ProviderRegistry.displayName(id), rows: rows)
             }
-            // 余额规格只随按量付费主平台显示；有平台时才显示充值提醒。
-            var top: [SettingsRowID] = [.tank]
-            if let main, added.contains(main), ProviderRegistry.meter(main) == .money { top.append(.fuelFull) }
-            var out = [SettingsSection(title: scaleTitle(main: main), rows: top)]
-            if !money.isEmpty { out.append(SettingsSection(title: L("section.payg"), rows: rows(money, quota: false))) }
-            if !quota.isEmpty { out.append(SettingsSection(title: L("section.plans"), rows: rows(quota, quota: true))) }
-            out.append(SettingsSection(title: L("section.alerts"), rows: platforms.isEmpty ? [.spikeAlert] : [.alertRepeat, .spikeAlert]))
+            var rules: [SettingsRowID] = []
+            if !platforms.isEmpty { rules.append(.alertRepeat) }
+            if platforms.contains(where: { ProviderRegistry.meter($0) == .quota }) { rules.append(.recoveredAlert) }
+            rules.append(.spikeAlert)
+            rules.append(.quietHours)
+            out.append(SettingsSection(title: L("section.alertRules"), rows: rules))
             return out
         case .general:
-            return [SettingsSection(title: L("section.thisMac"), rows: [.launchAtLogin, .refreshInterval, .exchangeRate, .updateCheck, .diagnostics])]
+            return [SettingsSection(title: L("section.thisMac"), rows: [.launchAtLogin, .refreshInterval, .exchangeRate]),
+                    SettingsSection(title: L("section.updates"), rows: [.updateCheck, .diagnostics])]
         }
+    }
+
+    /// 提醒状态细条统一按余额或套餐剩余计算。
+    static func alertBarFraction(_ reading: AccountReading?, fuelFull: Double, scale: String?, usdToCny: Double) -> Double? {
+        guard let reading else { return nil }
+        let fraction: Double
+        switch reading {
+        case .money(let value, let currency), .keyLimit(let value, let currency):
+            fraction = gaugeFraction(value, currency: currency, full: fuelFull, scale: scale, usdToCny: usdToCny)
+        case .session(let value), .remaining(let value): fraction = value / 100
+        }
+        return max(0, min(1, fraction))
+    }
+
+    /// 提醒页每个平台预警线那一行的名字：套餐「剩余低于」、按量「余额低于」、余额其实是 Key 上限时「Key 剩余额度低于」
+    static func alertLineLabel(_ id: ProviderID, keyLimit: Bool) -> String {
+        if ProviderRegistry.meter(id) == .quota { return L("set.alert.remainingBelow") }
+        return L(keyLimit ? "set.alert.keyLimitBelow" : "set.alert.balanceBelow")
+    }
+
+    /// 预警线前面的货币符号：主平台跟数据里的币种走，其他平台按平台计费币种（OpenRouter 是美元）
+    static func alertSymbol(_ id: ProviderID, main: ProviderID?, mainCurrency: String?) -> String {
+        currencySymbol(id == main ? mainCurrency : ProviderRegistry.currency(id).rawValue)
     }
 
     /// 「余额预警」里列哪些平台：已添加的全部（按界面顺序）
@@ -208,15 +270,23 @@ enum SettingsLayout {
         if !isMain { out.append(AccountAction(kind: .setMain, title: L("action.pinIt"))) }
         switch id {
         case .deepseek:
-            out.append(AccountAction(kind: .apiKey, title: state == .invalid ? L("action.relogin") : L("action.changeKey")))
+            out.append(AccountAction(kind: .apiKey, title: L("action.changeKey")))      // Key 无效也是「更换 API Key」（没有「登录」）
             out.append(AccountAction(kind: .console, title: state == .balanceOnly ? L("action.loginConsole") : L("action.reloginConsole")))
         case .siliconflow:
             out.append(AccountAction(kind: .webRelogin, title: L("action.relogin")))
-        case .codexPlan:
-            break       // 读本机记录，不需要登录
+        case .kimi, .openrouter:
+            out.append(AccountAction(kind: .apiKey, title: L("action.changeKey")))
+        case .packyapi:
+            out.append(AccountAction(kind: .apiKey, title: L("action.changeToken")))     // 和 API Key 一样打开登录页
+        case .codexPlan, .geminiPlan:
+            break       // 读本机记录 / 本机 CLI，不需要登录
         case .claudePlan:
             if claudeSource == .terminal { out.append(AccountAction(kind: .reinstallHook, title: L("action.reinstallHook"))) }
-            out.append(AccountAction(kind: .switchClaudeSource, title: claudeSource.switchTitle))
+            if claudeSource == .web { out.append(AccountAction(kind: .webRelogin, title: L("claudeWeb.relogin"))) }
+            // 三种来源：菜单里给另外两种，顺序固定（网页登录、本机 Claude Code、终端钩子）
+            for other in [ClaudePlanSource.web, .desktop, .terminal] where other != claudeSource {
+                out.append(AccountAction(kind: .switchClaudeSource(other), title: other.switchToTitle))
+            }
         }
         if id == .codexPlan || id == .claudePlan {
             out.append(AccountAction(kind: .dataDir, title: L("action.dataDir")))
@@ -227,11 +297,16 @@ enum SettingsLayout {
     }
 
     /// 行内突出当前需要处理的一项；重装钩子只适用于 Claude 套餐。
-    static func urgentAction(_ id: ProviderID, state: AccountState, hookGone: Bool) -> AccountAction? {
+    static func urgentAction(_ id: ProviderID, state: AccountState, hookGone: Bool,
+                             claudeSource: ClaudePlanSource) -> AccountAction? {
         switch (id, state) {
+        // 网页来源登录过期 / 没登录：行内直接给「重新登录 claude.ai」
+        case (.claudePlan, .invalid) where claudeSource == .web:
+            return AccountAction(kind: .webRelogin, title: L("claudeWeb.relogin"))
         case (.deepseek, .balanceOnly): return AccountAction(kind: .console, title: L("action.loginConsole"))
         case (.deepseek, .consoleExpired): return AccountAction(kind: .console, title: L("action.reloginConsole"))
-        case (.deepseek, .invalid): return AccountAction(kind: .apiKey, title: L("action.relogin"))
+        case (.deepseek, .invalid), (.kimi, .invalid), (.openrouter, .invalid): return AccountAction(kind: .apiKey, title: L("action.changeKey"))
+        case (.packyapi, .invalid): return AccountAction(kind: .apiKey, title: L("action.changeToken"))
         case (.siliconflow, .invalid), (.siliconflow, .expiring):
             return AccountAction(kind: .webRelogin, title: L("action.relogin"))
         case (.claudePlan, _) where hookGone:
@@ -243,9 +318,23 @@ enum SettingsLayout {
     /// 菜单按操作类型排除行内紧急操作，保持其余顺序，「移除…」始终在最后。
     static func menuActions(_ id: ProviderID, state: AccountState, isMain: Bool,
                             claudeSource: ClaudePlanSource, hookGone: Bool, customDir: Bool = false) -> [AccountAction] {
-        let urgent = urgentAction(id, state: state, hookGone: hookGone)
+        let urgent = urgentAction(id, state: state, hookGone: hookGone, claudeSource: claudeSource)
         return accountActions(id, state: state, isMain: isMain, claudeSource: claudeSource, customDir: customDir)
             .filter { $0.kind != urgent?.kind }
+    }
+
+    /// 读数能不能写：失效、连不上、正在连接、未添加，或数据源已停止更新（Claude 钩子不在了）时不写，免得显示旧数
+    static func showsReading(state: AccountState, stale: Bool) -> Bool {
+        guard !stale else { return false }
+        switch state {
+        case .invalid, .keychainUnreadable, .offline, .connecting, .notAdded, .hidden: return false     // 读不到钥匙串时手里只有磁盘旧数
+        default: return true
+        }
+    }
+
+    /// 提醒卡第一行的读数：规则同平台页 accountDetail；nil 时界面改写账号状态、不画进度条
+    static func alertStatusReading(state: AccountState, reading: AccountReading?, stale: Bool) -> AccountReading? {
+        showsReading(state: state, stale: stale) ? reading : nil
     }
 
     /// 平台行第二行状态文字之后的部分：当前读数 + 简短说明（都没有为 nil）。
@@ -254,19 +343,14 @@ enum SettingsLayout {
     static func accountDetail(_ id: ProviderID, state: AccountState, reading: AccountReading?, stale: Bool = false,
                               claudeSource: ClaudePlanSource = .terminal, customDir: String? = nil) -> String? {
         var parts: [String] = []
-        var showReading: Bool
-        switch state {
-        case .invalid, .offline, .connecting, .notAdded: showReading = false
-        default: showReading = true
-        }
-        if stale { showReading = false }
-        if showReading, let r = reading { parts.append(r.text) }
+        if showsReading(state: state, stale: stale), let r = reading { parts.append(r.text) }
         switch id {
         case .codexPlan: parts.append(L("acct.note.codexLocal"))
+        case .geminiPlan: parts.append(L("acct.note.geminiCLI"))
         case .claudePlan:
             parts.append(claudeSource.label)
             if reading == nil && !stale && (state == .ok || state == .connecting) {
-                parts.append(claudeSource == .desktop ? L("acct.note.claudeDesktop") : L("acct.note.claudeTerminal"))
+                parts.append(claudeSource == .desktop ? L("acct.note.claudeDesktop") : claudeSource == .web ? L("acct.note.claudeWeb") : L("acct.note.claudeTerminal"))
             }
         default: break
         }
@@ -275,11 +359,6 @@ enum SettingsLayout {
     }
 
     // MARK: 说明文字
-
-    /// 提醒页顶部进度条的名字（用户 2026-10-17 定名：原「油箱」→「余额标尺」→「余额进度条」）：主平台是套餐时叫「额度进度条」
-    static func scaleTitle(main: ProviderID?) -> String {
-        main.map { ProviderRegistry.meter($0) == .quota } == true ? L("settings.quotaBar") : L("settings.balanceBar")
-    }
 
     /// 「显示哪个平台」那一行的说明：按选中值写真实规则（MainSwitcher：10 分钟内在跑的任务、多个轮流、都没在跑保持）。
     /// 面板和菜单栏共用这一个设置（用户 10-19）
@@ -298,12 +377,47 @@ enum SettingsLayout {
         !auto && added.contains(main) ? main.rawValue : "auto"
     }
 
+    static func menuBarStyle(_ stored: String?) -> String {
+        stored == "classic" ? "classic" : "bars"
+    }
+    static func menuBarShowRunning(_ stored: Bool?) -> Bool { stored ?? true }
+    static var menuBarStyleOptions: [Option] {
+        [("bars", L("mb.style.bars")), ("classic", L("mb.style.classic"))]
+    }
     static var menuBarModeOptions: [Option] { [("balance", L("opt.mb.balance")), ("cost", L("opt.mb.cost")), ("icon", L("opt.mb.icon"))] }
-    static var themeOptions: [Option] { [("light", L("opt.theme.light")), ("dark", L("opt.theme.dark")), ("system", L("opt.theme.system"))] }
+    static var themeOptions: [Option] { [("system", L("opt.theme.system")), ("light", L("opt.theme.light")), ("dark", L("opt.theme.dark"))] }
     static func refreshLabel(_ s: Int) -> String { s < 60 || s % 60 != 0 ? L("opt.seconds", s) : L("opt.minutes", s / 60) }
     /// 各平台 minPollInterval 都是 60 秒，30 秒选了也不生效，所以不提供（自查第 3 条）
     static var refreshOptions: [Option] { [60, 120, 300].map { ("\($0)", refreshLabel($0)) } }
-    static let fuelFullOptions: [Option] = [20, 50, 100, 200].map { ("\($0)", "¥\($0)") }
+    /// 余额刻度用哪个币种：已添加的按量付费平台币种一致时用它，不一致或都没有时返回 nil（按 ¥ 显示）
+    static func scaleCurrency(_ currencies: [String?]) -> String? {
+        let known = Set(currencies.compactMap { $0 })
+        return known.count == 1 ? known.first : nil
+    }
+
+    /// 「表盘满格金额」的币种：按已添加的按量付费平台的币种。actual = 取到过数的平台实际余额币种（优先，
+    /// 如 DeepSeek 只有美元余额的账户）；没取到数的按计费币种，开机还没数据时也定得下来
+    static func gaugeScaleCurrency(added: [ProviderID], actual: [ProviderID: String] = [:]) -> String? {
+        scaleCurrency(added.filter { ProviderRegistry.meter($0) == .money }.map { actual[$0] ?? ProviderRegistry.currency($0).rawValue })
+    }
+
+    /// 各平台快照里的余额币种（gaugeScaleCurrency 的 actual）
+    static func balanceCurrencies(_ platforms: [PlatformState]) -> [ProviderID: String] {
+        Dictionary(platforms.compactMap { st in st.snapshot?.balance.map { (st.id, $0.currency.rawValue) } }, uniquingKeysWith: { a, _ in a })
+    }
+
+    /// 表盘 / 进度条读数（0…1）：余额先换成刻度币种（nil = ¥），再 ÷ 满格。$18 不能当 ¥18 画
+    static func gaugeFraction(_ amount: Double, currency: String?, full: Double, scale: String?, usdToCny: Double) -> Double {
+        let from = currency ?? "CNY", to = scale ?? "CNY"
+        var v = amount
+        if from == "USD" && to == "CNY" { v = amount * usdToCny }
+        if from == "CNY" && to == "USD" { v = usdToCny > 0 ? amount / usdToCny : 0 }
+        return max(0, min(1, v / max(1, full)))
+    }
+
+    static func fuelFullOptions(symbol: String = "¥") -> [Option] {
+        [20, 50, 100, 200].map { ("\($0)", "\(symbol)\($0)") }
+    }
 
     static let alertPresets: [Double] = [5, 10, 20]
 

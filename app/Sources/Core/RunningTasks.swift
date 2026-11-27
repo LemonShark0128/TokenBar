@@ -9,6 +9,9 @@ struct RunningTask: Equatable {
     var startedAt: Date
     var lastActivity: Date
     var tokens: Int
+    var usage = TokenBreakdown()
+    var rawModel: String? = nil
+    var costUSD: Double? { rawModel.flatMap { ModelPricing.usd(usage, model: $0) } }
 }
 
 /// 扫描最近改过的会话日志末尾，找出每个会话文件里未收轮的轮次。
@@ -23,14 +26,17 @@ enum RunningTasks {
 
     /// 只扫 enabled 里的 .claudePlan（claudeDir/projects/<子目录>/*.jsonl）和 .codexPlan（codexSessions/yyyy/MM/dd/*.jsonl）；
     /// 文件修改时间在 30 分钟内才读；去掉最后活动早于 30 分钟的，按开始时间升序、同时间按 sessionKey 升序
-    /// cache：App 每 10 或 30 秒扫一次，传同一个缓存，没变的文件不再读（测试不传时每次全读）
+    /// cache：App 周期扫描，传同一个缓存，没变的文件不再读（测试不传时每次全读）
     static func scan(enabled: Set<ProviderID>, claudeDir: URL, codexSessions: URL, now: Date,
+                     antigravityBrain: URL? = nil,
                      cache: RunningTasksCache? = nil, fileManager fm: FileManager = .default) -> [RunningTask] {
-        scanDetailed(enabled: enabled, claudeDir: claudeDir, codexSessions: codexSessions, now: now, cache: cache, fileManager: fm).tasks
+        scanDetailed(enabled: enabled, claudeDir: claudeDir, codexSessions: codexSessions, now: now,
+                     antigravityBrain: antigravityBrain, cache: cache, fileManager: fm).tasks
     }
 
     /// 同 scan，另外给出各平台会话日志最近一次修改时间（30 分钟内改过的才算；刷新频率按它判断有没有在用）
     static func scanDetailed(enabled: Set<ProviderID>, claudeDir: URL, codexSessions: URL, now: Date,
+                             antigravityBrain: URL? = nil,
                              cache: RunningTasksCache? = nil,
                              fileManager fm: FileManager = .default) -> (tasks: [RunningTask], lastChange: [ProviderID: Date]) {
         var items: [(url: URL, parse: (URL) -> RunningTask?)] = []
@@ -47,22 +53,62 @@ enum RunningTasks {
             lastChange[.codexPlan] = f.map(\.mtime).max()
             items += f.map { ($0.url, { Self.codex($0) }) }
         }
+        if enabled.contains(.geminiPlan), let brain = antigravityBrain {
+            let f = fresh(geminiFiles(brain, fm), now: now, fm)
+            lastChange[.geminiPlan] = f.map(\.mtime).max()
+            items += f.map { ($0.url, { Self.gemini($0) }) }
+        }
         // 每个文件读完立刻释放读进来的数据（不然一轮扫描的临时对象要等整轮结束才放）
         let out = cache?.tasks(items, fm) ?? items.compactMap { it in autoreleasepool { it.parse(it.url) } }
-        let tasks = out.filter { now.timeIntervalSince($0.lastActivity) < dropAfter }
-            .sorted { $0.startedAt != $1.startedAt ? $0.startedAt < $1.startedAt : $0.sessionKey < $1.sessionKey }
-        return (tasks, lastChange)
+        return (live(out, now: now), lastChange)
     }
 
-    /// claude-opus-4-7 → opus 4.7；claude-sonnet-4-5-20250929 → sonnet 4.5；不是 claude- 开头的原样
+    /// 追读已知活跃文件，不列举目录；新文件由完整扫描发现。
+    static func scanKnown(_ files: [ProviderID: [URL]], now: Date, cache: RunningTasksCache? = nil,
+                          fileManager fm: FileManager = .default) -> (tasks: [RunningTask], lastChange: [ProviderID: Date]) {
+        var items: [(url: URL, parse: (URL) -> RunningTask?)] = []
+        var last: [ProviderID: Date] = [:]
+        for id in [ProviderID.claudePlan, .codexPlan, .geminiPlan] {
+            let f = fresh(files[id] ?? [], now: now, fm)
+            last[id] = f.map(\.mtime).max()
+            items += f.map { file in
+                (file.url, {
+                    switch id {
+                    case .claudePlan: return Self.claude($0)
+                    case .codexPlan: return Self.codex($0)
+                    case .geminiPlan: return Self.gemini($0)
+                    default: return nil
+                    }
+                })
+            }
+        }
+        let out = cache?.tasks(items, fm) ?? items.compactMap { it in autoreleasepool { it.parse(it.url) } }
+        return (live(out, now: now), last)
+    }
+
+    /// 去掉太久没动静的任务，按开始时间（同时开始按会话键）排序
+    private static func live(_ tasks: [RunningTask], now: Date) -> [RunningTask] {
+        tasks.filter { now.timeIntervalSince($0.lastActivity) < dropAfter }
+            .sorted { $0.startedAt != $1.startedAt ? $0.startedAt < $1.startedAt : $0.sessionKey < $1.sessionKey }
+    }
+
+    /// claude-opus-4-7 → opus 4.7；claude-sonnet-4-5-20250929 → sonnet 4.5；gemini-4-neon-high → gemini 4 neon
     static func shortModel(_ raw: String) -> String {
-        guard raw.hasPrefix("claude-") else { return raw }
-        var parts = raw.dropFirst("claude-".count).split(separator: "-").map(String.init)
-        // 去掉结尾的日期（8 位数字）
-        if let last = parts.last, last.count == 8, last.allSatisfy(\.isNumber) { parts.removeLast() }
-        guard let family = parts.first else { return raw }
-        let version = parts.dropFirst().joined(separator: ".")
-        return version.isEmpty ? family : "\(family) \(version)"
+        if raw.hasPrefix("claude-") {
+            var parts = raw.dropFirst("claude-".count).split(separator: "-").map(String.init)
+            // 去掉结尾的日期（8 位数字）
+            if let last = parts.last, last.count == 8, last.allSatisfy(\.isNumber) { parts.removeLast() }
+            guard let family = parts.first else { return raw }
+            let version = parts.dropFirst().joined(separator: ".")
+            return version.isEmpty ? family : "\(family) \(version)"
+        }
+        if raw.hasPrefix("gemini-") {
+            var parts = raw.split(separator: "-").map(String.init)
+            let efforts: Set<String> = ["low", "medium", "high", "xhigh", "max"]
+            if parts.count > 2, let last = parts.last, efforts.contains(last.lowercased()) { parts.removeLast() }
+            return parts.joined(separator: " ")
+        }
+        return raw
     }
 
     // ---------------------------------------------------------------- 文件
@@ -70,7 +116,7 @@ enum RunningTasks {
     private static func fresh(_ files: [URL], now: Date, _ fm: FileManager) -> [(url: URL, mtime: Date)] {
         let since = now.addingTimeInterval(-dropAfter)
         return files.compactMap { u in
-            guard let m = (try? fm.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date, m >= since else { return nil }
+            guard let m = FileStat.mtime(u), m >= since else { return nil }
             return (u, m)
         }
     }
@@ -83,8 +129,7 @@ enum RunningTasks {
             for m in LocalAgentUsage.subdirectories(y, fm) {
                 for d in LocalAgentUsage.subdirectories(m, fm) {
                     out += LocalAgentUsage.jsonlFiles(in: d, fm).filter { u in
-                        let mtime = (try? fm.attributesOfItem(atPath: u.path)[.modificationDate] as? Date) ?? nil
-                        return mtime.map { $0 > since } ?? false
+                        FileStat.mtime(u).map { $0 > since } ?? false
                     }
                 }
             }
@@ -92,18 +137,19 @@ enum RunningTasks {
         return out
     }
 
+    /// Antigravity 会话日志：brain/<会话ID>/.system_generated/logs/transcript.jsonl（只列一级会话目录，不递归）
+    private static func geminiFiles(_ root: URL, _ fm: FileManager) -> [URL] {
+        LocalAgentUsage.subdirectories(root, fm).map {
+            $0.appendingPathComponent(".system_generated/logs/transcript.jsonl")
+        }
+    }
+
     private static func lines(_ f: URL, truncated: inout Bool) -> [Data] {
         LocalAgentUsage.tailLines(f, limits: .init(maxFiles: 1, tailBytes: tailBytes), truncated: &truncated)
     }
 
     private static func date(_ ts: String?) -> Date? {
-        guard let ts else { return nil }
-        let frac = ISO8601DateFormatter()
-        frac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = frac.date(from: ts) { return d }
-        let whole = ISO8601DateFormatter()
-        whole.formatOptions = [.withInternetDateTime]
-        return whole.date(from: ts)
+        ts.flatMap(ISODate.parse)
     }
 
     /// 项目名：最近的工作目录；中途 cd 进了子目录时，取读到的范围里出现过的、是它上级的最短目录（会话启动目录）
@@ -120,7 +166,16 @@ enum RunningTasks {
     /// 每行都解的结构字段；message.content 不在这里解
     private struct ClaudeLine: Decodable {
         /// 「已写」只算输出 token（输入和缓存读取每调一次工具都重算一遍，累加起来不像「用了多少」）
-        struct Usage: Decodable { var output_tokens: Int? }
+        struct Usage: Decodable {
+            var input_tokens: Int?
+            var cache_read_input_tokens: Int?
+            var cache_creation_input_tokens: Int?
+            var output_tokens: Int?
+            var breakdown: TokenBreakdown {
+                TokenBreakdown(input: input_tokens ?? 0, cachedInput: cache_read_input_tokens ?? 0,
+                               cacheWrite: cache_creation_input_tokens ?? 0, output: output_tokens ?? 0)
+            }
+        }
         struct Message: Decodable {
             var id: String?
             var model: String?
@@ -177,9 +232,10 @@ enum RunningTasks {
         var firstSeen: Date?
         var start: Date?, last: Date?
         var model: String?, cwds: [String] = []
-        var usage: [String: Int] = [:]
+        var usage: [String: TokenBreakdown] = [:]
+        var written: [String: Int] = [:]
         var anonymous = 0
-        func reset() { start = nil; model = nil; usage = [:] }
+        func reset() { start = nil; model = nil; usage = [:]; written = [:] }
         for line in all {
             guard let l = try? dec.decode(ClaudeLine.self, from: line) else { continue }
             let t = date(l.timestamp)
@@ -198,26 +254,28 @@ enum RunningTasks {
                 if !side, !open, unknown { open = true; start = firstSeen }
                 if !side { unknown = false }
                 guard open, let m = l.message else { break }
-                if let n = m.usage?.output_tokens {
+                if let u = m.usage {
                     let k: String
                     if let id = m.id ?? l.requestId { k = id } else { anonymous += 1; k = "#\(anonymous)" }
-                    usage[k] = n
+                    usage[k] = u.breakdown
+                    if let n = u.output_tokens { written[k] = n }
                 }
-                if !side, let raw = m.model, raw != "<synthetic>" { model = shortModel(raw) }
+                if !side, let raw = m.model, raw != "<synthetic>" { model = raw }
                 if !side, let s = m.stop_reason, closingStops.contains(s) { open = false; reset() }
             default: break
             }
             if open, let t { last = t }
         }
         guard open, let start, let last else { return nil }
-        return RunningTask(provider: .claudePlan, sessionKey: f.path, project: project(cwds), model: model,
-                           startedAt: start, lastActivity: max(start, last), tokens: usage.values.reduce(0, +))
+        return RunningTask(provider: .claudePlan, sessionKey: f.path, project: project(cwds), model: model.map(shortModel),
+                           startedAt: start, lastActivity: max(start, last), tokens: written.values.reduce(0, +),
+                           usage: usage.values.reduce(TokenBreakdown(), +), rawModel: model)
     }
 
     // ---------------------------------------------------------------- Codex
 
     private struct CodexLine: Decodable {
-        struct Total: Decodable { var output_tokens: Int? }
+        typealias Total = CodexTokenUsage
         struct Info: Decodable { var total_token_usage: Total? }
         struct Payload: Decodable {
             var type: String?
@@ -240,6 +298,8 @@ enum RunningTasks {
         // 读全文时累计值从 0 起算；截断时第一条累计值只当起点
         var total: Int? = truncated ? nil : 0
         var base: Int?
+        var previous: CodexTokenUsage? = truncated ? nil : CodexTokenUsage()
+        var usage = TokenBreakdown()
         for line in all {
             guard let l = try? dec.decode(CodexLine.self, from: line) else { continue }
             let t = date(l.timestamp)
@@ -250,13 +310,16 @@ enum RunningTasks {
             } else if l.type == "event_msg" {
                 switch l.payload?.type {
                 case "task_started":
-                    open = true; unknown = false; start = t; base = total
+                    open = true; unknown = false; start = t; base = total; usage = TokenBreakdown()
                 case "task_complete", "turn_aborted":
                     open = false; unknown = false
                 case "token_count":
-                    if let n = l.payload?.info?.total_token_usage?.output_tokens {
+                    if let current = l.payload?.info?.total_token_usage {
+                        let n = current.output_tokens ?? total ?? 0
                         if !open, unknown { open = true; unknown = false; start = firstSeen; base = total ?? n }
                         if open, base == nil { base = total ?? n }
+                        if open, let previous { usage = usage + current.delta(from: previous) }
+                        previous = current
                         total = n
                     }
                 default: break
@@ -267,7 +330,88 @@ enum RunningTasks {
         guard open, let start, let last else { return nil }
         let tokens = max(0, (total ?? 0) - (base ?? 0))
         return RunningTask(provider: .codexPlan, sessionKey: f.path, project: project(cwd.map { [$0] } ?? []), model: model,
-                           startedAt: start, lastActivity: max(start, last), tokens: tokens)
+                           startedAt: start, lastActivity: max(start, last), tokens: tokens, usage: usage, rawModel: model)
+    }
+
+    // ---------------------------------------------------------------- Antigravity (Gemini)
+
+    /// 只解结构字段（不解 content / thinking / tool 参数内容）
+    private struct GeminiLine: Decodable {
+        struct ToolStub: Decodable {}
+        var step_index: Int?
+        var type: String?
+        var status: String?
+        var created_at: String?
+        var model: String?
+        var input_tokens: Int?
+        var cache_read_tokens: Int?
+        var output_tokens: Int?
+        var tool_calls: [ToolStub]?
+    }
+
+    private static let geminiTerminalStatuses: Set<String> = ["ERROR", "CANCELED", "CANCELLED", "INTERRUPTED"]
+
+    private static func gemini(_ f: URL) -> RunningTask? {
+        var truncated = false
+        let all = lines(f, truncated: &truncated)
+        let dec = JSONDecoder()
+        var open = false, unknown = truncated
+        var firstSeen: Date?, start: Date?, last: Date?
+        var model: String?
+        var written: [String: Int] = [:]
+        var usage: [String: TokenBreakdown] = [:]
+        var anonymous = 0
+        func reset() { start = nil; model = nil; written = [:]; usage = [:] }
+
+        for line in all {
+            guard let l = try? dec.decode(GeminiLine.self, from: line) else { continue }
+            let t = date(l.created_at)
+            if let t, firstSeen == nil { firstSeen = t }
+            let status = l.status?.uppercased() ?? ""
+            let isTerminal = geminiTerminalStatuses.contains(status)
+            switch l.type {
+            case "USER_INPUT":
+                open = true; unknown = false; reset(); start = t
+            case "SYSTEM_MESSAGE":
+                if !open { open = true; unknown = false; reset(); start = t }
+            case "PLANNER_RESPONSE":
+                if isTerminal {
+                    open = false; unknown = false; reset()
+                    break
+                }
+                if !open, unknown { open = true; start = firstSeen }
+                unknown = false
+                let hasTools = !(l.tool_calls ?? []).isEmpty
+                if !open && (hasTools || status == "RUNNING") { open = true; reset(); start = t }
+                guard open else { break }
+                if let m = l.model, !m.isEmpty { model = m }
+                let out = max(0, l.output_tokens ?? 0)
+                let cached = max(0, l.cache_read_tokens ?? 0)
+                let inp = max(0, (l.input_tokens ?? 0) - cached)
+                let key: String
+                if let step = l.step_index { key = "s:\(step)" } else { anonymous += 1; key = "#\(anonymous)" }
+                written[key] = out
+                usage[key] = TokenBreakdown(input: inp, cachedInput: cached, cacheWrite: 0, output: out)
+                if !hasTools && status != "RUNNING" { open = false; reset() }
+            case "GENERIC":
+                if status == "CANCELED" || status == "CANCELLED" || status == "INTERRUPTED" {
+                    open = false; unknown = false; reset()
+                } else if status == "RUNNING" {
+                    if !open { open = true; unknown = false; start = t }
+                } else if !open, unknown, !isTerminal {
+                    open = true; unknown = false; start = firstSeen
+                }
+            default: break
+            }
+            if open, let t {
+                if start == nil { start = t }
+                last = t
+            }
+        }
+        guard open, let start, let last else { return nil }
+        return RunningTask(provider: .geminiPlan, sessionKey: f.path, project: "Antigravity",
+                           model: model.map(shortModel), startedAt: start, lastActivity: max(start, last),
+                           tokens: written.values.reduce(0, +), usage: usage.values.reduce(TokenBreakdown(), +), rawModel: model)
     }
 }
 
@@ -282,9 +426,9 @@ enum RunningTaskText {
     private static func elapsed(_ t: RunningTask, now: Date) -> Int { max(0, Int(now.timeIntervalSince(t.startedAt))) }
     private static func stoppedMinutes(_ t: RunningTask, now: Date) -> Int { max(0, Int(now.timeIntervalSince(t.lastActivity)) / 60) }
 
-    /// 「12:04」「1:02:04」；停住时「停了 7 分钟」
-    static func clock(_ t: RunningTask, now: Date) -> String {
-        if isStale(t, now: now) { return L("task.stoppedMin", stoppedMinutes(t, now: now)) }
+    /// 「12:04」「1:02:04」；停住时「停了 7 分钟」（short：窄卡里写「停 7分」）
+    static func clock(_ t: RunningTask, now: Date, short: Bool = false) -> String {
+        if isStale(t, now: now) { return L(short ? "task.stoppedShort" : "task.stoppedMin", stoppedMinutes(t, now: now)) }
         let e = elapsed(t, now: now)
         let h = e / 3600, m = e % 3600 / 60, s = e % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
@@ -304,7 +448,20 @@ enum RunningTaskText {
     /// 「opus 4.7 · 已写 18.2k」；不知道模型时「已写 18.2k」
     static func detail(_ t: RunningTask) -> String {
         let tok = L("task.written", tokens(t.tokens))
-        return t.model.map { "\($0) · \(tok)" } ?? tok
+        let base = t.model.map { "\($0) · \(tok)" } ?? tok
+        guard let cost = t.costUSD else { return base }
+        return base + L(cost < 0.01 ? "task.costSmall" : "task.cost", dollars(cost))
+    }
+
+    /// 窄卡用：「opus 5.5 · ≈$1.60」（已写 token 在合计行和中号卡里）；没有花费时退回 detail
+    static func costDetail(_ t: RunningTask) -> String {
+        guard let cost = t.costUSD, cost.isFinite, cost >= 0 else { return detail(t) }
+        let money = cost < 0.01 ? L("task.costSmallBare") : L("task.costBare", dollars(cost))
+        return t.model.map { "\($0) · \(money)" } ?? money
+    }
+
+    private static func dollars(_ value: Double) -> String {
+        String(format: "%.2f", locale: Locale(identifier: "en_US_POSIX"), value)
     }
 
     static func visible(_ tasks: [RunningTask]) -> (shown: [RunningTask], more: Int) {
@@ -317,9 +474,15 @@ enum RunningTaskText {
 
     /// 「Claude，token-dashboard，已跑 12 分钟，opus 4.7，已写 2万 token」
     static func a11y(_ t: RunningTask, now: Date) -> String {
-        let name = t.provider == .codexPlan ? "Codex" : "Claude"
-        let time = isStale(t, now: now) ? L("task.stoppedMin", stoppedMinutes(t, now: now)) : L("task.ranMin", elapsed(t, now: now) / 60)
-        return ([name, t.project, time] + (t.model.map { [$0] } ?? []) + [L("task.writtenTokens", cnCount(t.tokens))]).joined(separator: L("a11y.sep"))
+        let name: String
+        switch t.provider {
+        case .codexPlan: name = "Codex"
+        case .geminiPlan: name = "Gemini"
+        default: name = "Claude"
+        }
+        let time = isStale(t, now: now) ? L("task.stoppedMinA11y", stoppedMinutes(t, now: now)) : L("task.ranMin", max(1, elapsed(t, now: now) / 60))
+        let cost = t.costUSD.map { L($0 < 0.01 ? "task.costSmallA11y" : "task.costA11y", dollars($0)) }
+        return ([name, t.project, time] + (t.model.map { [$0] } ?? []) + [L("task.writtenTokens", cnCount(t.tokens))] + (cost.map { [$0] } ?? [])).joined(separator: L("a11y.sep"))
     }
 }
 
@@ -344,9 +507,9 @@ final class RunningTasksCache: @unchecked Sendable {
             var next: [String: Entry] = [:]
             var out: [RunningTask] = []
             for it in items {
-                let a = try? fm.attributesOfItem(atPath: it.url.path)
-                let mtime = a?[.modificationDate] as? Date ?? .distantPast
-                let size = (a?[.size] as? NSNumber)?.uint64Value ?? 0
+                let a = FileStat.of(it.url)
+                let mtime = a?.mtime ?? .distantPast
+                let size = a?.size ?? 0
                 let e: Entry
                 if let hit = store[it.url.path], hit.mtime == mtime, hit.size == size {
                     e = hit

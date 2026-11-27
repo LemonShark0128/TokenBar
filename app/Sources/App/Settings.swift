@@ -1,9 +1,8 @@
 import AppKit
 import Combine
 import SwiftUI
-import UserNotifications
 
-// ---------------------------------------------------------------- 设置窗：侧栏 + 平台 · 菜单栏与面板 · 提醒 · 通用
+// ---------------------------------------------------------------- 设置窗：侧栏 + 显示 · 提醒 · 平台 · 通用
 
 struct SettingsView: View {
     @ObservedObject var model: UsageModel
@@ -25,15 +24,11 @@ struct SettingsView: View {
     struct LayoutKey: Equatable {
         let sections: [SettingsSection]
         let notes: [String]
-        /// 油箱说明文字（换行数会随平台名、预警开关变）
-        let tank: String
     }
 
     func ctx() -> Ctx {
         let inp = input ?? model.accountsInput
-        var states: [ProviderID: AccountState] = [:]
-        for id in ProviderRegistry.all { states[id] = UsageModel.accountState(for: inp.platforms.first { $0.id == id }) }
-        let added = SettingsLayout.added(states)
+        let (states, added) = UsageModel.accountStates(inp)
         return Ctx(inp: inp, states: states, added: added, main: added.contains(inp.mainID) ? inp.mainID : nil)
     }
 
@@ -41,7 +36,7 @@ struct SettingsView: View {
         let c = ctx()
         let custom = Set(c.added.filter { alertKey($0, c) == "custom" })
         let page = model.settingsPage
-        let sections = SettingsLayout.sections(page, added: c.added, main: c.main, customOpen: custom)
+        let sections = SettingsLayout.sections(page, added: c.added, main: c.main, customOpen: custom, style: model.mbStyle)
         // 侧栏铺满整窗高度：右侧内容决定高度，侧栏画在左边的留空上
         HStack(alignment: .top, spacing: 0) {
             Color.clear.frame(width: kSettingsSidebarWidth, height: 1)
@@ -59,7 +54,7 @@ struct SettingsView: View {
             SettingsSidebar(selected: page, updated: model.data?.nowLocal ?? "—", p: p) { model.settingsPage = $0 }
         }
         // 换页、出现自定义输入框、重新登录说明等：窗口跟着内容重新定高（宽度不变）
-        .onChange(of: LayoutKey(sections: sections, notes: model.reloginNotes.values.map(\.text).sorted(), tank: tankCaption)) { _, _ in
+        .onChange(of: LayoutKey(sections: sections, notes: model.reloginNotes.values.map(\.text).sorted())) { _, _ in
             DispatchQueue.main.async { Hud.refit("settings") }
         }
         // 下拉选中值、平台状态和读数变了也可能让说明折行：数据一变就重新量一次（高度没变时 refit 什么也不做）
@@ -72,40 +67,9 @@ struct SettingsView: View {
 
     @ViewBuilder
     func sectionView(_ sec: SettingsSection, _ c: Ctx) -> some View {
-        if sec.rows.first == .tank {
-            tankGroup(extra: Array(sec.rows.dropFirst()), c)
-        } else {
-            SettingsGroup(title: sec.title, p: p) {
-                ForEach(Array(sec.rows.enumerated()), id: \.offset) { i, row in
-                    rowView(row, first: i == 0, c)
-                }
-            }
-        }
-    }
-
-    var tankCaption: String {
-        let isQuota = ProviderRegistry.meter(model.mainID) == .quota
-        let on = model.balanceAlertCny > 0
-        return isQuota
-            ? (on ? L("set.tank.quotaOn", model.mainName) : L("set.tank.quotaOff", model.mainName))
-            : (on ? L("set.tank.moneyOn", model.mainName) : L("set.tank.moneyOff"))
-    }
-
-    /// 最上面的余额进度条；extra 是并进同一张卡片的行（余额规格，第六批）
-    func tankGroup(extra: [SettingsRowID], _ c: Ctx) -> some View {
-        // 主平台是套餐平台：预警线是剩余百分比（满格 100%），没有「余额规格」
-        let isQuota = ProviderRegistry.meter(model.mainID) == .quota
-        return SettingsGroup(title: SettingsLayout.scaleTitle(main: model.mainID), p: p) {
-            VStack(alignment: .leading, spacing: 8) {
-                TankScale(balance: model.data?.balance.cny ?? 0, full: isQuota ? 100 : model.fuelFullCny,
-                          alert: model.balanceAlertCny, currency: model.data?.balance.currency, percent: isQuota, p: p)
-                Text(tankCaption)
-                    .font(.system(size: 11)).foregroundColor(p.sub)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(.horizontal, 12).padding(.vertical, 12)
-            ForEach(Array(extra.enumerated()), id: \.offset) { _, row in
-                rowView(row, first: false, c)
+        SettingsGroup(title: sec.title, p: p) {
+            ForEach(Array(sec.rows.enumerated()), id: \.offset) { i, row in
+                rowView(row, first: i == 0, c)
             }
         }
     }
@@ -118,8 +82,9 @@ struct SettingsView: View {
         case .mainPlatform:
             SettingsRow(label: L("set.showWhich"), help: SettingsLayout.mainHelp(auto: c.inp.auto, main: c.inp.mainID),
                         first: first, p: p) {
-                DropdownButton(title: L("set.showWhich"), options: SettingsLayout.mainOptions(added: c.added),
-                               selected: SettingsLayout.mainSelection(auto: c.inp.auto, main: c.inp.mainID, added: c.added),
+                // 隐藏的平台不在「显示哪个平台」里（设置的平台列表里仍在，写「已隐藏 · 不刷新」）
+                DropdownButton(title: L("set.showWhich"), options: SettingsLayout.mainOptions(added: SettingsLayout.shown(c.states)),
+                               selected: SettingsLayout.mainSelection(auto: c.inp.auto, main: c.inp.mainID, added: SettingsLayout.shown(c.states)),
                                p: p) { k in model.chooseMain(k) }
             }
         case .account(let id):
@@ -134,7 +99,7 @@ struct SettingsView: View {
             SettingsRow(label: L("set.refresh"), help: L("set.refreshHelp"), first: first, p: p) {
                 DropdownButton(title: L("set.refresh"), options: SettingsLayout.refreshOptions, selected: "\(model.refreshSeconds)",
                                fallback: SettingsLayout.refreshLabel(model.refreshSeconds), p: p) {
-                    model.refreshSeconds = Int($0) ?? 120
+                    model.refreshSeconds = Int($0) ?? 60
                 }
             }
         case .exchangeRate:
@@ -169,10 +134,38 @@ struct SettingsView: View {
                 .foregroundColor(diagnosticsCopied ? p.sub : Accent.blue)
                 .accessibilityLabel(diagnosticsCopied ? L("set.diagnosticsCopied") : L("set.copyDiagnostics"))
             }
+        case .menuBarStyle:
+            SettingsRow(label: L("mb.style"), first: first, p: p) {
+                DropdownButton(title: L("mb.style"), options: SettingsLayout.menuBarStyleOptions,
+                               selected: model.mbStyle, p: p) { model.mbStyle = $0 }
+            }
+        case .menuBarShowRunning:
+            SettingsRow(label: L("mb.showRunning"), help: L("mb.showRunning.help"), first: first, p: p) {
+                PillSwitch(on: model.mbShowRunning, title: L("mb.showRunning")) { model.mbShowRunning.toggle() }
+            }
+            if model.mbShowRunning {
+                SettingsRow(label: L("mb.slots"), first: false, p: p) {
+                    HStack(spacing: 2) {
+                        ForEach(SettingsLayout.menuBarSlotOptions, id: \.key) { option in
+                            Button { model.mbSlots = option.key } label: {
+                                Text(option.label).font(.system(size: 12))
+                                    .padding(.horizontal, 12).padding(.vertical, 5)
+                                    .background(Capsule().fill(model.mbSlots == option.key ? Accent.blue.opacity(0.18) : Color.clear))
+                            }.buttonStyle(.plain)
+                            .accessibilityAddTraits(model.mbSlots == option.key ? .isSelected : [])
+                        }
+                    }.padding(2).background(Capsule().fill(p.track))
+                }
+            }
         case .menuBarMode:
             SettingsRow(label: L("set.menuBarShows"), help: L("set.menuBarShowsHelp"),
                         first: first, p: p) {
                 DropdownButton(title: L("set.menuBarShows"), options: SettingsLayout.menuBarModeOptions, selected: model.mbMode, p: p) { model.mbMode = $0 }
+            }
+        case .panelHome:
+            SettingsRow(label: L("today.setting"), first: first, p: p) {
+                DropdownButton(title: L("today.setting"), options: SettingsLayout.panelHomeOptions,
+                               selected: model.panelHome, p: p) { model.panelHome = $0 }
             }
         case .theme:
             SettingsRow(label: L("set.appearance"), first: first, p: p) {
@@ -187,19 +180,27 @@ struct SettingsView: View {
             SettingsRow(label: L("set.transparency"), help: L("set.transparencyHelp"), first: first, p: p) { TransparencySlider(p: p) }
         case .widget:
             SettingsRow(label: L("set.widget"), help: L("set.widgetHelp"), first: first, p: p) {
-                PillSwitch(on: model.widgetVisible, title: L("set.widget")) { WidgetController.shared.toggle(model) }
+                PillSwitch(on: model.widgetVisible, title: L("set.widget")) { model.toggleWidget() }
             }
-        case .tank:
-            EmptyView()          // 进度条整张卡片由 sectionView → tankGroup 画
-        case .alertHeader(let quota):
-            alertHeader(quota: quota)
+        case .alertStatus(let id):
+            alertStatusRow(id, first: first, c)
         case .alert(let id):
-            alertRow(id, first: first, c)
+            let keyLimit = c.inp.platforms.first { $0.id == id }?.snapshot?.balanceIsKeyLimit == true
+            SettingsRow(label: SettingsLayout.alertLineLabel(id, keyLimit: keyLimit), first: first, p: p) {
+                DropdownButton(title: L("set.alertLineFor", ProviderRegistry.displayName(id)),
+                               options: SettingsLayout.alertOptions(quota: ProviderRegistry.meter(id) == .quota, symbol: symbol(id, c)),
+                               selected: alertKey(id, c), p: p) { pickAlert($0, id) }
+            }
+        case .hourly(let id):
+            SettingsRow(label: L("set.alert.hourlyOver"), help: L("set.alert.hourlyRowHelp"), first: first, p: p) {
+                hourlyButton(id, c)
+            }
         case .alertCustom(let id):
             alertCustomRow(id, first: first, c)
         case .fuelFull:
+            let currency = SettingsLayout.gaugeScaleCurrency(added: c.added, actual: SettingsLayout.balanceCurrencies(c.inp.platforms))
             SettingsRow(label: L("set.fuelFull"), help: L("set.fuelFullHelp"), first: first, p: p) {
-                DropdownButton(title: L("set.fuelFull"), options: SettingsLayout.fuelFullOptions, selected: "\(Int(model.fuelFullCny))", fallback: fmtMoney(model.fuelFullCny, model.data?.balance.currency, 0), p: p) {
+                DropdownButton(title: L("set.fuelFull"), options: SettingsLayout.fuelFullOptions(symbol: currencySymbol(currency)), selected: "\(Int(model.fuelFullCny))", fallback: fmtMoney(model.fuelFullCny, currency, 0), p: p) {
                     model.fuelFullCny = Double($0) ?? model.fuelFullCny
                 }
             }
@@ -210,24 +211,22 @@ struct SettingsView: View {
                     model.alertRepeatHours = Int($0) ?? AlertRepeat.defaultHours
                 }
             }
-        case .runoutAlert:
-            let on = c.inp.settings.quotaRunoutAlert
-            SettingsRow(label: L("set.runout"), help: L("set.runoutHelp"), first: first, p: p) {
-                PillSwitch(on: on, title: L("set.runout")) {
-                    model.updateProviderSettings { $0.quotaRunoutAlert = !on }
+        case .recoveredAlert:
+            let on = c.inp.settings.quotaRecoveredAlert
+            SettingsRow(label: L("set.recovered"), help: L("set.recoveredHelp"), first: first, p: p) {
+                PillSwitch(on: on, title: L("set.recovered")) {
+                    model.updateProviderSettings { $0.quotaRecoveredAlert = !on }
                 }
             }
         case .spikeAlert:
             SettingsRow(label: L("set.spike"), help: L("set.spikeHelp"), first: first, p: p) {
                 PillSwitch(on: model.spikeAlertsOn, title: L("set.spike")) { model.spikeAlertsOn.toggle() }
             }
+        case .quietHours:
+            QuietHoursRow(live: input == nil && model.usageStore != nil && !kRendering,
+                          first: first, p: p)
         }
     }
-
-    // MARK: 提醒页（其余代码在 SettingsAlerts.swift）
-
-    /// 下拉列宽在表头和平台行之间共享，数值与列名都向右对齐。
-    let alertColumnWidth: CGFloat = 90
 
     // MARK: 通用页底部
 
@@ -235,7 +234,7 @@ struct SettingsView: View {
         HStack {
             Spacer()
             Button(L("set.quit")) { model.quitForReal() }
-                .buttonStyle(.plain).font(.system(size: 12)).foregroundColor(Accent.red)
+                .buttonStyle(.plain).font(.system(size: 12)).foregroundColor(Color(nsColor: .systemRed))   // 破坏性操作用系统红，不用提醒色（用户 11-05）
         }
         .padding(.horizontal, 4).padding(.top, 2)
     }

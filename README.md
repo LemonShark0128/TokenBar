@@ -8,17 +8,19 @@
 
 Token Bar 是一个 macOS 菜单栏小工具：在菜单栏里一眼看到 AI 平台还剩多少钱、还剩多少额度、照现在的速度还能用多久。
 
-- **按量付费**：DeepSeek、硅基流动——余额、今日 / 本月花费、近 7 天各模型 token 用量。
-- **套餐额度**：Claude（Pro / Max）、Codex（ChatGPT 套餐）——5 小时窗口和每周额度已用多少、下次什么时候重置。
+- **按量付费**：DeepSeek、硅基流动、PackyAPI——余额、今日 / 本月花费、近 7 天各模型 token 用量；OpenRouter（美元）——今日 / 本月花费、Key 剩余额度；Kimi（月之暗面国内站）——余额，今日 / 本月花费按余额变化估算。
+- **套餐额度**：Claude（Pro / Max）、Codex（ChatGPT 套餐）、Gemini（Google AI 套餐，经 Antigravity CLI）——5 小时窗口和每周额度还剩多少、按时间应剩多少、下次什么时候重置。Claude 可以直接在 App 里登录 claude.ai 读额度，不用装 Claude Code。
+- **「今天」首页**：添加两个以上平台时，面板首页是一张可拖动排序、可拉伸大小的卡片网格。
 - **还能撑多久**：按最近的消耗速度估算剩余可用时间，快用完时提醒（系统通知 + 面板顶部提醒条）。
-- **正在跑的任务**：列出本机 Claude Code / Codex 进行中的会话（项目名、模型、已写 token）。
+- **正在跑的任务**：列出本机 Claude Code / Codex / Antigravity 进行中的会话（项目名、模型、已写 token）；菜单栏自动显示正在跑的平台，两个同时在跑可以并排。
 - 菜单栏、点开的面板、可以挂在桌面上的小组件三种看法；深色 / 浅色跟随系统。
 
 ### 截图
 
+<p><img src="docs/images/menubar.png" width="238" alt="菜单栏：Claude 和 Codex 同时在跑，并排显示"></p>
 <p>
-<img src="docs/images/panel.png" width="300" alt="面板">
-<img src="docs/images/quota-dark.png" width="300" alt="套餐额度（深色）">
+<img src="docs/images/panel.png" width="300" alt="「今天」首页">
+<img src="docs/images/quota-dark.png" width="300" alt="Gemini 套餐额度（深色）">
 </p>
 <p>
 <img src="docs/images/widget.png" width="270" alt="桌面小组件">
@@ -74,19 +76,24 @@ Token Bar **不收集、不上传任何数据**：没有统计、没有崩溃上
 |---|---|
 | `api.deepseek.com`、`platform.deepseek.com` | DeepSeek 余额、用量（用你填的 API Key / 控制台登录凭证） |
 | `bill.siliconflow.cn`、`walletd.siliconflow.cn`、`cloud.siliconflow.cn` | 硅基流动余额、账单（用你的控制台登录凭证） |
+| `api.moonshot.cn` | Kimi 余额（用你填的 API Key） |
+| `openrouter.ai` | OpenRouter 花费、Key 剩余额度、余额（用你填的 API Key） |
+| `www.packyapi.ai` | PackyAPI 余额、花费（用你填的控制台系统访问令牌和用户 ID） |
+| `claude.ai` | Claude 套餐额度——只在你选「登录 claude.ai」来源时（用你粘贴的 sessionKey） |
 | `api.frankfurter.dev` | 美元兑人民币汇率（欧洲央行数据，每天最多一次） |
 | `api.github.com` | 检查更新：看 GitHub 上 Token Bar 的最新版本号（匿名请求，不带任何账号信息，每天最多一次；有新版本只在设置页和右键菜单提示，不自动下载）。设置 → 通用 →「自动检查更新」可以关掉 |
 
-Claude、Codex 的额度不由 Token Bar 联网获取，而是读本机文件和本机命令行（见下）。右键菜单里「打开 … 用量页」只是用你的浏览器打开对应平台的网页。
+除了选「登录 claude.ai」来源的 Claude 套餐，Claude、Codex、Gemini 的额度不由 Token Bar 联网获取，而是读本机文件和本机命令行（见下）。右键菜单里「打开 … 用量页」只是用你的浏览器打开对应平台的网页。
 
-**网页登录**：DeepSeek、硅基流动的「控制台登录」在 App 内一个一次性网页窗口里完成，窗口不保留任何登录状态（不写 cookie 到磁盘），只把需要的那一个凭证存进钥匙串。
+**网页登录**：DeepSeek、硅基流动的「控制台登录」（以及 claude.ai 的备用登录窗口）在 App 内一个一次性网页窗口里完成，窗口不保留任何登录状态（不写 cookie 到磁盘），只把需要的那一个凭证存进钥匙串。
 
-**钥匙串**：一条通用密码，名字是 `com.lemon.deepseek-tokenbar.all`，里面是你添加的平台的 API Key、网页登录凭证（及其过期时间）、硅基流动账号编号。不开 iCloud 同步。
+**钥匙串**：一条通用密码，名字是 `com.lemon.deepseek-tokenbar.all`，里面是你添加的平台的 API Key、网页登录凭证（及其过期时间）、硅基流动账号编号、PackyAPI 用户 ID。不开 iCloud 同步。
 
 **读本机文件（只读）**
 
 - `~/.claude/projects/` 下 Claude Code 的会话记录、`~/.codex/sessions/` 下 Codex 的会话记录：只取模型名、token 数、时间戳、额度读数，以及会话所在文件夹的名字（显示「正在跑的任务」用）；**对话内容一律不解码、不保存、不写日志**。如果你用 `CODEX_HOME` / `CLAUDE_CONFIG_DIR` 把数据放在别处，在设置 → 平台里对应平台的「…」→「数据目录…」选一下（从菜单栏启动的 App 读不到终端里设的环境变量）。
 - `~/Library/Application Support/Claude/plan-usage-history.json`：Claude 桌面 App 自己记的套餐额度。
+- `~/.gemini/antigravity/brain/` 下 Antigravity 的会话记录：同样只取时间戳和结构字段，用来显示「正在跑的任务」。
 
 **会改动的本机文件**
 
@@ -98,6 +105,8 @@ Claude、Codex 的额度不由 Token Bar 联网获取，而是读本机文件和
 **会启动的程序**
 
 - `claude -p /usage`：Claude 套餐选「桌面 App」来源时，定期跑一次你本机已安装的 Claude Code 命令行读取额度（本地命令，不调用模型、不花钱；登录由 claude 自己处理，Token Bar 不读它的登录文件）。它会在 `~/.claude/projects/` 下建一个对应固定工作目录的空文件夹。
+- `codex app-server`：读 Codex 套餐额度和手动重置次数（只查额度，不创建会话、不调用模型；登录由 codex 自己处理）。
+- `agy -p /usage`：添加 Gemini 套餐时，定期跑你本机已安装的 Antigravity CLI 读取额度（不调用模型、不花 token；登录由 agy 自己处理，Token Bar 不读它的登录文件）。
 - `launchctl`：注册 / 注销上面的开机自启。
 
 ### 遇到问题
@@ -128,7 +137,7 @@ bash app/build.sh
 
 [MIT](LICENSE)。
 
-Token Bar 是个人开源项目，与 Anthropic、OpenAI、DeepSeek（深度求索）、硅基流动没有任何关联，也未获得它们的认可。Claude、Codex、ChatGPT、DeepSeek、硅基流动等名称和商标归各自所有者所有。App 里的平台小图标是作者自己画的示意图形，不是官方标志。
+Token Bar 是个人开源项目，与 Anthropic、OpenAI、Google、DeepSeek（深度求索）、硅基流动、月之暗面（Kimi）、OpenRouter、PackyAPI 没有任何关联，也未获得它们的认可。Claude、Codex、ChatGPT、Gemini、Antigravity、DeepSeek、硅基流动、Kimi、OpenRouter、PackyAPI 等名称和商标归各自所有者所有。App 里的平台小图标是作者自己画的示意图形，不是官方标志。
 
 ---
 
@@ -136,10 +145,11 @@ Token Bar 是个人开源项目，与 Anthropic、OpenAI、DeepSeek（深度求�
 
 Token Bar is a macOS menu bar app that shows how much money or quota you have left on your AI platforms, and how long it will last at your current pace.
 
-- **Pay-as-you-go**: DeepSeek and SiliconFlow — balance, today's / this month's spend, 7-day token usage by model.
-- **Plan quotas**: Claude (Pro / Max) and Codex (ChatGPT plans) — how much of the 5-hour and weekly limits you've used, and when they reset.
+- **Pay-as-you-go**: DeepSeek, SiliconFlow and PackyAPI — balance, today's / this month's spend, 7-day token usage by model; OpenRouter (USD) — today's / this month's spend and remaining key limit; Kimi (Moonshot, China site) — balance, with today's / this month's spend estimated from balance changes.
+- **Plan quotas**: Claude (Pro / Max), Codex (ChatGPT plans) and Gemini (Google AI plans, via the Antigravity CLI) — how much of the 5-hour and weekly limits is left, where you should be at this pace, and when they reset. Claude can sign in to claude.ai right in the app — no Claude Code needed.
+- **Today home**: with two or more platforms, the panel opens on a card grid you can reorder and resize.
 - **Runway**: estimates remaining time from recent burn rate and alerts you before you run out (system notification + banner in the panel).
-- **Running tasks**: lists in-progress Claude Code / Codex sessions on this Mac (project, model, tokens written).
+- **Running tasks**: lists in-progress Claude Code / Codex / Antigravity sessions on this Mac (project, model, tokens written); the menu bar automatically shows whichever platform is running, side by side when two are.
 - Menu bar, a pop-up panel, and an optional floating desktop widget; follows system light / dark mode.
 
 > The interface follows your system language: Chinese if your preferred language is Chinese, English otherwise.
@@ -193,18 +203,23 @@ Token Bar **collects and uploads nothing**: no analytics, no crash reporting, no
 |---|---|
 | `api.deepseek.com`, `platform.deepseek.com` | DeepSeek balance and usage (with your API key / console login token) |
 | `bill.siliconflow.cn`, `walletd.siliconflow.cn`, `cloud.siliconflow.cn` | SiliconFlow balance and bills (with your console login token) |
+| `api.moonshot.cn` | Kimi balance (with your API key) |
+| `openrouter.ai` | OpenRouter spend, key limit and balance (with your API key) |
+| `www.packyapi.ai` | PackyAPI balance and spend (with your console access token and user ID) |
+| `claude.ai` | Claude plan quota — only with the "Sign in to claude.ai" source (with the sessionKey you paste) |
 | `api.frankfurter.dev` | USD→CNY exchange rate (ECB data, at most once a day) |
 
-Claude and Codex quotas are read from local files and the local CLI, not fetched by Token Bar over the network. The right-click menu item that opens a platform's usage page simply opens it in your browser.
+Except for the Claude plan's "Sign in to claude.ai" source, Claude, Codex and Gemini quotas are read from local files and local CLIs, not fetched by Token Bar over the network. The right-click menu item that opens a platform's usage page simply opens it in your browser.
 
-**Web login**: DeepSeek / SiliconFlow console logins happen in a one-off in-app web window that keeps no login state on disk; only the one credential needed is saved to the Keychain.
+**Web login**: DeepSeek / SiliconFlow console logins (and the fallback claude.ai login window) happen in a one-off in-app web window that keeps no login state on disk; only the one credential needed is saved to the Keychain.
 
-**Keychain**: one generic password item named `com.lemon.deepseek-tokenbar.all`, holding the API keys, web login tokens (and their expiry) and SiliconFlow account ID for the platforms you add. Not synced to iCloud.
+**Keychain**: one generic password item named `com.lemon.deepseek-tokenbar.all`, holding the API keys, web login tokens (and their expiry) SiliconFlow account ID and PackyAPI user ID for the platforms you add. Not synced to iCloud.
 
 **Files read (read-only)**
 
 - Claude Code session logs under `~/.claude/projects/` and Codex session logs under `~/.codex/sessions/`: only model names, token counts, timestamps, quota readings, and the name of the session's folder (for "running tasks"). **Conversation content is never decoded, stored or logged.** If you keep this data elsewhere via `CODEX_HOME` / `CLAUDE_CONFIG_DIR`, pick the folder in Settings → Platforms → "…" → "Data Folder…" (an app launched from the menu bar can't see environment variables set in your shell).
 - `~/Library/Application Support/Claude/plan-usage-history.json`: quota history recorded by the Claude desktop app.
+- Antigravity session logs under `~/.gemini/antigravity/brain/`: likewise only timestamps and structural fields, for "running tasks".
 
 **Files modified**
 
@@ -216,6 +231,8 @@ Claude and Codex quotas are read from local files and the local CLI, not fetched
 **Processes started**
 
 - `claude -p /usage`: when the Claude plan uses the desktop-app source, Token Bar periodically runs your locally installed Claude Code CLI to read quota (a local command — no model call, no cost; claude handles its own login, Token Bar never reads its credential files). This creates an empty folder under `~/.claude/projects/` for the fixed working directory.
+- `codex app-server`: reads Codex plan quota and manual reset credits (quota only — no session, no model call; codex handles its own login).
+- `agy -p /usage`: when you add the Gemini plan, Token Bar periodically runs your locally installed Antigravity CLI to read quota (no model call, no tokens used; agy handles its own login, Token Bar never reads its credential files).
 - `launchctl`: to register / unregister launch at login.
 
 ### Troubleshooting
@@ -246,4 +263,4 @@ bash app/build.sh
 
 [MIT](LICENSE).
 
-Token Bar is an independent open-source project. It is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, DeepSeek or SiliconFlow. Claude, Codex, ChatGPT, DeepSeek, SiliconFlow and related names are trademarks of their respective owners. Platform icons in the app are the author's own simple drawings, not official logos.
+Token Bar is an independent open-source project. It is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Google, DeepSeek, SiliconFlow, Moonshot (Kimi), OpenRouter or PackyAPI. Claude, Codex, ChatGPT, Gemini, Antigravity, DeepSeek, SiliconFlow, Kimi, OpenRouter, PackyAPI and related names are trademarks of their respective owners. Platform icons in the app are the author's own simple drawings, not official logos.

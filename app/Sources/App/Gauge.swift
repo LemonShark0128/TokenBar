@@ -1,11 +1,9 @@
 import AppKit
-import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- logo：油量式圆形仪表
 
-/// 汽车油量表风格：开口朝下的刻度弧 + 已用弧 + 指针 + 中心轴。
+/// 汽车油量表风格：开口朝下的刻度弧 + 剩余弧 + 指针 + 中心轴。
 /// 菜单栏用 template 图（交给系统着色），面板内用带色版（按油量档位绿/橙/红）。
 enum GaugeIcon {
     static let startDeg = 210.0
@@ -86,54 +84,51 @@ enum GaugeIcon {
         let img = NSImage(size: NSSize(width: pt, height: pt), flipped: false) { rect in
             let color = template ? NSColor.black : (tint ?? .black)
             draw(in: rect, value: value, tint: color, weight: 1.45, trackAlpha: 0.35)
-            if dayBadge {
-                let r: CGFloat = 3.9
-                let c = NSPoint(x: rect.maxX - r, y: rect.minY + r)
-                guard let ctx = NSGraphicsContext.current else { return true }
-                ctx.compositingOperation = .destinationOut           // 先挖一圈缝，角标和弧线分开
-                NSBezierPath(ovalIn: NSRect(x: c.x - r - 1, y: c.y - r - 1, width: 2 * r + 2, height: 2 * r + 2)).fill()
-                ctx.compositingOperation = .sourceOver
-                color.setFill()
-                NSBezierPath(ovalIn: NSRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)).fill()
-                ctx.compositingOperation = .destinationOut           // 「日」字挖空
-                let glyph = NSAttributedString(string: L("badge.day"), attributes: [.font: NSFont.systemFont(ofSize: 5.6, weight: .heavy)])
-                let gs = glyph.size()
-                glyph.draw(at: NSPoint(x: c.x - gs.width / 2, y: c.y - gs.height / 2))
-                ctx.compositingOperation = .sourceOver
-            }
-            if alertBadge, let ctx = NSGraphicsContext.current {
-                let r: CGFloat = 3.9
-                let c = NSPoint(x: rect.maxX - r, y: rect.maxY - r)
-                NSGraphicsContext.saveGraphicsState()
-                ctx.compositingOperation = .destinationOut
-                NSBezierPath(ovalIn: NSRect(x: c.x - r - 1, y: c.y - r - 1, width: 2 * r + 2, height: 2 * r + 2)).fill()
-                ctx.compositingOperation = .sourceOver
-                color.setFill()
-                NSBezierPath(ovalIn: NSRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)).fill()
-                ctx.compositingOperation = .destinationOut
-                let glyph = NSAttributedString(string: "!", attributes: [.font: NSFont.systemFont(ofSize: 7, weight: .heavy)])
-                let gs = glyph.size()
-                glyph.draw(at: NSPoint(x: c.x - gs.width / 2, y: c.y - gs.height / 2))
-                NSGraphicsContext.restoreGraphicsState()
-            }
+            drawBadges(in: rect, color: color, dayBadge: dayBadge, alertBadge: alertBadge)
             return true
         }
         img.isTemplate = template
         return img
     }
 
-    static func levelColor(_ v: Double) -> NSColor {
-        if v <= 0.02 { return NSColor(red: 0.92, green: 0.26, blue: 0.21, alpha: 1) }
-        if v < 0.15 { return NSColor(red: 0.98, green: 0.62, blue: 0.22, alpha: 1) }
-        return NSColor(red: 0.20, green: 0.80, blue: 0.45, alpha: 1)
+    /// 菜单栏图标角标（油量表与平台标志共用）：右下「日」、右上「!」。挖空画法，template 图也能正确显示
+    static func drawBadges(in rect: NSRect, color: NSColor, dayBadge: Bool, alertBadge: Bool) {
+        for (on, text, size, top) in [(dayBadge, L("badge.day"), 5.6, false), (alertBadge, "!", 7.0, true)] where on {
+            guard let ctx = NSGraphicsContext.current else { continue }
+            let r: CGFloat = 3.9
+            let c = NSPoint(x: rect.maxX - r, y: top ? rect.maxY - r : rect.minY + r)
+            NSGraphicsContext.saveGraphicsState()
+            ctx.compositingOperation = .destinationOut           // 先挖一圈缝，角标和图形分开
+            NSBezierPath(ovalIn: NSRect(x: c.x - r - 1, y: c.y - r - 1, width: 2 * r + 2, height: 2 * r + 2)).fill()
+            ctx.compositingOperation = .sourceOver
+            color.setFill()
+            NSBezierPath(ovalIn: NSRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)).fill()
+            ctx.compositingOperation = .destinationOut           // 字挖空
+            let g = NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: size, weight: .heavy)])
+            let gs = g.size()
+            g.draw(at: NSPoint(x: c.x - gs.width / 2, y: c.y - gs.height / 2))
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+
+    /// 三档颜色（油量表、套餐色共用）
+    static let okColor = NSColor(red: 0.20, green: 0.80, blue: 0.45, alpha: 1)
+    static let warnColor = AlertColor.warn
+    static let dangerColor = AlertColor.danger
+
+    /// dark：给定时取固定的深 / 浅色（画进 NSImage 再交给 SwiftUI 的地方要用，否则会按画图那一刻的进程外观取色）；nil = 随外观自动
+    static func levelColor(_ v: Double, dark: Bool? = nil) -> NSColor {
+        if v <= 0.02 { return dark.map(AlertColor.danger(dark:)) ?? dangerColor }
+        if v < 0.15 { return dark.map(AlertColor.warn(dark:)) ?? warnColor }
+        return okColor
     }
 
     /// 套餐：按已用比例（QuotaLevel：≥80% 橙、≥95% 红），颜色同 levelColor 的三档
-    static func quotaColor(_ remaining: Double) -> NSColor {
+    static func quotaColor(_ remaining: Double, dark: Bool? = nil) -> NSColor {
         switch QuotaLevel.severity(remainingFraction: remaining) {
-        case .ok: return levelColor(1)
-        case .warn: return levelColor(0.1)
-        case .danger: return levelColor(0)
+        case .ok: return levelColor(1, dark: dark)
+        case .warn: return levelColor(0.1, dark: dark)
+        case .danger: return levelColor(0, dark: dark)
         }
     }
 }
@@ -142,17 +137,18 @@ struct GaugeLogo: View {
     let value: Double
     var size: CGFloat = 14
     var template: Bool = false
-    /// 套餐平台：弧线和指针画已用，颜色按剩余比例
+    /// 套餐平台：弧线、指针和颜色均按剩余比例
     var quota: Bool = false
-    /// 读屏：给了就读这句；不给时小图标只是装饰（旁边的文字已经写了读数），VoiceOver 跳过
-    var a11yLabel: String? = nil
+    /// 读外观：切换深 / 浅色时重画，图标取对应的提醒色
+    @Environment(\.colorScheme) private var scheme
     var body: some View {
-        Image(nsImage: GaugeIcon.image(value: GaugeGeometry.arcFraction(level: value, quota: quota), size: size * 2, template: template,
-                                       tint: quota ? GaugeIcon.quotaColor(value) : GaugeIcon.levelColor(value)))
+        let dark = scheme == .dark
+        Image(nsImage: GaugeIcon.image(value: GaugeGeometry.arcFraction(level: value), size: size * 2, template: template,
+                                       tint: quota ? GaugeIcon.quotaColor(value, dark: dark) : GaugeIcon.levelColor(value, dark: dark)))
             .resizable()
             .frame(width: size, height: size)
-            .accessibilityLabel(a11yLabel ?? "")
-            .accessibilityHidden(a11yLabel == nil)
+            // 小图标只是装饰（旁边的文字已经写了读数），VoiceOver 跳过
+            .accessibilityHidden(true)
     }
 }
 
@@ -195,14 +191,5 @@ struct LogoBoard: View {
         }
         .padding(14)
         .background(LinearGradient(colors: [p.bgTop, p.bgBottom], startPoint: .top, endPoint: .bottom))
-    }
-}
-
-extension View {
-    func card(_ p: Palette, alt: Bool = false) -> some View {
-        self.padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)   // 区块一律撑满宽度（设置页原先按内容收窄）
-            .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(alt ? p.cardAlt : p.card))
     }
 }

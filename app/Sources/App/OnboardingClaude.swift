@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import SwiftUI
 
 // ---------------------------------------------------------------- 首次引导：Claude 套餐的几页（选来源、桌面 App、终端版钩子）
@@ -13,6 +12,8 @@ extension OnboardingView {
             claudeChooseSource
         } else if claudeChoice == .desktop {
             claudeDesktopStep
+        } else if claudeChoice == .web {
+            claudeWebStep
         } else if let snippet = claudeSnippet {
             VStack(alignment: .leading, spacing: 10) {
                 title(L("ob.claude.notInstalled"), ClaudeHookCopy.unparseable)
@@ -64,7 +65,8 @@ extension OnboardingView {
                 HStack {
                     // 从「选来源」页进来的可以返回重选；从设置的「改用终端版」进来的直接取消
                     Button(presetClaudeChoice == nil ? L("ob.back") : L("ob.cancel")) {
-                        if presetClaudeChoice == nil { message = ""; claudeChoice = nil } else { advance() }
+                        if presetClaudeChoice == nil { message = ""; claudeChoice = nil }
+                        else { Hud.windows["onboarding"]?.performClose(nil) }
                     }.buttonStyle(.plain).foregroundColor(p.sub).font(.system(size: 12)).disabled(busy)
                     Spacer()
                     // 真机 10-17：用户把上面的路径复制给 Claude 让它自己改，其实点按钮就会自动改好（窗口定高，放在按钮旁边不占行）
@@ -100,9 +102,10 @@ extension OnboardingView {
     var claudeChooseSource: some View {
         VStack(alignment: .leading, spacing: 12) {
             title(L("ob.claude.addTitle"), L("ob.claude.whereIntro"))
+            // 三种来源（用户 11/6）：登录 claude.ai 放第一个、推荐（不用装 Claude Code）
             SettingsGroup(title: L("ob.claude.source"), p: p) {
-                sourceRow(.desktop, L("ob.claude.srcDesktop"),
-                          L("ob.claude.srcDesktopDetail"), first: true)
+                sourceRow(.web, L("ob.claude.srcWeb"), L("ob.claude.srcWebDetail"), first: true)
+                sourceRow(.desktop, L("ob.claude.srcDesktop"), L("ob.claude.srcDesktopDetail"))
                 sourceRow(.terminal, L("ob.claude.srcTerminal"),
                           L("ob.claude.srcTerminalDetail"))
             }
@@ -122,9 +125,11 @@ extension OnboardingView {
         let on = claudePick == src
         return VStack(spacing: 0) {
             if !first { Hairline(p: p).padding(.leading, 12) }
-            HStack(alignment: .top, spacing: 10) {
+            // 真按钮：读屏能按、键盘能 Tab 到；选中状态由 isSelected 读，圆点图标不单独念
+            Button { claudePick = src } label: { HStack(alignment: .top, spacing: 10) {
                 Image(systemName: on ? "largecircle.fill.circle" : "circle")
                     .foregroundColor(on ? Accent.blue : p.sub).font(.system(size: 14))
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(name).font(.system(size: 12.5, weight: .medium)).foregroundColor(p.text)
                         .fixedSize(horizontal: false, vertical: true)
@@ -133,50 +138,187 @@ extension OnboardingView {
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
-            .contentShape(Rectangle())
-            .onTapGesture { claudePick = src }
-            .accessibilityElement(children: .combine)
-            .accessibilityAddTraits(on ? [.isSelected, .isButton] : .isButton)
+            .contentShape(Rectangle()) }
+            .buttonStyle(.plain)
+            .accessibilityAddTraits(on ? .isSelected : [])
         }
     }
 
-    /// 桌面来源：不改任何文件，记下来源后直接添加；先查命令行，再看桌面 App 有没有最近的记录，决定结果页怎么说
+    /// 「用本机 Claude Code 查」：不改任何文件，记下来源后直接添加；再查一次命令行，按结果决定结果页怎么说
     func addDesktop() {
         guard preview == nil else { return }
         busy = true
         Task { @MainActor in
             await model.addClaudeDesktop()
             connected.insert(.claudePlan)
-            claudeDesktopHasData = false
-            claudeDesktopViaCLI = false
-            if case .quota = await ClaudeCLIUsage.standard(now: Date()) {
-                claudeDesktopHasData = true
-                claudeDesktopViaCLI = true
-            } else if case .quota = ClaudeAppUsageSource.read(ClaudeAppUsageSource.standardURL, now: Date()) {
-                claudeDesktopHasData = true
-            }
-            busy = false
+            await checkClaudeCLI()
             claudeDesktopAdded = true
         }
     }
 
-    /// 桌面来源的结果页
+    /// 查一次命令行（和桌面 App 的旧记录），定下结果页的情况；查到了顺便让面板马上刷新
+    func checkClaudeCLI() async {
+        busy = true
+        let cli = await ClaudeCLIUsage.standard(now: Date())
+        var desktop = false
+        if case .quota = ClaudeAppUsageSource.read(ClaudeAppUsageSource.standardURL, now: Date()) { desktop = true }
+        let r = ClaudeDesktopResult.of(cli: cli, desktopHasData: desktop)
+        claudeCLIResult = r
+        claudeDesktopViaCLI = r == .gotCLI
+        claudeDesktopHasData = r == .gotCLI || r == .gotDesktop
+        logLine("Claude Code 命令行检查：\(r == .gotCLI ? "读到额度" : r == .needsLogin ? "没登录" : r == .notInstalled ? "没装" : "没查到")")
+        if r == .gotCLI { await model.usageStore?.refresh(.claudePlan) }
+        busy = false
+    }
+
+    /// 「用本机 Claude Code 查」的结果页（proposal-claude-source-copy 乙）：查到了说已添加；
+    /// 没登录给「打开终端登录」「重新检查」；没装给安装说明和「重新检查」，并提示可以返回改用登录 claude.ai
     var claudeDesktopStep: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            title(claudeDesktopAdded ? L("ob.claude.added") : L("ob.adding"),
-                  claudeDesktopViaCLI ? L("ob.claude.gotViaCLI")
-                  : claudeDesktopHasData ? L("ob.claude.gotDesktop")
-                                       : ClaudePlanProvider.desktopWaitingNote + L("common.sentenceSep"))
-            VStack(alignment: .leading, spacing: 5) {
-                bullet(L("ob.claude.noFilesChanged"))
-                bullet(L("ob.claude.liveVsEstimate"))
-                bullet(L("ob.claude.switchHint"))
+        let r = claudeCLIResult ?? (claudeDesktopViaCLI ? .gotCLI : claudeDesktopHasData ? .gotDesktop : .notInstalled)
+        return VStack(alignment: .leading, spacing: 12) {
+            switch r {
+            case .gotCLI, .gotDesktop:
+                title(claudeDesktopAdded ? L("ob.claude.added") : L("ob.adding"),
+                      r == .gotCLI ? L("ob.claude.gotViaCLI") : L("ob.claude.gotDesktop"))
+                VStack(alignment: .leading, spacing: 5) {
+                    bullet(L("ob.claude.noFilesChanged"))
+                    bullet(L("ob.claude.switchHint"))
+                }
+            case .needsLogin:
+                title(L("ob.claude.cliNeedsLogin"), L("ob.claude.cliNeedsLoginNote"))
+                HStack(spacing: 10) {
+                    Button { openClaudeLoginTerminal() } label: { Label(L("ob.claude.cliOpenLogin"), systemImage: "terminal") }
+                    recheckButton
+                }
+            case .notInstalled:
+                title(L("ob.claude.cliMissing"), L("ob.claude.cliMissingNote"))
+                HStack(spacing: 10) {
+                    Button(L("ob.claude.installGuide")) {
+                        NSWorkspace.shared.open(URL(string: ClaudeStatusLineInstaller.installGuideURL)!)
+                    }
+                    recheckButton
+                }
+            case .failed(let why):
+                title(L("ob.claude.cliFailedTitle"), why)
+                recheckButton
+            }
+            if !message.isEmpty {
+                Text(message).font(.system(size: 12)).foregroundColor(p.warnText).fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
             HStack {
+                // 没查到时可以返回改选来源（如改用登录 claude.ai）；从设置的「改用 …」进来的没有选来源页
+                if r != .gotCLI && r != .gotDesktop && presetClaudeChoice == nil {
+                    Button(L("ob.back")) { message = ""; claudeChoice = nil; claudeCLIResult = nil }
+                        .buttonStyle(.plain).foregroundColor(p.sub).font(.system(size: 12)).disabled(busy)
+                }
                 Spacer()
-                Button(OnboardingPlan.stepButton(isLast: isLast)) { advance() }.keyboardShortcut(.defaultAction).disabled(!claudeDesktopAdded)
+                Button(OnboardingPlan.stepButton(isLast: isLast)) { advance() }.keyboardShortcut(.defaultAction)
+                    .disabled(!claudeDesktopAdded || busy)
             }
+        }
+    }
+
+    var recheckButton: some View {
+        Button(busy ? L("ob.checking") : L("ob.claude.cliRecheck")) {
+            guard preview == nil else { return }
+            Task { @MainActor in await checkClaudeCLI() }
+        }.disabled(busy)
+    }
+
+    /// 打开终端并启动 claude（同终端钩子那一步的启动脚本），用户在里面输入 /login
+    func openClaudeLoginTerminal() {
+        guard preview == nil else { return }
+        do {
+            let url = try model.claudeInstaller.writeTerminalLauncher()
+            NSWorkspace.shared.open(url)
+            logLine("已打开终端启动 Claude Code（登录用）")
+        } catch {
+            message = L("ob.terminalFailed", error.localizedDescription)
+        }
+    }
+
+    /// 默认浏览器登录后粘贴 sessionKey；内置登录窗作为备用。验证并保存后才切换来源。
+    var claudeWebStep: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if claudeWebDone {
+                title(L("ob.claude.added"), L("ob.claude.webGot"))
+                VStack(alignment: .leading, spacing: 5) {
+                    bullet(L("ob.claude.webStored"))
+                    bullet(L("ob.claude.switchHint"))
+                }
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        title(L("ob.claude.webTitle"), L("ob.claude.webIntro"))
+                        Button {
+                            guard preview == nil else { return }
+                            NSWorkspace.shared.open(ClaudeWebUsage.loginURL)
+                        } label: {
+                            Label(L("ob.claude.webBrowser"), systemImage: "safari")
+                                .frame(maxWidth: .infinity)
+                        }.controlSize(.large).disabled(busy)
+                        ForEach(["ob.claude.webStep1", "ob.claude.webStep2", "ob.claude.webSafari", "ob.claude.webStep3"], id: \.self) { key in
+                            Text(L(key)).font(.system(size: 12)).foregroundColor(p.text)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        SecureField(L("ob.claude.webPaste"), text: $claudeSessionInput)
+                            .textFieldStyle(.roundedBorder).disabled(busy)
+                            .onSubmit { saveClaudeSession() }
+                        if !message.isEmpty {
+                            Text(message).font(.system(size: 12)).foregroundColor(p.warnText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Button(busy ? L("ob.checking") : L("ob.claude.webSave")) {
+                            saveClaudeSession()
+                        }.disabled(busy)
+                        Text(L("ob.claude.webStored")).font(.system(size: 11)).foregroundColor(p.sub)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button(L("ob.claude.webEmbedded")) {
+                            guard preview == nil else { return }
+                            busy = true; message = ""
+                            model.openWebLogin(.claudePlan, onDone: { ok, msg in
+                                busy = false
+                                if ok {
+                                    claudeSessionInput = ""
+                                    connected.insert(.claudePlan); claudeWebDone = true
+                                } else { message = msg }
+                            }, onCancel: { busy = false }, onPersisted: { claudeSessionInput = "" })
+                        }.buttonStyle(.plain).font(.system(size: 11)).foregroundColor(Accent.blue).disabled(busy)
+                        Text(L("ob.claude.webGoogle")).font(.system(size: 11)).foregroundColor(p.sub)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            Spacer(minLength: 0)
+            HStack {
+                if !claudeWebDone {
+                    // 登录窗开着时不让返回：免得改选别的来源后又在登录窗里登录成功、来源被翻回网页登录（审核建议）
+                    Button(presetClaudeChoice == nil ? L("ob.back") : L("ob.cancel")) {
+                        claudeSessionInput = ""
+                        if presetClaudeChoice == nil { message = ""; claudeChoice = nil }
+                        else { Hud.windows["onboarding"]?.performClose(nil) }
+                    }.buttonStyle(.plain).foregroundColor(p.sub).font(.system(size: 12)).disabled(busy)
+                }
+                Spacer()
+                Button(OnboardingPlan.stepButton(isLast: isLast)) { advance() }.keyboardShortcut(.defaultAction)
+                    .disabled(!claudeWebDone)
+            }
+        }
+    }
+
+    func saveClaudeSession() {
+        guard preview == nil, !busy else { return }
+        busy = true; message = ""
+        let attempt = model.beginClaudeLogin()
+        Task { @MainActor in
+            await model.saveClaudeSession(claudeSessionInput, attempt: attempt,
+                                          onPersisted: { claudeSessionInput = "" }, onDone: { ok, msg in
+                busy = false
+                if ok {
+                    connected.insert(.claudePlan); claudeWebDone = true
+                } else { message = msg }
+            })
         }
     }
 

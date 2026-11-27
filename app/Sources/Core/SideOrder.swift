@@ -3,8 +3,9 @@ import Foundation
 /// 面板「其他平台」的顺序：按近 1 小时活跃度（与自动切换主平台同一套 Activity），最活跃的在最上面。
 /// 面板开着时不重排；名次只在用户下一次打开面板时更新（界面播放挪位置的动画）
 enum SideOrder {
-    /// 活跃度相对「在用」下限的倍数；没有读数按 0
-    static func score(_ a: Activity?) -> Double { a?.multiple ?? 0 }
+    /// 活跃度相对「在用」下限的倍数；没有读数按 0。
+    /// 取到 6 位小数：套餐涨幅是 Double 百分比相减，会带 1e-15 量级的误差，不该让它打破同分（四舍五入保序）
+    static func score(_ a: Activity?) -> Double { ((a?.multiple ?? 0) * 1e6).rounded() / 1e6 }
 
     /// 按活跃度从高到低；同分按平台顺序（都没读数时与原来的顺序一致）
     static func ranked(_ ids: [ProviderID], activity: [ProviderID: Activity]) -> [ProviderID] {

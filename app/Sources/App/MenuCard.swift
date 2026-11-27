@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 右键菜单顶部信息卡
 
@@ -9,7 +8,7 @@ import UserNotifications
 @MainActor
 final class HoverState: ObservableObject { @Published var on = false }
 
-/// 右键菜单顶部的整块信息卡：小油量表 + 余额/可用天数/时速，今日/本月/命中，口径+新鲜度，下面每个辅助平台一行。
+/// 右键菜单顶部的整块信息卡：每个平台一行（状态话同「今天」页），正在跑的任务挂在所属平台下，底部今日实付 + 更新时间。
 /// 颜色跟着菜单本身的深浅走，过时套餐读数使用次要文字色。
 struct MenuInfoCard: View {
     @ObservedObject var model: UsageModel
@@ -20,98 +19,27 @@ struct MenuInfoCard: View {
     private var p: Palette { Palette.of(colorScheme == .dark) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            if let d = model.data, d.balance.isQuota {
-                // 套餐平台：一行文字（已用百分比 + 重置时间），没有今日 / 本月
-                HStack(spacing: 10) {
-                    GaugeLogo(value: model.fuelLevel, size: 30, template: d.quota?.stale == true, quota: true)
-                        .foregroundColor(d.quota?.stale == true ? p.sub.opacity(0.5) : p.text)
-                    if d.quota?.remainingPercent == nil {
-                        // 没有额度数据时是一句引导（如「打开 Claude 桌面 App…」）：允许折行，不截断
-                        LT("menu.quotaNoteLine", model.mainName, d.quota?.note ?? L("codex.noDataNote"))
-                            .font(.system(size: 12.5, weight: .medium)).foregroundColor(.primary).lineLimit(5)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(model.mainQuotaSide?.quotaLine ?? model.mainName)
-                                .font(.system(size: 12.5, weight: .medium)).foregroundColor(d.quota?.stale == true ? p.sub : .primary).lineLimit(1).minimumScaleFactor(0.8)
-                            if let chip = d.runway {
-                                Text(chip.short).font(.system(size: 11.5))
-                                    .foregroundColor(chip.muted ? .secondary : riskTint(chip.severity, ok: .secondary)).lineLimit(1)
-                            }
-                        }
-                    }
-                    Spacer(minLength: 6)
-                    LT("menu.panelLink").font(.system(size: 11.5)).foregroundColor(Accent.blue)
-                        .opacity(hover.on ? 1 : 0.75)
+        VStack(alignment: .leading, spacing: 8) {
+            if let d = model.data {
+                let now = model.fixedNow ?? Date()
+                let rows = MenuCardRows.build(d, running: model.runningTasks, now: now,
+                                              recentAgents: model.fixedNow == nil ? model.recentRunningAgents : nil,
+                                              paygActive: model.menuBarPaygActive)
+                // 每个平台一行（方案甲）：主平台排第一、名称加粗，和其他平台之间一条分隔线
+                ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                    if index == 1 { Divider() }
+                    platformRow(row, now: now)
                 }
-                .mainA11y(d.quota?.remainingPercent == nil
-                          ? A11yText.quotaNoData(provider: model.mainName, note: d.quota?.note)
-                          : A11yText.gaugeValue(base: model.gaugeA11y(d), chipTitle: d.runway?.short, chipDetail: nil)
-                            + (d.quota?.stale == true ? L("panel.noData") : ""),
-                          onOpen: onOpen)
-                runningRows()
-                sideRows(d)
-            } else if let d = model.data {
-                let (cap, spike) = burnCaption(d, fuelFull: model.fuelFullCny, compact: true)
-                HStack(spacing: 10) {
-                    GaugeLogo(value: model.fuelLevel, size: 30)
-                    VStack(alignment: .leading, spacing: 1) {
-                        if d.sides.isEmpty {
-                            Text(fmtMoney(d.balance.cny, d.balance.currency)).font(.num(17, .semibold)).foregroundColor(.primary)
-                        } else {
-                            // 不止一个平台时写明主卡是哪个平台
-                            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                                Text(fmtMoney(d.balance.cny, d.balance.currency)).font(.num(17, .semibold)).foregroundColor(.primary)
-                                Text(model.mainName)
-                                    .font(.system(size: 11)).foregroundColor(.secondary).lineLimit(1)
-                            }
-                        }
-                        Text(d.runway?.short ?? cap).font(.system(size: 11.5))
-                            .foregroundColor(d.runway.map { $0.muted ? .secondary : riskTint($0.severity, ok: .secondary) } ?? (spike ? Accent.orange : .secondary)).lineLimit(1)
-                    }
-                    Spacer(minLength: 6)
-                    LT("menu.panelLink").font(.system(size: 11.5)).foregroundColor(Accent.blue)
-                        .opacity(hover.on ? 1 : 0.75)
-                }
-                .mainA11y(A11yText.gaugeValue(base: model.gaugeA11y(d), chipTitle: d.runway?.short ?? cap, chipDetail: nil),
-                          onOpen: onOpen)
-                HStack(alignment: .top, spacing: 0) {
-                    // 花费未知（只有余额 / 离线）写「—」，不写 ¥0.00
-                    ForEach([(L("panel.today"), d.today.known ? fmtMoney(d.today.costCny, d.balance.currency) : "—"),
-                              (L("panel.month"), d.month.known ? fmtMoney(d.month.costCny, d.balance.currency) : "—"),
-                             (L("panel.cacheHit"), overallHitRate(d.models))], id: \.0) { it in
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(it.0).font(.system(size: 11)).foregroundColor(.secondary)
-                            Text(it.1).font(.num(13, .semibold)).foregroundColor(.primary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(A11yText.stats([(L("panel.today"), d.today.known ? fmtMoney(d.today.costCny, d.balance.currency) : "—"),
-                                                    (L("panel.month"), d.month.known ? fmtMoney(d.month.costCny, d.balance.currency) : "—"),
-                                                    (L("panel.cacheHit"), overallHitRate(d.models))]))
-                HStack(spacing: 6) {
-                    let f = model.freshness
-                    Circle().fill(f.0 == .ok ? Accent.green : (f.0 == .offline ? Accent.red : Accent.orange))
-                        .frame(width: 6, height: 6)
-                    Text("\(sourceLabel(d.today.source) ?? "—") · \(f.1)")
-                        .font(.num(11, .regular)).foregroundColor(.secondary)
-                    Spacer(minLength: 6)
-                }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(L("menu.dataBasisA11y", A11yText.speak("\(sourceLabel(d.today.source) ?? L("source.unknown")) · \(model.freshness.1)")))
-                runningRows()
-                sideRows(d)
+                Divider()
+                footer(d, now: now, shownNotes: Set(rows.filter(\.stateMultiline).compactMap(\.state)))
             } else {
                 HStack(spacing: 8) {
                     Circle().fill(Accent.red).frame(width: 6, height: 6)
-                    Text(model.error ?? (model.needsSetup ? L("a11y.noPlatforms") : L("status.connecting", model.mainName))).font(.system(size: 12)).foregroundColor(.secondary)
+                    Text(model.error ?? (model.needsSetup ? A11yText.noPlatforms(allHidden: !model.hiddenIDs.isEmpty) : L("status.connecting", model.mainName))).font(.system(size: 12)).foregroundColor(.secondary)
                     Spacer()
                     LT("menu.panelLink").font(.system(size: 11.5)).foregroundColor(Accent.blue)
                 }
-                .mainA11y(model.error ?? (model.needsSetup ? L("a11y.noPlatforms") : L("a11y.connecting", model.mainName)), onOpen: onOpen)
+                .mainA11y(model.error ?? (model.needsSetup ? A11yText.noPlatforms(allHidden: !model.hiddenIDs.isEmpty) : L("a11y.connecting", model.mainName)), onOpen: onOpen)
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
@@ -122,64 +50,99 @@ struct MenuInfoCard: View {
         .frame(minWidth: MenuCardHost.width, maxWidth: .infinity)
     }
 
-    /// 辅助平台：每个一行（名称 · 今日花费或异常原因 · 余额；套餐平台是重置时间 · 已用百分比）
-    /// 正在跑的任务：主平台区和其他平台行之间，没有任务时不占地方
-    @ViewBuilder
-    private func runningRows() -> some View {
-        if !model.runningTasks.isEmpty {
-            Divider()
-            RunningTasksSection(tasks: model.runningTasks, fixedNow: model.fixedNow, p: p, compact: true)
-        }
+    /// 状态话颜色：风险红 / 橙优先，其余提醒橙或灰（同今天卡）
+    private func tint(_ row: MenuCardRow) -> Color {
+        riskTint(row.severity, ok: row.warn ? p.warnText : .secondary, p: p)
     }
 
-    @ViewBuilder
-    private func sideRows(_ d: AppData) -> some View {
-        if !d.sides.isEmpty {
-            Divider()
-            ForEach(d.sides) { sd in
-                HStack(spacing: 6) {
-                    Text(sd.name).font(.system(size: 11.5)).foregroundColor(.primary)
-                    // 用完时右边已写「下次重置：…」，中间不再写风险或别的窗口的重置时间（同面板 SideRow）
-                    if let text = sd.riskText, sd.quotaExhausted == nil {
-                        Text(text).font(.system(size: 11)).foregroundColor(riskTint(sd.riskSeverity, ok: .secondary)).lineLimit(1)
-                    } else if sd.needsAttention {
-                        Text(sd.status).font(.system(size: 11)).foregroundColor(Accent.orange).lineLimit(1)
-                    } else if sd.isQuota, sd.quotaExhausted == nil {
-                        if let r = sd.quotaReset {
-                            Text(r).font(.num(11, .regular)).foregroundColor(.secondary).lineLimit(1)
-                        }
-                    } else if let t = sd.todayCost {
-                        LT("panel.todayMoney", fmtMoney(t, sd.currency))
-                            .font(.num(11, .regular)).foregroundColor(.secondary).lineLimit(1)
+    /// 一行：图标 · 名称 · 状态话 · 读数；套餐下挂会话 / 本周细条；正在跑的任务挂在所属平台下
+    private func platformRow(_ row: MenuCardRow, now: Date) -> some View {
+        let alert = row.severity.map { $0 > 0 } ?? false || row.warn
+        let updateHelp = row.dimmed ? StaleTime.help(row.lastUpdated, now: now) : nil
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if let id = row.provider {
+                    Image(nsImage: PlatformGlyph.image(id, size: 12, tint: nil)).renderingMode(.template)
+                        .foregroundColor(alert ? tint(row) : Color(nsColor: PlatformColor.color(id)))
+                        .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1.5 }
+                }
+                Text(row.name).font(.system(size: 12, weight: row.isMain ? .semibold : .regular))
+                    .foregroundColor(.primary).lineLimit(1).fixedSize()
+                if let activity = row.activity {
+                    RunningDot(activity: activity).alignmentGuide(.firstTextBaseline) { $0[.bottom] + 1 }
+                }
+                if let state = row.state, !row.stateMultiline {
+                    AlertLine(glyph: row.glyph, iconSize: 11) {
+                        Text(state).lineLimit(1).truncationMode(.tail)
                     }
+                    .font(.system(size: 11)).foregroundColor(tint(row)).helpIfPresent(updateHelp)
+                }
+                Spacer(minLength: 6)
+                // 有会话 / 本周细条时读数就在细条右边，这里不重复，把位置让给状态话
+                if row.windows.isEmpty {
+                    Text(row.value).font(.num(12, .semibold)).foregroundColor(.primary).opacity(row.dimmed && row.loginHint ? 0.55 : 1).lineLimit(1).fixedSize()
+                }
+            }
+            if let state = row.state, row.stateMultiline {
+                // 没有额度数据时的引导：允许折行，不截断
+                AlertLine(glyph: row.glyph, iconSize: 11) {
+                    Text(state).lineLimit(5).fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.system(size: 11)).foregroundColor(tint(row)).helpIfPresent(updateHelp).padding(.leading, 18)
+            }
+            ForEach(row.windows) { w in
+                HStack(spacing: 6) {
+                    Text(w.title).font(.system(size: 10.5)).foregroundColor(p.sub)
+                        .frame(width: 64, alignment: .leading).lineLimit(1).minimumScaleFactor(0.8)
+                    PaceBar(remaining: w.remaining, pace: w.pace, tint: quotaTint(w.severity), track: p.track, height: 5)
+                    Text(w.value).font(.num(10.5, .regular)).foregroundColor(.primary)
+                        .frame(width: 56, alignment: .trailing).lineLimit(1).minimumScaleFactor(0.8)
+                }
+                .padding(.leading, 18)
+            }
+            ForEach(row.tasks, id: \.sessionKey) { t in
+                let stale = RunningTaskText.isStale(t, now: now)
+                HStack(spacing: 6) {
+                    Text(t.project).font(.system(size: 11)).foregroundColor(.primary).lineLimit(1).truncationMode(.middle)
+                    Text(RunningTaskText.costDetail(t)).font(.system(size: 10.5)).foregroundColor(p.sub).lineLimit(1)
                     Spacer(minLength: 6)
-                    Text(sd.isQuota ? sd.quotaExhausted?.text ?? L("panel.used", quotaUsedPercent(remaining: sd.quotaRemaining))
-                         : fmtMoney(sd.tank, sd.currency))
-                        .font(.num(11.5, .semibold)).foregroundColor(sd.quotaStale ? p.sub : quotaRemainingTint(sd))
-                        .lineLimit(1).layoutPriority(1)
+                    Text(RunningTaskText.clock(t, now: now, short: true)).font(.num(10.5, .regular))
+                        .foregroundColor(stale ? p.warnText : .secondary).lineLimit(1).fixedSize()
                 }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(A11yText.side(sd))
-            }
-            if let t = d.totalTodayCny {
-                HStack {
-                    Spacer()
-                    LT("panel.todayTotal", d.totalIsApprox ? "≈" : "", fmtCNY(t)).font(.num(11, .regular)).foregroundColor(.secondary)
-                        .accessibilityLabel(A11yText.speak(L("panel.todayTotal", d.totalIsApprox ? "≈" : "", fmtCNY(t))))
-                }
+                .padding(.leading, 18)
             }
         }
-    }
-    private func quotaRemainingTint(_ side: AppData.Side) -> Color {
-        if side.quotaExhausted != nil { return .primary }
-        guard side.isQuota, let remaining = side.quotaRemaining else { return .primary }
-        switch QuotaLevel.severity(usedPercent: 100 - remaining) {
-        case .ok: return .primary
-        case .warn: return p.warnText
-        case .danger: return p.dangerText
-        }
+        .opacity(row.dimmed && !row.loginHint ? 0.55 : 1)
+        .helpIfPresent(updateHelp)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(row.a11y)
     }
 
+    /// 底部：今日实付（有按量付费花费时）· 更新时间 · 面板 ›
+    private func footer(_ d: AppData, now: Date, shownNotes: Set<String>) -> some View {
+        let f = model.freshness
+        let lastUpdated = d.mainCardSide?.lastUpdated ?? d.balance.ageS.map { now.addingTimeInterval(-Double($0)) }
+        // 新鲜度只在它就是平台行里已写出的引导时省略；离线 / 过时提示都要留着
+        let showFresh = !shownNotes.contains(f.1) && f.1 != d.quota?.note
+        return HStack(spacing: 6) {
+            if let paid = MenuCardRows.paidLine(d) {
+                Text(paid).font(.num(11, .regular)).foregroundColor(.secondary).lineLimit(1).minimumScaleFactor(0.85)
+            }
+            Spacer(minLength: 6)
+            if showFresh {
+                Circle().fill(f.0 == .ok ? Accent.green : (f.0 == .offline ? Accent.red : Accent.orange))
+                    .frame(width: 6, height: 6).accessibilityHidden(true)
+                Text(f.1).font(.num(11, .regular)).foregroundColor(.secondary).lineLimit(1).minimumScaleFactor(0.85)
+                    .truncationMode(.tail).layoutPriority(1)   // 离线 / 过时提示比实付更要紧
+                    .helpIfPresent(f.0 == .stale || f.0 == .offline ? StaleTime.help(lastUpdated, now: now) : nil)
+            }
+            LT("menu.panelLink").font(.system(size: 11.5)).foregroundColor(Accent.blue)
+                .opacity(hover.on ? 1 : 0.75)
+        }
+        .mainA11y([MenuCardRows.paidLine(d), showFresh ? L("menu.dataBasisA11y", A11yText.speak(f.1)) : nil, L("menu.openPanel")]
+                    .compactMap { $0 }.joined(separator: L("a11y.sep")),
+                  onOpen: onOpen)
+    }
 }
 
 /// 把信息卡塞进 NSMenuItem.view：自己跟踪悬停、自己处理点击（自定义视图的菜单项不会触发 action）
@@ -240,28 +203,28 @@ struct MenuBarPreview: View {
     /// 套餐平台版（Codex 套餐）：写当前会话已用百分比，「今日花费」模式也一样
     var quota = false
     private func item(_ label: String, mode: String, low: Bool = false, spike: Bool = false, value: Double? = nil,
-                      currency: String? = nil, riskHours: Double? = nil, danger: Bool = false, alertBadge: Bool = false,
+                      currency: String? = nil, danger: Bool = false, alertBadge: Bool = false,
                       risk: PlatformRisk? = nil) -> some View {
         let d = model.data
         // 与 StatusBarController.refresh 同一个函数生成文字；图标显示当前平台标志
         let exhausted = quota && value == nil && risk == nil ? model.menuBarQuotaSide?.menuQuota?.exhausted : nil
         let riskTitle = risk.flatMap { MenuBarText.riskTitle($0, mode: mode) }
-        let amount = riskTitle ?? riskHours.map { Runway.compactText(hours: $0) } ?? MenuBarText.title(mode: mode, isQuota: quota, balance: value ?? d?.balance.cny, today: value ?? d?.today.costCny,
+        let amount = riskTitle ?? MenuBarText.title(mode: mode, isQuota: quota, balance: value ?? d?.balance.cny, today: value ?? d?.today.costCny,
                                        quotaUsed: value ?? model.menuBarQuotaSide?.menuQuota?.usedPercent, currency: currency,
                                        exhausted: exhausted)
         let quotaSeverity = MenuBarText.quotaSeverity(isQuota: quota,
             usedPercent: value ?? model.menuBarQuotaSide?.menuQuota?.usedPercent, risk: risk)
-        let quotaColor: Color = quotaSeverity == .danger ? Color(nsColor: .systemRed)
-            : quotaSeverity == .warn ? Color(nsColor: .systemOrange) : .white
+        let quotaColor: Color = quotaSeverity == .danger ? Color(nsColor: AlertColor.danger)
+            : quotaSeverity == .warn ? Color(nsColor: AlertColor.warn) : .white
         let color: Color = exhausted != nil ? .white
-            : quotaSeverity != nil ? quotaColor : danger ? Color(nsColor: .systemRed) : (low || spike || riskHours != nil || riskTitle != nil) ? Color(nsColor: .systemOrange) : .white
+            : quotaSeverity != nil ? quotaColor : danger ? Color(nsColor: AlertColor.danger) : (low || spike || riskTitle != nil) ? Color(nsColor: AlertColor.warn) : .white
         return HStack(spacing: 12) {
             HStack(spacing: 0) {
                 Image(nsImage: PlatformGlyph.menuImage(risk?.id ?? (quota ? .codexPlan : .deepseek), tint: nil,
                                                       dayBadge: mode == "cost" && !quota, alertBadge: alertBadge))
                     .renderingMode(.template).foregroundColor(color)
                 if !amount.isEmpty {
-                    Text(amount).font(Font(kStatusFont)).foregroundColor(color).padding(.leading, 4)
+                    Text(amount).font(Font(kStatusFont)).foregroundColor(.white).padding(.leading, 4)   // 颜色只给图标
                 }
             }
             .padding(.horizontal, 8).frame(height: 24)
@@ -300,12 +263,13 @@ struct MenuBarPreview: View {
                 item("低于预警线", mode: "balance", low: true, value: 8.40)
                 item("用量异常增加", mode: "balance", spike: true)
                 item("只图标 · 用量异常增加（角标 !）", mode: "icon", spike: true, alertBadge: true)
-                item("有风险：跟随最危险的平台，显示可用时长", mode: "balance", risk: Self.paygRisk(.deepseek, hours: 5.6))
-                item("有风险（红）：硅基流动 40m", mode: "balance", danger: true, risk: Self.paygRisk(.siliconflow, hours: 2.0 / 3))
+                // 用户 10-27：按量付费撑不过 12 小时也只写余额 / 今日花费，可用时长在悬停提示和面板里
+                item("撑不过 12 小时：仍写余额", mode: "balance", risk: Self.paygRisk(.deepseek, hours: 5.6))
+                item("撑不过 12 小时 · 今日花费模式：仍写今日花费", mode: "cost", risk: Self.paygRisk(.deepseek, hours: 2.0 / 3))
             }
         }
         .padding(10)
-        .frame(width: quota ? 300 : 430, height: quota ? 286 : 286, alignment: .topLeading)
+        .frame(width: quota ? 300 : 430, height: 286, alignment: .topLeading)
         .background(Color(red: 0.18, green: 0.36, blue: 0.60))
         .environment(\.colorScheme, .dark)
     }

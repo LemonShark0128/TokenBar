@@ -6,8 +6,8 @@ func registerAlertRepeatTests() {
     test("alertRepeatOptionsDefaultSix") {
         try checkEqual(AlertRepeat.options.map(\.key), ["1", "3", "6", "12", "24", "0"])
         try checkEqual(AlertRepeat.options.map(\.label), ["每 1 小时", "每 3 小时", "每 6 小时", "每 12 小时", "每天一次", "只提醒一次"])
-        try checkEqual(AlertRepeat.hours(UserDefaults(suiteName: "tb-test-\(UUID().uuidString)")!), 6)
-        let d = UserDefaults(suiteName: "tb-test-\(UUID().uuidString)")!
+        try checkEqual(AlertRepeat.hours(freshDefaults()), 6)
+        let d = freshDefaults()
         d.set(12, forKey: AlertRepeat.key)
         try checkEqual(AlertRepeat.hours(d), 12)
         d.set(7, forKey: AlertRepeat.key)                     // 不在选项里的旧值：回到默认

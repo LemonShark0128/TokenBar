@@ -132,6 +132,6 @@ func registerUpdateCheckTests() {
     }
     test("settingsGeneralPageHasUpdateRow") {
         let s = SettingsLayout.sections(.general, added: [.deepseek], main: .deepseek, customOpen: [])
-        try checkEqual(s.first?.rows.contains(.updateCheck), true)
+        try checkEqual(s.flatMap(\.rows).contains(.updateCheck), true)
     }
 }

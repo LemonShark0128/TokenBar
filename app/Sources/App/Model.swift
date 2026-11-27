@@ -1,14 +1,35 @@
 import AppKit
 import Combine
 import SwiftUI
-import UserNotifications
 
 // ---------------------------------------------------------------- 状态
 
 @MainActor
 final class UsageModel: ObservableObject {
+    let claudeLoginAttempts = ClaudeLoginAttempts()
+    @Published var todayLayout: [TodayLayoutItem] = []
+    @Published var todayEditing = false
+    var savesTodayLayout = false
+    @Published var panelDetailModel: UsageModel?
+    @Published var detailPlatform: ProviderID?
+    @Published var widgetDetailModel: UsageModel?
+    @Published var widgetDetailPlatform: ProviderID?
+    @Published var panelHome: String = UserDefaults.standard.string(forKey: "panelHome") ?? "today" {
+        didSet { savePref(panelHome, forKey: "panelHome"); onRefit?() }
+    }
     @Published var data: AppData?
-    @Published var bannerDismissal = BannerDismissal.load(.standard)
+    /// 渲染预览不读用户关掉过的预警条（否则用户在正在用的 App 里关掉一条，预览里就少一条）
+    @Published var bannerDismissal = kRendering ? BannerDismissal(dismissed: [:]) : BannerDismissal.load(.standard)
+    /// 读不到钥匙串时面板顶部的横幅（带「重试」；只是锁着时不带）。出现 / 消失要重新量面板高度
+    @Published var keychainBanner: KeychainBanner? {
+        didSet { if oldValue != keychainBanner { onRefit?() } }
+    }
+
+    /// 面板「重试」：清掉记住的读取失败后重读钥匙串（系统会再弹一次授权框）
+    func retryKeychain() {
+        guard let s = usageStore else { return }
+        Task { @MainActor in await s.retryKeychain() }
+    }
 
     var visibleBanner: AppData.RiskBanner? {
         data?.banner.flatMap { bannerDismissal.hides($0) ? nil : $0 }
@@ -25,11 +46,15 @@ final class UsageModel: ObservableObject {
 
     /// 第一期起数据来自 UsageStore（不再请求 Python 采集服务）；mainState 是主平台的原始状态
     var usageStore: UsageStore?
+    /// 被动的详情模型借用上层的表盘刻度币种（见 gaugeScale）；nil = 自己算
+    var gaugeScaleFrom: (() -> String?)?
     @Published var mainState: PlatformState?
     /// 菜单栏平台的一行数据（数字取它，不取主平台）；没有 store（离屏预览）时为 nil，回落到主平台
     @Published var menuBarSide: AppData.Side?
     /// 还没有任何平台凭据：面板显示「添加第一个平台」
     @Published var needsSetup = false
+    /// 暂时隐藏的平台（今天页底部「已隐藏：… · 显示」）；都隐藏了时 needsSetup 也为真，面板写「平台都隐藏了」
+    @Published var hiddenIDs: [ProviderID] = []
     /// 标题下的「已自动切换」提示（面板出现时从 UsageStore 取，3 秒后淡出）
     @Published var switchNotice: String? {
         didSet { switchNoticeGeneration += 1 }
@@ -50,6 +75,8 @@ final class UsageModel: ObservableObject {
     var fixedNow: Date?
     /// 渲染预览固定时区（菜单栏读数里的「10:13 重置」不随本机时区变）；真 App 为 nil
     var fixedTimeZone: TimeZone?
+    /// 低位窗口恢复提醒的记忆：持久化保存
+    var recoveryMemory = QuotaRecoveryMemory.load(.standard)
     /// 已经提醒过「额度用完」的窗口：持久化保存，重启后同一窗口不重复提醒
     var exhaustedMemory = ExhaustedAlertMemory.load(.standard)
     /// 本次运行是否已经在日志里记过「已读到 Codex 额度」
@@ -58,15 +85,23 @@ final class UsageModel: ObservableObject {
         didSet { if panelShown != oldValue { visibilityChanged(shown: panelShown) } }
     }
     /// 本机 Claude Code / Codex 用量（近 7 天，按日期 × 模型）；后台线程读，最多每 5 分钟一次
+    var localBreakdowns: [ProviderID: DailyModelBreakdown] = [:]
     var localUsage: [ProviderID: DailyModelTokens] = [:]
     var localThrottle = LocalUsageThrottle()
-    /// 本机正在跑的 Claude Code / Codex 轮次：每 10 或 30 秒在后台扫一次（RunningScanCadence），只在内存里（离屏预览直接设）
-    @Published var runningTasks: [RunningTask] = []
+    /// 本机正在跑的 Claude Code / Codex 轮次：按文件事件和 2 / 10 秒节奏在后台扫描，只在内存里（离屏预览直接设）
+    @Published var runningTasks: [RunningTask] = [] {
+        didSet { panelDetailModel?.runningTasks = runningTasks }
+    }
     var runningTimer: AnyCancellable?
-    /// 在跑任务扫描当前的间隔（RunningScanCadence：10 或 30 秒）
-    var runningScanEvery: TimeInterval = 0
-    /// 桌面 App 额度记录的变化时间（文件没变不再解析）
-    let desktopProbe = DesktopActivityProbe()
+    /// 在跑任务扫描当前的间隔（2 / 10 秒，nil 表示仅事件和兜底）
+    var runningScanEvery: TimeInterval?
+    var runningFallbackTimer: AnyCancellable?
+    var logWatcher: AgentLogWatcher?
+    var refreshPause = RefreshPauseState()
+    var runningScanBusy = false
+    var runningFullScanPending = false
+    /// 最近一次监听的 AgentDirs，用于设置变化时重建
+    var monitoredAgentDirs: AgentDirs?
     var runningGen = 0
     /// 本机日志逐文件的解析缓存：没变的文件不再打开（传进后台读取任务）
     let localCache = LocalUsageCache()
@@ -81,7 +116,7 @@ final class UsageModel: ObservableObject {
 
     @Published var themeMode: ThemeMode {
         didSet {
-            UserDefaults.standard.set(themeMode.rawValue, forKey: "themeMode")
+            savePref(themeMode.rawValue, forKey: "themeMode")
             applyAppAppearance()
         }
     }
@@ -90,19 +125,20 @@ final class UsageModel: ObservableObject {
 
     @Published var refreshSeconds: Int {
         didSet {
-            UserDefaults.standard.set(refreshSeconds, forKey: "refreshSeconds")
+            savePref(refreshSeconds, forKey: "refreshSeconds")
             restartTimer()
         }
     }
     @Published var launchAtLogin: Bool
-    @Published var showSettings = false
-    /// 设置窗当前页、「高级」是否展开、选了「自定义」预警线的非主平台（只在内存里，不存）
-    @Published var settingsPage: SettingsPage = .platform
+    /// 设置窗当前页、选了「自定义」预警线的平台（只在内存里，不存；值不在预设档里时重启后照样显示自定义）
+    @Published var settingsPage: SettingsPage = .display
     @Published var alertCustomOpen: Set<ProviderID> = []
     /// 面板（popover）高度：每次打开时按内容量出来，不再写死 820
     @Published var panelHeight: CGFloat = 820
     /// 面板里「Token 明细」展开与否（展开后要重新定高 → onRefit）
     @Published var detailOpen = false
+    /// Offline rendering only: the card whose resize outline is shown.
+    var todayResizePreview: String? = nil
     /// 面板「近 7 天 token」选中的日期；nil = 今天。关面板时回到今天
     @Published var trendPick: String?
     var onRefit: (() -> Void)?
@@ -116,48 +152,49 @@ final class UsageModel: ObservableObject {
     @Published var widgetVisible = false {
         didSet { if widgetVisible != oldValue { visibilityChanged(shown: widgetVisible) } }
     }
+    /// 菜单栏样式：classic（经典文字）/ bars（竖条）
+    @Published var mbStyle: String {
+        didSet { savePref(mbStyle, forKey: "mbStyle") }
+    }
+    @Published var menuBarPaygActive: Set<ProviderID> = []
+    @Published var recentRunningAgents: Set<ProviderID> = []
+    @Published var menuBarLastActivity: [ProviderID: Date] = [:]
+    @Published var mbSlots: String {
+        didSet { savePref(mbSlots, forKey: "mbSlots") }
+    }
+    @Published var mbShowRunning: Bool {
+        didSet { savePref(mbShowRunning, forKey: "mbShowRunning") }
+    }
     /// 菜单栏显示什么：balance（余额）/ cost（今日花费）/ icon（只显示图标）—— 不再轮播
     @Published var mbMode: String {
-        didSet { UserDefaults.standard.set(mbMode, forKey: "mbMode") }
+        didSet { savePref(mbMode, forKey: "mbMode") }
     }
     /// 小组件当前页：balance（余额）/ tokens（今日 Token），在小组件里点切换
     @Published var widgetPage: String {
-        didSet { UserDefaults.standard.set(widgetPage, forKey: "widgetPage") }
+        didSet { savePref(widgetPage, forKey: "widgetPage") }
     }
-    /// 异常时从屏幕顶部弹出提醒条（替代原来常驻的顶部状态条）
     /// 花费飙升（近 1 小时是平时的 N 倍）时也提醒：默认关，打开后弹通知 / 提醒条、菜单栏加橙点
     @Published var spikeAlertsOn: Bool = UserDefaults.standard.bool(forKey: StatusPresenter.spikeAlertsKey) {
-        didSet { UserDefaults.standard.set(spikeAlertsOn, forKey: StatusPresenter.spikeAlertsKey) }
+        didSet { savePref(spikeAlertsOn, forKey: StatusPresenter.spikeAlertsKey) }
     }
     /// 余额 / 额度一直低于预警线时隔多久再提醒（小时，0 = 只提醒一次），默认 6
     @Published var alertRepeatHours: Int = AlertRepeat.hours(.standard) {
-        didSet { UserDefaults.standard.set(alertRepeatHours, forKey: AlertRepeat.key) }
+        didSet { savePref(alertRepeatHours, forKey: AlertRepeat.key) }
     }
     var onOpenPanel: (() -> Void)?
     @Published var selectedModel: String?
-    @Published var trendModel: String?
-    @Published var openedDay: AppData.Day?
     @Published var fuelFullCny: Double {
-        didSet { UserDefaults.standard.set(fuelFullCny, forKey: "fuelFullCny") }
+        didSet { savePref(fuelFullCny, forKey: "fuelFullCny") }
     }
 
-    /// 主平台的预警线（0 = 关闭）。唯一数据源是 ProviderSettings.lowAlerts；这里是它的镜像，
-    /// 通知、提醒条、菜单栏橙色照旧读它。设置里「油箱」的预警线改的就是主平台这一项。
-    /// 低于它就弹一次通知；充回线上再重新武装。
-    @Published var balanceAlertCny: Double {
-        didSet {
-            guard !syncingAlert else { return }
-            updateProviderSettings { s in
-                s.lowAlerts[self.mainID] = self.balanceAlertCny > 0
-                    ? Decimal(string: String(self.balanceAlertCny), locale: Locale(identifier: "en_US_POSIX")) : nil
-            }
-        }
+    /// 正在显示的平台的预警线（0 = 关闭）：只存在 ProviderSettings.lowAlerts[mainID] 一处，这里现读（不再有镜像）。
+    /// 菜单栏橙色读它；改预警线走 updateProviderSettings
+    var balanceAlertCny: Double {
+        if let renderAlert { return renderAlert }
+        return ProviderSettings.load(.standard).lowAlerts[mainID].map { NSDecimalNumber(decimal: $0).doubleValue } ?? 0
     }
-    var syncingAlert = false
-    /// 设置页里选的是「自定义」金额
-    @Published var balanceAlertCustom: Bool {
-        didSet { UserDefaults.standard.set(balanceAlertCustom, forKey: "balanceAlertCustom") }
-    }
+    /// 离屏渲染：直接给定正在显示的平台的预警线，不读写本机设置
+    var renderAlert: Double?
 
     /// 面板右上角 × 只关面板（由状态栏控制器注入，程序继续在后台跑）
     var onClosePanel: (() -> Void)?
@@ -168,6 +205,9 @@ final class UsageModel: ObservableObject {
     /// 近 1 小时花费超过近 7 天日均时速的 3 倍 → 提醒用量异常增加，6 小时内只提醒一次
     /// 按平台记的提醒状态（每个平台的预警线各自提醒；换主平台不串）
     var platformAlerts = PlatformAlertTracker.load(.standard)
+    var pendingAlerts: [PendingAlert] = []
+    var alertFlushScheduled = false
+    var notificationDelegate: AlertNotificationDelegate?
 
     /// 真正的退出：先摘掉看门狗 job 再退，否则 10 秒后会被重新拉起
     func quitForReal() {
@@ -190,10 +230,12 @@ final class UsageModel: ObservableObject {
         didSet { UpdateCheck.setEnabled(autoUpdateCheck, .standard); logLine("自动检查更新：\(autoUpdateCheck ? "开" : "关")") }
     }
     var okCount = 0
-    let startedAt = Date()
 
-    init() {
+    init(passive: Bool = false) {
         let d = UserDefaults.standard
+        // 渲染预览不读本机保存的「今天」布局：否则预览随正在用的 App 里拖过的卡片顺序变（11/6 第 8 轮 8 张预览因此对不上）
+        todayLayout = kRendering ? [] : TodayLayout.decode(d.data(forKey: "todayLayout")) ?? []
+        savesTodayLayout = !passive && !kRendering
         let resolvedTheme: ThemeMode
         if let raw = d.string(forKey: "themeMode"), let m = ThemeMode(rawValue: raw) {
             resolvedTheme = m
@@ -203,33 +245,38 @@ final class UsageModel: ObservableObject {
             resolvedTheme = .system
         }
         themeMode = resolvedTheme
-        d.set(resolvedTheme.rawValue, forKey: "themeMode")
-        let rs = d.object(forKey: "refreshSeconds") as? Int ?? 30
+        if !passive && !kRendering { d.set(resolvedTheme.rawValue, forKey: "themeMode") }     // 渲染预览不写用户的设置
+        let rs = d.object(forKey: "refreshSeconds") as? Int ?? 60
         refreshSeconds = [60, 120, 300].contains(rs) ? rs : 60     // 没存过或旧的 30 秒：按 60 秒（最短取数间隔）
         fuelFullCny = d.object(forKey: "fuelFullCny") as? Double ?? 50
-        // 预警线来自 ProviderSettings（含旧 balanceAlertCny 的一次性迁移）；启动时主平台先按 DeepSeek 读，store 就绪后会同步
-        balanceAlertCny = ProviderSettings.load(d).lowAlerts[.deepseek].map { NSDecimalNumber(decimal: $0).doubleValue } ?? 0
-        balanceAlertCustom = d.object(forKey: "balanceAlertCustom") as? Bool ?? false
         // 旧版是多选 + 轮播；迁移成单选：只勾了「今日花费」的沿用花费，其余一律显示余额
+        mbStyle = SettingsLayout.menuBarStyle(d.string(forKey: "mbStyle"))
+        mbSlots = SettingsLayout.menuBarSlotMode(d.string(forKey: "mbSlots")).rawValue
+        mbShowRunning = SettingsLayout.menuBarShowRunning(d.object(forKey: "mbShowRunning") as? Bool)
         mbMode = d.string(forKey: "mbMode")
             ?? ((d.object(forKey: "mbShowCost") as? Bool ?? false) && !(d.object(forKey: "mbShowBalance") as? Bool ?? true)
                 ? "cost" : "balance")
-        widgetPage = d.string(forKey: "widgetPage") ?? "balance"
-        launchAtLogin = FileManager.default.fileExists(atPath: kHome + "/Library/LaunchAgents/\(kGuardianLabel).plist")
+        widgetPage = d.string(forKey: "widgetPage") ?? ""
+        launchAtLogin = FileManager.default.fileExists(atPath: kGuardianPlistPath)
         // 离屏预览只用固定数据：不写采集配置、不启动服务或后台刷新。
-        guard !kRendering else { return }
+        guard !kRendering && !passive else { return }
         requestNotificationAuthOnce()
-        // 刷新由 AppMain 紧接着 attach 的 UsageStore 调度
+        // 数据刷新由 AppMain 随后 attach 的 UsageStore 调度；这里只启动汇率刷新
         startExchangeRateRefresh()
-        // 睡眠唤醒后立刻刷新一次，避免醒来先看到旧数字
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            // 回调在主队列上，但闭包被声明成 @Sendable：用 Task { @MainActor } 让编译器检查
-            Task { @MainActor in
-                guard let self = self else { return }
-                logLine("系统唤醒，立即刷新")
-                self.systemIsDark = StatusTheme.systemIsDark()
-                self.fetch()
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.screensDidSleepNotification, NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.willSleepNotification] {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.setRefreshPaused(true) }
+            }
+        }
+        for name in [NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification, NSWorkspace.didWakeNotification] {
+            workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.setRefreshPaused(false) }
+            }
+        }
+        for (name, paused) in [("com.apple.screenIsLocked", true), ("com.apple.screenIsUnlocked", false)] {
+            DistributedNotificationCenter.default().addObserver(forName: Notification.Name(name), object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.setRefreshPaused(paused) }
             }
         }
         // 跟随系统时：系统外观一变就更新（进而触发界面重绘）
@@ -262,24 +309,23 @@ final class UsageModel: ObservableObject {
     }
 
     var trendModelKey: String? {
-        guard let ms = data?.models, !ms.isEmpty else { return nil }
-        if let k = trendModel, ms.contains(where: { $0.key == k }) { return k }
-        return ms.first?.key
+        data?.models.first?.key
     }
 
-    /// 手动刷新：交给 UsageStore（结果经 applyStore 回到界面）
-    func fetch() {
+    /// 立即刷新：交给 UsageStore（结果经 applyStore 回到界面）。
+    /// resetSlowdown：点「刷新」按钮传 true（按量付费平台回到设置的间隔）；打开面板、网络恢复不清零放慢
+    func fetch(resetSlowdown: Bool = false) {
         guard let s = usageStore else { return }
         updating = true
         Task { @MainActor in
-            await s.refresh()
+            await s.refresh(resetSlowdown: resetSlowdown)
             self.updating = false
         }
     }
 
     /// 「开机自动启动」= 注册/注销守护 job（同一个 job 负责开机自启 + 异常退出自动重启）
     func toggleAutoStart() {
-        let path = kHome + "/Library/LaunchAgents/\(kGuardianLabel).plist"
+        let path = kGuardianPlistPath
         UserDefaults.standard.set(true, forKey: kAutoStartChosenKey)
         if launchAtLogin {
             // ⚠️ 不能 bootout：本实例多半就是这个 job 拉起的，bootout 会把自己一起杀掉（实测图标直接消失）。

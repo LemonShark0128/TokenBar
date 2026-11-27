@@ -240,6 +240,7 @@ func registerClaudeAppUsageSourceTests() {
         let far = QuotaWindow(kind: .weekly, usedPercent: 100, resetsAt: at("2026-10-20T10:00:00Z"), windowMinutes: 10080,
                               resetIsEstimated: true)
         try checkEqual(QuotaText.resetText(far, now: now, timeZone: tz), "约 周二 10:00 重置（推算）")
+        try checkEqual(QuotaText.resetText(far, now: now, timeZone: tz, restore: true), "约 周二 10:00 恢复（推算）")
         try checkEqual(QuotaText.exhausted(name: "Claude 套餐", window: far, now: now, timeZone: tz),
                        "Claude 套餐 本周额度已用完，约 周二 10:00 恢复（推算）")
     }
@@ -282,12 +283,13 @@ func registerClaudeAppUsageSourceTests() {
         // 老用户迁移：没存过时，钩子装好了当终端，否则当桌面
         try checkEqual(ClaudePlanSource.resolve(stored: nil, hookInstalled: installed(true)), .terminal)
         try checkEqual(ClaudePlanSource.resolve(stored: nil, hookInstalled: installed(false)), .desktop)
-        try checkEqual(ClaudePlanSource.resolve(stored: "web", hookInstalled: installed(false)), .desktop)
+        try checkEqual(ClaudePlanSource.resolve(stored: "web", hookInstalled: installed(false)), .web)      // 11/6 起认得网页来源
+        try checkEqual(ClaudePlanSource.resolve(stored: "cloud", hookInstalled: installed(false)), .desktop)
         try checkEqual(ClaudePlanSource.defaultsKey, "claudePlan.source")
     }
 
     test("claudeSourceLoadPersistsMigration") {
-        let suite = "tb claude source \(UUID().uuidString)"
+        let suite = testSuiteName("claude-source")
         let d = UserDefaults(suiteName: suite)!
         defer { d.removePersistentDomain(forName: suite) }
         try checkEqual(ClaudePlanSource.load(d, hookInstalled: { true }), .terminal)
@@ -318,7 +320,7 @@ func registerClaudeAppUsageSourceTests() {
         guard case .success(let s0) = await fetch(p) else { throw TestFailure(description: "应为 success") }
         try checkEqual(s0.quota, nil)
         try checkEqual(s0.quotaNote, ClaudePlanProvider.desktopWaitingNote + "。" + ClaudePlanProvider.cliMissingHint)
-        try checkEqual(ClaudePlanProvider.desktopWaitingNote, "打开 Claude 桌面 App，Token Bar 会在它下次记录额度后显示（通常 15 分钟内）")
+        try checkEqual(ClaudePlanProvider.desktopWaitingNote, "还没读到额度")
         try Data("{\"version\":2,\"samples\":[{\"t\":\(ms(ago(600))),\"u\":{\"fh\":30}}]}".utf8).write(to: app)
         guard case .success(let s1) = await fetch(p), let q1 = s1.quota else { throw TestFailure(description: "应读到额度") }
         try checkEqual(q1.windows.map(\.usedPercent), [30])
@@ -364,29 +366,30 @@ func registerClaudeAppUsageSourceTests() {
         func titles(_ src: ClaudePlanSource, main: Bool) -> [String] {
             SettingsLayout.accountActions(.claudePlan, state: .ok, isMain: main, claudeSource: src).map(\.title)
         }
-        try checkEqual(titles(.terminal, main: true), ["重装状态栏钩子", "改用 Claude 桌面 App", "数据目录…", "移除…"])
-        try checkEqual(titles(.desktop, main: true), ["改用终端版 Claude Code", "数据目录…", "移除…"])
-        try checkEqual(titles(.desktop, main: false), ["固定显示它", "改用终端版 Claude Code", "数据目录…", "移除…"])
+        // 三种来源（11/6 加了登录 claude.ai）：菜单里给另外两种
+        try checkEqual(titles(.terminal, main: true), ["重装状态栏钩子", "改用登录 claude.ai", "改用本机 Claude Code 查", "数据目录…", "移除…"])
+        try checkEqual(titles(.desktop, main: true), ["改用登录 claude.ai", "改用终端版 Claude Code", "数据目录…", "移除…"])
+        try checkEqual(titles(.desktop, main: false), ["固定显示它", "改用登录 claude.ai", "改用终端版 Claude Code", "数据目录…", "移除…"])
         let t = SettingsLayout.menuActions(.claudePlan, state: .ok, isMain: false, claudeSource: .terminal, hookGone: true)
-        try checkEqual(t.map(\.title), ["固定显示它", "改用 Claude 桌面 App", "数据目录…", "移除…"])
+        try checkEqual(t.map(\.title), ["固定显示它", "改用登录 claude.ai", "改用本机 Claude Code 查", "数据目录…", "移除…"])
         let active = SettingsLayout.menuActions(.claudePlan, state: .ok, isMain: true, claudeSource: .terminal, hookGone: false)
-        try checkEqual(active.map(\.kind), [.reinstallHook, .switchClaudeSource, .dataDir, .remove])
+        try checkEqual(active.map(\.kind), [.reinstallHook, .switchClaudeSource(.web), .switchClaudeSource(.desktop), .dataDir, .remove])
         let d = SettingsLayout.menuActions(.claudePlan, state: .ok, isMain: false, claudeSource: .desktop, hookGone: false)
-        try checkEqual(d.map(\.title), ["固定显示它", "改用终端版 Claude Code", "数据目录…", "移除…"])
+        try checkEqual(d.map(\.title), ["固定显示它", "改用登录 claude.ai", "改用终端版 Claude Code", "数据目录…", "移除…"])
     }
 
     test("claudeSourceAccountDetail") {
         let r = AccountReading.session(59.4)
         try checkEqual(SettingsLayout.accountDetail(.claudePlan, state: .ok, reading: r, claudeSource: .desktop),
-                       "5 小时窗口已用 41% · 来自 Claude 桌面 App")
+                       "5 小时窗口剩 59% · 来自本机 Claude Code")
         try checkEqual(SettingsLayout.accountDetail(.claudePlan, state: .ok, reading: nil, claudeSource: .desktop),
-                       "来自 Claude 桌面 App · 打开它后通常 15 分钟内显示额度")
+                       "来自本机 Claude Code · 还没读到额度：要在终端登录过 Claude Code（运行 claude，输入 /login）")
         try checkEqual(SettingsLayout.accountDetail(.claudePlan, state: .ok, reading: r, claudeSource: .terminal),
-                       "5 小时窗口已用 41% · 来自终端版 Claude Code")
+                       "5 小时窗口剩 59% · 来自终端版 Claude Code")
         try checkEqual(SettingsLayout.accountDetail(.claudePlan, state: .connecting, reading: nil, claudeSource: .terminal),
                        "来自终端版 Claude Code · 等你在终端里用一次")
         try checkEqual(SettingsLayout.accountDetail(.claudePlan, state: .offline, reading: nil, claudeSource: .desktop),
-                       "来自 Claude 桌面 App")
+                       "来自本机 Claude Code")
         try checkEqual(SettingsLayout.accountDetail(.claudePlan, state: .ok, reading: r, stale: true, claudeSource: .terminal),
                        "来自终端版 Claude Code")
     }
@@ -399,15 +402,18 @@ func registerClaudeAppUsageSourceTests() {
     }
 
     test("claudeSourceLabels") {
-        try checkEqual(ClaudePlanSource.desktop.label, "来自 Claude 桌面 App")
+        // 「桌面」来源实际是跑本机 Claude Code 命令行（11/6 proposal-claude-source-copy 乙：改名，不再说桌面 App）
+        try checkEqual(ClaudePlanSource.desktop.label, "来自本机 Claude Code")
         try checkEqual(ClaudePlanSource.terminal.label, "来自终端版 Claude Code")
-        try checkEqual(ClaudePlanSource.desktop.switchTitle, "改用终端版 Claude Code")
-        try checkEqual(ClaudePlanSource.terminal.switchTitle, "改用 Claude 桌面 App")
+        try checkEqual(ClaudePlanSource.web.label, "来自 claude.ai 登录")
+        try checkEqual(ClaudePlanSource.terminal.switchToTitle, "改用终端版 Claude Code")
+        try checkEqual(ClaudePlanSource.desktop.switchToTitle, "改用本机 Claude Code 查")
+        try checkEqual(ClaudePlanSource.web.switchToTitle, "改用登录 claude.ai")
     }
 
     test("claudeMenuBarTooltipNote") {
         try checkEqual(MenuBarText.quotaTooltip(provider: "Claude 套餐", reading: nil, note: ClaudePlanProvider.desktopWaitingNote),
-                       "Claude 套餐 额度未知 · 打开 Claude 桌面 App，Token Bar 会在它下次记录额度后显示（通常 15 分钟内）")
+                       "Claude 套餐 额度未知 · 还没读到额度")
         try checkEqual(MenuBarText.quotaTooltip(provider: "Claude 套餐", reading: nil), "Claude 套餐 额度未知")
     }
 

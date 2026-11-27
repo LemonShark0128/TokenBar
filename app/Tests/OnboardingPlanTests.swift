@@ -104,8 +104,51 @@ func registerOnboardingPickCheckTests() {
         try checkEqual(OnboardingPlan.pickCheck(on: false, added: false, state: nil), .off)
     }
     test("pickDetailForAdded") {
-        try checkEqual(OnboardingPlan.addedDetail(on: true, state: .ok), "已连接")
-        try checkEqual(OnboardingPlan.addedDetail(on: true, state: .invalid), "已添加 · 已失效，需要重新登录")
-        try checkEqual(OnboardingPlan.addedDetail(on: false, state: .ok), "已添加 · 取消勾选后会移除")
+        try checkEqual(OnboardingPlan.addedDetail(on: true, state: .ok, id: .deepseek), "已连接")
+        try checkEqual(OnboardingPlan.addedDetail(on: true, state: .invalid, id: .deepseek), "已添加 · API Key 无效")
+        try checkEqual(OnboardingPlan.addedDetail(on: true, state: .invalid, id: .siliconflow), "已添加 · 登录已过期")
+        try checkEqual(OnboardingPlan.addedDetail(on: false, state: .ok, id: .deepseek), "已添加 · 取消勾选后会移除")
     }
+    // 用户 11/6 选 proposal-pick-redesign 乙：老用户进「添加 / 移除平台」是管理页，第一次打开仍是勾选
+    test("manageShownForReturningUsers") {
+        try check(!OnboardingPlan.showsManage(added: [], only: nil), "第一次（什么都没加）走勾选")
+        try check(OnboardingPlan.showsManage(added: [.deepseek], only: nil))
+        try check(!OnboardingPlan.showsManage(added: [.deepseek], only: .kimi), "从设置添加某一个平台：直接走连接")
+    }
+    test("manageListsAddedAndAddable") {
+        let m = OnboardingPlan.manageLists(added: [.claudePlan, .deepseek])
+        try checkEqual(m.added, [.deepseek, .claudePlan])                      // 按界面顺序
+        try checkEqual(m.addable, [.siliconflow, .kimi, .openrouter, .packyapi, .codexPlan, .geminiPlan])
+        let all = OnboardingPlan.manageLists(added: Set(ProviderRegistry.all))
+        try checkEqual(all.addable, [])
+        try checkEqual(L("ob.allAdded", ProviderRegistry.all.count), "8 个平台都已添加")
+    }
+    test("manageStatusShowsReading") {
+        func st(_ id: ProviderID, _ s: AccountState?, _ r: AccountReading?) -> (String, Bool) {
+            let x = OnboardingPlan.addedStatus(id, state: s, reading: r); return (x.text, x.warn)
+        }
+        try checkEqual(st(.deepseek, .ok, .money(5.35, currency: "CNY")).0, "已连接 · 余额 ¥5.35")
+        try checkEqual(st(.deepseek, .ok, .money(5.35, currency: "CNY")).1, false)
+        try checkEqual(st(.claudePlan, .ok, .session(59)).0, "已连接 · 5 小时窗口剩 59%")
+        try checkEqual(st(.kimi, .ok, nil).0, "已连接")
+        try checkEqual(st(.deepseek, .balanceOnly, .money(5.35, currency: "CNY")).0, "已连接 · 余额 ¥5.35")
+        // 没连上：写状态、标成要处理（橙色）
+        let bad = st(.siliconflow, .invalid, nil)
+        try checkEqual(bad.0, "已添加 · 登录已过期")
+        try check(bad.1)
+        try check(st(.deepseek, .expiring(days: 2), .money(1, currency: "CNY")).1, "快过期要提醒")
+    }
+    // 管理页「可添加」每行一句短说明（窗口定高，两行的长说明放不下）
+    test("manageShortGain") {
+        try checkEqual(ProviderRegistry.all.map(OnboardingPlan.shortGain), [
+            "API Key · 余额，登录控制台后有花费明细", "网页登录 · 余额、今日 / 本月花费", "API Key · 余额（花费按余额变化估算）",
+            "API Key · 这把 Key 的今日 / 本月花费、余额",
+            "访问令牌 · 余额、今日 / 本月花费", "读本机 Codex 记录，不用登录", "登录 claude.ai 或用本机 Claude Code 查", "用本机 Antigravity CLI 查额度，不花 token"])
+    }
+    test("pickGroupsByMeter") {
+        let g = OnboardingPlan.groups
+        try checkEqual(g.map(\.ids), [[.deepseek, .siliconflow, .kimi, .openrouter, .packyapi], [.codexPlan, .claudePlan, .geminiPlan]])
+        try checkEqual(g.map(\.title), ["按量付费 · 看余额", "套餐 · 看额度"])
+    }
+
 }

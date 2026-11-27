@@ -31,15 +31,21 @@ enum RiskRanker {
     static func risk(_ i: RiskInput) -> PlatformRisk {
         var r = PlatformRisk(id: i.id, kind: .none, hours: nil, atRisk: false, severity: .ok)
         switch i.status {
-        case .offline, .credentialInvalid, .schemaChanged, .stale:
+        case .offline, .credentialInvalid, .keychainUnreadable, .schemaChanged, .stale:
             r.kind = .noData
             return r
-        case .loading, .notAdded: return r
+        case .loading, .notAdded, .hidden: return r
         default: break
         }
         r.paygReading = i.payg
         r.quotaReading = i.quota
-        if i.belowThreshold {
+        // 套餐已用完比「低于预警线」更具体（用完一定在线下）：先说用完和恢复时间
+        if let quota = i.quota, quota.state == .exhausted {
+            r.kind = .quota(quota)
+            r.hours = quota.hoursToEmpty
+            r.atRisk = true
+            r.severity = quota.severity
+        } else if i.belowThreshold {
             r.kind = .belowThreshold
             r.hours = 0
             r.atRisk = true
@@ -61,7 +67,7 @@ enum RiskRanker {
     }
 
     static func rank(_ inputs: [RiskInput]) -> [PlatformRisk] {
-        inputs.filter { $0.status != .notAdded }.map { risk($0) }.sorted {
+        inputs.filter { $0.status.isShown }.map { risk($0) }.sorted {
             if $0.atRisk != $1.atRisk { return $0.atRisk }
             if $0.atRisk {
                 let a = $0.hours ?? .infinity, b = $1.hours ?? .infinity
@@ -71,10 +77,6 @@ enum RiskRanker {
             if aNoData != bNoData { return aNoData }
             return order($0.id) < order($1.id)
         }
-    }
-
-    static func mostAtRisk(_ inputs: [RiskInput]) -> PlatformRisk? {
-        rank(inputs).first { $0.atRisk }
     }
 
     private static func order(_ id: ProviderID) -> Int { ProviderID.allCases.firstIndex(of: id) ?? 0 }

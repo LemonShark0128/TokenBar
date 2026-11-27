@@ -2,10 +2,57 @@ import Foundation
 
 /// 本地日期（yyyy-MM-dd）→ 模型名 → token 数
 typealias DailyModelTokens = [String: [String: Int]]
+typealias DailyModelBreakdown = [String: [String: TokenBreakdown]]
 
 /// 读本机 Claude Code 和 Codex 的会话日志，只取模型名、token 数和时间戳，汇总成近 7 天「本地日期 × 模型 → token」。
 /// 对话内容一律不解码、不保存、不写日志；目录和时钟都由调用方传入（测试用临时目录）。
 enum LocalAgentUsage {
+    struct DetailedUsage: Equatable {
+        var tokens: [ProviderID: DailyModelTokens] = [:]
+        var breakdowns: [ProviderID: DailyModelBreakdown] = [:]
+        /// 近 7 天本机活跃分钟数（选「常用平台」用）
+        var activeMinutes: [ProviderID: Int] = [:]
+    }
+    struct ProviderApiValue: Equatable {
+        var todayUSD = 0.0
+        var weekUSD = 0.0
+        var partial = false
+    }
+
+    static func readDetailed(enabled: Set<ProviderID>, claudeDir: URL, codexSessions: URL, now: Date,
+                             timeZone: TimeZone, limits: Limits = .standard, cache: LocalUsageCache? = nil) -> DetailedUsage {
+        var result = DetailedUsage()
+        result.tokens = read(enabled: enabled, claudeDir: claudeDir, codexSessions: codexSessions,
+                             now: now, timeZone: timeZone, limits: limits, cache: cache, onBreakdown: { provider, breakdown in
+            result.breakdowns[provider] = breakdown
+        }, onActiveMinutes: { provider, minutes in
+            result.activeMinutes[provider] = minutes
+        })
+        return result
+    }
+
+    /// 每个平台今天及近 7 天的 API 价值；未知模型不计价，但保留 partial。
+    static func apiValues(_ usage: [ProviderID: DailyModelBreakdown], now: Date,
+                          timeZone: TimeZone) -> [ProviderID: ProviderApiValue] {
+        let window = DayWindow(now: now, timeZone: timeZone)
+        let today = window.fmt.string(from: now)
+        var result: [ProviderID: ProviderApiValue] = [:]
+        for (provider, days) in usage where provider == .claudePlan || provider == .codexPlan {
+            var value = ProviderApiValue()
+            var any = false
+            for (day, models) in days where window.contains(day) {
+                for (model, tokens) in models {
+                    any = true
+                    guard let usd = ModelPricing.usd(tokens, model: model) else { value.partial = true; continue }
+                    value.weekUSD += usd
+                    if day == today { value.todayUSD += usd }
+                }
+            }
+            if any { result[provider] = value }
+        }
+        return result
+    }
+
     struct Limits: Equatable {
         /// 最多读这么多个文件（按修改时间取最近的）
         var maxFiles: Int
@@ -21,15 +68,19 @@ enum LocalAgentUsage {
     /// 只读添加了的套餐平台：Claude 套餐读 claudeDir，Codex 套餐读 codexSessions。
     /// 传入 cache 时，修改时间和大小都没变的文件直接用上次的解析结果，不再打开；不传时每次全部重读
     static func read(enabled: Set<ProviderID>, claudeDir: URL, codexSessions: URL, now: Date, timeZone: TimeZone,
-                     limits: Limits = .standard, cache: LocalUsageCache? = nil) -> [ProviderID: DailyModelTokens] {
+                     limits: Limits = .standard, cache: LocalUsageCache? = nil,
+                     onBreakdown: ((ProviderID, DailyModelBreakdown) -> Void)? = nil,
+                     onActiveMinutes: ((ProviderID, Int) -> Void)? = nil) -> [ProviderID: DailyModelTokens] {
         var out: [ProviderID: DailyModelTokens] = [:]
         if enabled.contains(.claudePlan) {
-            out[.claudePlan] = claude(root: claudeDir, now: now, timeZone: timeZone, limits: limits, cache: cache)
+            out[.claudePlan] = claude(root: claudeDir, now: now, timeZone: timeZone, limits: limits, cache: cache, onBreakdown: { onBreakdown?(.claudePlan, $0) },
+                                     onActiveMinutes: { onActiveMinutes?(.claudePlan, $0) })
         } else {
             cache?.clear(.claude)
         }
         if enabled.contains(.codexPlan) {
-            out[.codexPlan] = codex(root: codexSessions, now: now, timeZone: timeZone, limits: limits, cache: cache)
+            out[.codexPlan] = codex(root: codexSessions, now: now, timeZone: timeZone, limits: limits, cache: cache, onBreakdown: { onBreakdown?(.codexPlan, $0) },
+                                   onActiveMinutes: { onActiveMinutes?(.codexPlan, $0) })
         } else {
             cache?.clear(.codex)
         }
@@ -63,11 +114,15 @@ enum LocalAgentUsage {
         var day: String
         var model: String
         var tokens: Int
+        var usage = TokenBreakdown()
+        /// 这条记录所在的分钟（Unix 时间 / 60），算活跃分钟数用
+        var minute = 0
     }
 
     /// root = Claude 目录（~/.claude）。读 projects/*/*.jsonl 和 projects/*/*/subagents/*.jsonl
     static func claude(root: URL, now: Date, timeZone: TimeZone, limits: Limits = .standard,
-                       cache: LocalUsageCache? = nil, fileManager fm: FileManager = .default) -> DailyModelTokens {
+                       cache: LocalUsageCache? = nil, onBreakdown: ((DailyModelBreakdown) -> Void)? = nil,
+                       onActiveMinutes: ((Int) -> Void)? = nil, fileManager fm: FileManager = .default) -> DailyModelTokens {
         let projects = root.appendingPathComponent("projects", isDirectory: true)
         var files: [URL] = []
         for p in subdirectories(projects, fm) {
@@ -97,10 +152,14 @@ enum LocalAgentUsage {
             }
         }
         var out: DailyModelTokens = [:]
+        var breakdown: DailyModelBreakdown = [:]
+        onActiveMinutes?(Set(latest.values.map(\.minute).filter { $0 > 0 }).count)
         for k in order {
             guard let e = latest[k], e.tokens > 0 else { continue }
             out[e.day, default: [:]][e.model, default: 0] += e.tokens
+            breakdown[e.day, default: [:]][e.model] = (breakdown[e.day]?[e.model] ?? TokenBreakdown()) + e.usage
         }
+        onBreakdown?(breakdown)
         return out
     }
 
@@ -116,11 +175,15 @@ enum LocalAgentUsage {
         for line in tailLines(f, limits: limits) where line.range(of: key) != nil {
             guard let l = try? dec.decode(ClaudeLine.self, from: line), l.type == "assistant",
                   let m = l.message, let model = m.model, model != "<synthetic>", let u = m.usage,
-                  let ts = l.timestamp, let day = days.localDay(of: ts) else { continue }
+                  let ts = l.timestamp, let at = ISODate.parse(ts) else { continue }
+            let day = days.localDay(of: at)
             let tokens = (u.input_tokens ?? 0) + (u.output_tokens ?? 0)
                 + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
             let k: String? = (m.id == nil && l.requestId == nil) ? nil : "\(m.id ?? "")|\(l.requestId ?? "")"
-            out.append(ClaudeEntry(key: k, day: day, model: model, tokens: tokens))
+            out.append(ClaudeEntry(key: k, day: day, model: model, tokens: tokens, usage: TokenBreakdown(
+                input: u.input_tokens ?? 0, cachedInput: u.cache_read_input_tokens ?? 0,
+                cacheWrite: u.cache_creation_input_tokens ?? 0, output: u.output_tokens ?? 0),
+                minute: Int(at.timeIntervalSince1970 / 60)))
         }
         return out
     }
@@ -129,7 +192,7 @@ enum LocalAgentUsage {
 
     /// turn_context（带 model）和 event_msg/token_count（带累计 total_tokens）；其余字段不解码
     private struct CodexLine: Decodable {
-        struct Total: Decodable { var total_tokens: Int? }
+        typealias Total = CodexTokenUsage
         struct Info: Decodable { var total_token_usage: Total? }
         struct Payload: Decodable {
             var type: String?
@@ -146,11 +209,15 @@ enum LocalAgentUsage {
         var day: String
         var model: String
         var delta: Int
+        var usage = TokenBreakdown()
+        /// 这段增量所在的分钟（Unix 时间 / 60），算活跃分钟数用
+        var minute = 0
     }
 
     /// root = ~/.codex/sessions（下面是 yyyy/MM/dd/*.jsonl）。同一会话里 token_count 是累计值，可能重复写：按增量算
     static func codex(root: URL, now: Date, timeZone: TimeZone, limits: Limits = .standard,
-                      cache: LocalUsageCache? = nil, fileManager fm: FileManager = .default) -> DailyModelTokens {
+                      cache: LocalUsageCache? = nil, onBreakdown: ((DailyModelBreakdown) -> Void)? = nil,
+                      onActiveMinutes: ((Int) -> Void)? = nil, fileManager fm: FileManager = .default) -> DailyModelTokens {
         var files: [URL] = []
         if let e = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
                                  options: [.skipsHiddenFiles]) {
@@ -165,11 +232,17 @@ enum LocalAgentUsage {
             perFile = list.map { parseCodex($0.url, days: days, limits: limits) }
         }
         var out: DailyModelTokens = [:]
+        var breakdown: DailyModelBreakdown = [:]
+        var minutes = Set<Int>()
         for entries in perFile {
             for e in entries where days.contains(e.day) {
+                if e.minute > 0 { minutes.insert(e.minute) }
                 out[e.day, default: [:]][e.model, default: 0] += e.delta
+                breakdown[e.day, default: [:]][e.model] = (breakdown[e.day]?[e.model] ?? TokenBreakdown()) + e.usage
             }
         }
+        onBreakdown?(breakdown)
+        onActiveMinutes?(minutes.count)
         return out
     }
 
@@ -187,6 +260,7 @@ enum LocalAgentUsage {
         var model: String?
         // 读全文时从 0 起算；截断时第一条累计值只当起点（之前的用量不知道属于哪天）
         var last: Int? = truncated ? nil : 0
+        var previous = CodexTokenUsage()
         for line in lines {
             let isTurn = line.range(of: turnKey) != nil
             guard isTurn || line.range(of: countKey) != nil,
@@ -196,13 +270,15 @@ enum LocalAgentUsage {
                 continue
             }
             guard l.type == "event_msg", l.payload?.type == "token_count",
-                  let total = l.payload?.info?.total_token_usage?.total_tokens else { continue }
-            defer { last = total }
+                  let current = l.payload?.info?.total_token_usage, let total = current.total_tokens else { continue }
+            defer { last = total; previous = current }
             guard let prev = last else { continue }
             // 累计值变小（会话重开等）：当作从 0 重新累计
             let delta = total >= prev ? total - prev : total
-            guard delta > 0, let ts = l.timestamp, let day = days.localDay(of: ts) else { continue }
-            out.append(CodexEntry(day: day, model: model ?? unknownCodexModel, delta: delta))
+            guard delta > 0, let ts = l.timestamp, let at = ISODate.parse(ts) else { continue }
+            let day = days.localDay(of: at)
+            out.append(CodexEntry(day: day, model: model ?? unknownCodexModel, delta: delta, usage: current.delta(from: previous),
+                                  minute: Int(at.timeIntervalSince1970 / 60)))
         }
         return out
     }
@@ -214,8 +290,6 @@ enum LocalAgentUsage {
         let days: Set<String>
         let minDay: String
         let fmt: DateFormatter
-        let iso = ISO8601DateFormatter()
-        let isoFrac = ISO8601DateFormatter()
         init(now: Date, timeZone: TimeZone) {
             var cal = Calendar(identifier: .gregorian)
             cal.timeZone = timeZone
@@ -229,14 +303,10 @@ enum LocalAgentUsage {
                 cal.date(byAdding: .day, value: -back, to: now).map { f.string(from: $0) }
             })
             minDay = days.min() ?? f.string(from: now)
-            iso.formatOptions = [.withInternetDateTime]
-            isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         }
         /// 时间戳 → 本地日期（不看窗口；认不出返回 nil）
-        func localDay(of ts: String) -> String? {
-            guard let d = isoFrac.date(from: ts) ?? iso.date(from: ts) else { return nil }
-            return fmt.string(from: d)
-        }
+        /// 已解析好的时间 → 本地日期（每行时间戳只解析一次，日期和分钟都从它来）
+        func localDay(of d: Date) -> String { fmt.string(from: d) }
         func contains(_ day: String) -> Bool { days.contains(day) }
     }
 
@@ -261,10 +331,8 @@ enum LocalAgentUsage {
     private static func recent(_ files: [URL], now: Date, limits: Limits, _ fm: FileManager) -> [FileStamp] {
         let since = now.addingTimeInterval(-TimeInterval(windowDays) * 86400)
         let dated: [FileStamp] = files.compactMap { u in
-            guard let a = try? fm.attributesOfItem(atPath: u.path),
-                  let m = a[.modificationDate] as? Date, m >= since else { return nil }
-            let size = (a[.size] as? NSNumber)?.uint64Value ?? 0
-            return FileStamp(url: u, mtime: m, size: size)
+            guard let a = FileStat.of(u), a.mtime >= since else { return nil }
+            return FileStamp(url: u, mtime: a.mtime, size: a.size)
         }
         return Array(dated.sorted { $0.mtime != $1.mtime ? $0.mtime > $1.mtime : $0.url.path < $1.url.path }.prefix(limits.maxFiles))
     }

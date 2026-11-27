@@ -5,7 +5,7 @@ struct ExhaustedAlertMemory: Equatable {
     var keys: Set<String> = []
 
     static func key(_ id: ProviderID, _ w: QuotaWindow) -> String {
-        "\(id.rawValue)|\(QuotaText.windowName(w.kind))|\(w.resetsAt.map { "\(Int($0.timeIntervalSince1970 / 60))" } ?? "-")"
+        "\(id.rawValue)|\(w.kind.sampleKey)|\(w.resetsAt.map { "\(Int($0.timeIntervalSince1970 / 60))" } ?? "-")"
     }
 
     mutating func toFire(_ platforms: [PlatformState], now: Date) -> [(id: ProviderID, window: QuotaWindow)] {
@@ -18,7 +18,7 @@ struct ExhaustedAlertMemory: Equatable {
             }
             // 没有读数不代表额度恢复；不在列表里的平台也保留记录。
             guard let quota = st.snapshot?.quota else { continue }
-            let exhausted = quota.windows.filter { $0.effectiveUsed(at: now) >= 100 }
+            let exhausted = quota.windows.filter { $0.isExhausted(at: now) }
             // 同一窗口每轮读到的重置时间会差几十秒（跨分钟）、偶尔读不到：相差 5 分钟以内或缺重置时间都算同一次
             var kept: Set<String> = []
             var fresh: [(key: String, window: QuotaWindow)] = []
@@ -51,7 +51,7 @@ struct ExhaustedAlertMemory: Equatable {
     }
 
     static func load(_ d: UserDefaults) -> ExhaustedAlertMemory {
-        ExhaustedAlertMemory(keys: Set(d.stringArray(forKey: "quotaExhausted.alerted") ?? []))
+        ExhaustedAlertMemory(keys: Set((d.stringArray(forKey: "quotaExhausted.alerted") ?? []).map(QuotaText.languageFreeKey)))
     }
 
     func save(_ d: UserDefaults) { d.set(keys.sorted(), forKey: "quotaExhausted.alerted") }

@@ -3,12 +3,15 @@ import Foundation
 /// 油表指针不能压到中间的余额数字：指针内端在任何角度都落在数字外框（最宽时）以外
 @MainActor
 func registerGaugeGeometryTests() {
-    test("quotaArcUsesConsumptionAndRetainsRemainingSeverity") {
-        for (remaining, used, severity): (Double, Double, RunwaySeverity) in [(1, 0, .ok), (0.52, 0.48, .ok), (0.2, 0.8, .warn), (0.05, 0.95, .danger), (0, 1, .danger)] {
-            try check(abs(GaugeGeometry.arcFraction(level: remaining, quota: true) - used) < 0.000001)
-            try checkEqual(GaugeGeometry.arcFraction(level: remaining, quota: false), remaining)
+    test("gaugeArcUsesRemainingAndRetainsQuotaSeverity") {
+        for (remaining, severity): (Double, RunwaySeverity) in [(1, .ok), (0.52, .ok), (0.2, .warn), (0.05, .danger), (0, .danger)] {
+            try checkEqual(GaugeGeometry.arcFraction(level: remaining), remaining)
             try checkEqual(QuotaLevel.severity(remainingFraction: remaining), severity)
         }
+    }
+    test("gaugeArcClampsRemainingFraction") {
+        try checkEqual(GaugeGeometry.arcFraction(level: -0.2), 0)
+        try checkEqual(GaugeGeometry.arcFraction(level: 1.2), 1)
     }
     test("gaugeNeedleClearsBalanceText") {
         // 面板 230/38、小组件和多平台面板的较小尺寸

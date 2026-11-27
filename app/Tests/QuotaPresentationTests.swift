@@ -24,23 +24,27 @@ func registerQuotaPresentationTests() {
     }
     let std = quota(session: 35, sessionIn: 2 * h + 13 * m, weekly: 41, weeklyIn: 7 * 86400 + 2 * h + 13 * m)
 
-    test("quotaUsedPercentAndSideLine") {
+    test("quotaUsedPercent") {
         for (remaining, expected): (Double?, String) in [(52, "48%"), (0.4, "100%"), (100, "0%"), (nil, "—%"), (.nan, "—%"), (-1, "100%"), (101, "0%")] {
             try checkEqual(quotaUsedPercent(remaining: remaining), expected)
         }
-        var side = AppData.Side(id: "claudePlan", name: "Claude 套餐", tank: nil, currency: "PCT", todayCost: nil, status: "正常", quotaRemaining: 52, quotaReset: "1:43 后重置")
-        try checkEqual(side.quotaLine, "Claude 套餐 已用 48% · 1:43 后重置")
-        side.quotaRemaining = nil
-        try checkEqual(side.quotaLine, "Claude 套餐 已用 —% · 1:43 后重置")
-        side.quotaExhausted = QuotaExhausted(clock: "08:00")
-        try checkEqual(side.quotaLine, "Claude 套餐 下次重置：08:00")
     }
     test("resetTextUnderAndOver24h") {
         try checkEqual(QuotaText.resetText(now.addingTimeInterval(2 * h + 13 * m), now: now, timeZone: utc), "2 小时 13 分后重置")
         try checkEqual(QuotaText.resetText(now.addingTimeInterval(13 * m), now: now, timeZone: utc), "13 分后重置")
-        try checkEqual(QuotaText.resetText(now.addingTimeInterval(7 * 86400 + 2 * h + 13 * m), now: now, timeZone: utc), "周四 08:00 重置")
+        try checkEqual(QuotaText.resetText(now.addingTimeInterval(7 * 86400 + 2 * h + 13 * m), now: now, timeZone: utc), "下周四 08:00 重置")
         try checkEqual(QuotaText.resetCompact(now.addingTimeInterval(2 * h + 13 * m), now: now, timeZone: utc), "2:13 后重置")
-        try checkEqual(QuotaText.resetCompact(now.addingTimeInterval(7 * 86400 + 2 * h + 13 * m), now: now, timeZone: utc), "周四 08:00 重置")
+        try checkEqual(QuotaText.resetCompact(now.addingTimeInterval(7 * 86400 + 2 * h + 13 * m), now: now, timeZone: utc), "下周四 08:00 重置")
+        // 11/6 用户定 round7-scout 第 3 条乙：星期几和今天相同（7 天后）写「下周四」，别的星期照旧
+        try checkEqual(QuotaText.resetText(now.addingTimeInterval(86400 + 2 * h + 13 * m), now: now, timeZone: utc), "周五 08:00 重置")
+        try checkEqual(QuotaText.resetText(now.addingTimeInterval(6 * 86400 + 2 * h + 13 * m), now: now, timeZone: utc), "周三 08:00 重置")
+        try checkEqual(QuotaText.resetText(now.addingTimeInterval(6 * 86400 + 20 * h), now: now, timeZone: utc), "下周四 01:47 重置")
+        try checkEqual(QuotaText.resetText(now.addingTimeInterval(8 * 86400), now: now, timeZone: utc), "下周五 05:47 重置")
+        L10n.lang = .en
+        defer { L10n.lang = .zh }
+        try checkEqual(QuotaText.resetText(now.addingTimeInterval(7 * 86400 + 2 * h + 13 * m), now: now, timeZone: utc), "resets next Thu 08:00")
+        try checkEqual(QuotaText.resetText(now.addingTimeInterval(86400 + 2 * h + 13 * m), now: now, timeZone: utc), "resets Fri 08:00")
+        L10n.lang = .zh
         try checkEqual(QuotaText.windowName(.session), "5 小时窗口")
         try checkEqual(QuotaText.windowName(.weeklyModel("GPT-5")), "本周（GPT-5）")
     }
@@ -57,7 +61,6 @@ func registerQuotaPresentationTests() {
         try checkEqual(d.balance.currency, "PCT")
         let q = d.quota
         try checkEqual(q?.headline, "5 小时窗口 · 2 小时 13 分后重置")
-        try checkEqual(q?.secondLine, "本周已用 41% · 周四 08:00 重置")
         try checkEqual(q?.rows.count, 2)
         try checkEqual(q?.lastUsed, "最近一次使用：12 分钟前")
         try check(d.burn == nil, "burn nil")
@@ -73,7 +76,7 @@ func registerQuotaPresentationTests() {
         let d = AppDataMapping.appData(main: planState(std), others: [], now: now, timeZone: utc)
         try checkEqual(d.quota?.plan, "Plus 套餐")
         try checkEqual(d.quota?.rows.first?.resetShort, "2:13 后重置")
-        try checkEqual(d.quota?.rows.last?.resetShort, "周四 08:00 重置")
+        try checkEqual(d.quota?.rows.last?.resetShort, "下周四 08:00 重置")
         var noPlan = std; noPlan.plan = nil
         let c = AppDataMapping.appData(main: planState(noPlan), others: [], now: now, timeZone: utc)
         try checkEqual(c.quota?.plan, nil)
@@ -84,7 +87,6 @@ func registerQuotaPresentationTests() {
     test("mapQuotaResetWindowText") {
         let qq = quota(session: 90, sessionIn: -h, weekly: 41, weeklyIn: 3 * 86400)
         let d = AppDataMapping.appData(main: planState(qq), others: [], now: now, timeZone: utc)
-        try check(d.quota?.secondLine?.hasPrefix("本周已用 41%") == true)
         try checkEqual(d.quota?.remainingPercent, 100)
         try checkEqual(d.quota?.rows.first?.isReset, true)
     }
@@ -119,7 +121,7 @@ func registerQuotaPresentationTests() {
         let qq = Quota(plan: nil, windows: [QuotaWindow(kind: .weekly, usedPercent: 100,
                        resetsAt: now.addingTimeInterval(7 * 86400 + 2 * h + 13 * m), windowMinutes: nil)], observedAt: now)
         try checkEqual(QuotaText.exhausted(name: "Codex 套餐", window: qq.windows[0], now: now, timeZone: utc),
-                       "Codex 套餐 本周额度已用完，周四 08:00 恢复")
+                       "Codex 套餐 本周额度已用完，下周四 08:00 恢复")
         try checkEqual(QuotaText.exhausted(name: "Codex 套餐", window: .session, resetsAt: now.addingTimeInterval(2 * h + 13 * m),
                                            now: now, timeZone: utc), "Codex 套餐 5 小时额度已用完，2 小时 13 分后恢复")
     }
@@ -131,7 +133,7 @@ func registerQuotaPresentationTests() {
     test("quotaLowAlertFloorsNearThreshold") {
         let n = StatusPresenter.quotaLowNotification(name: "Codex 套餐", remaining: 9.6, threshold: 10)
         try checkEqual(n.body, "剩余 9%，已低于预警线 10%")
-        try checkEqual(A11yText.quotaGauge(provider: "Codex", remainingPercent: 9.6, reset: nil), "Codex 已用 91%")
+        try checkEqual(A11yText.quotaGauge(provider: "Codex", remainingPercent: 9.6, reset: nil), "Codex 剩余 9%")
     }
     test("remainingPercentFloorsEverywhere") {
         // 剩余不夸大：和提醒、通知同一口径（向下取整），夹在 0…100
@@ -143,11 +145,9 @@ func registerQuotaPresentationTests() {
         try checkEqual(quotaRemainingPercent(100.4), "100%")
         try checkEqual(quotaRemainingPercent(nil), "—%")
         try checkEqual(quotaRemainingPercent(.nan), "—%")
-        try checkEqual(AccountReading.session(9.6).text, "5 小时窗口已用 91%")
-        try checkEqual(AccountReading.remaining(9.6).text, "已用 91%")
-        try checkEqual(A11yText.quotaGauge(provider: "Codex 套餐", remainingPercent: 0.4, reset: nil), "Codex 套餐 已用 100%")
-        // 通用百分比格式化仍保留四舍五入（设置预警线等使用）
-        try checkEqual(quotaPercent(40.4), "40%")
+        try checkEqual(AccountReading.session(9.6).text, "5 小时窗口剩 9%")
+        try checkEqual(AccountReading.remaining(9.6).text, "剩 9%")
+        try checkEqual(A11yText.quotaGauge(provider: "Codex 套餐", remainingPercent: 0.4, reset: nil), "Codex 套餐 剩余 0%")
     }
     test("quotaFreshnessNeverStale") {
         let st = planState(std, fetchedAgo: 2 * h)
@@ -162,8 +162,8 @@ func registerQuotaPresentationTests() {
     }
     test("quotaGaugeA11y") {
         try checkEqual(A11yText.quotaGauge(provider: "Codex 套餐", remainingPercent: 59, reset: "5 小时窗口 2 小时 13 分后重置"),
-                       "Codex 套餐 已用 41%，5 小时窗口 2 小时 13 分后重置")
-        try checkEqual(A11yText.quotaGauge(provider: "Codex 套餐", remainingPercent: nil, reset: nil), "Codex 套餐 已用未知")
+                       "Codex 套餐 剩余 59%，5 小时窗口 2 小时 13 分后重置")
+        try checkEqual(A11yText.quotaGauge(provider: "Codex 套餐", remainingPercent: nil, reset: nil), "Codex 套餐 剩余未知")
     }
     testAsync("moneyMappingUnchanged") {
         let http = FixtureHTTPClient()

@@ -12,11 +12,7 @@ struct SiliconFlowProvider: UsageProvider {
     }
 
     var id: ProviderID { .siliconflow }
-    var displayName: String { L("provider.siliconflow") }
-    var capabilities: Capabilities {
-        Capabilities(hasBalance: true, currency: .cny, minPollInterval: 60, dayBoundary: .local)
-    }
-    var loginSteps: [LoginStep] { [.webLogin(url: Self.consoleURL, required: true)] }
+    var capabilities: Capabilities { ProviderRegistry.capabilities(.siliconflow) }
 
     static let consoleURL = URL(string: "https://cloud.siliconflow.cn/me/bills")!
     static let walletURL = "https://walletd.siliconflow.cn/api/v1/subject/profile"
@@ -171,7 +167,15 @@ struct SiliconFlowProvider: UsageProvider {
 
     // MARK: - 接口
 
-    /// GET 并校验：HTTP 状态、JSON、业务码 20000（其余业务码按登录失效），返回 data
+    /// 业务码：20000 成功；400xx 是登录失效（会停止自动刷新、提示重新登录）；其余（限流、服务端错误等）按网络问题，下一轮再试
+    static func bizCodeError(_ code: Int?) -> ProviderError? {
+        guard let code else { return .schemaChanged("硅基流动响应没有 code") }
+        if code == 20000 { return nil }
+        if (40000..<40100).contains(code) { return .auth("硅基流动 code=\(code)") }
+        return .network("硅基流动 code=\(code)")
+    }
+
+    /// GET 并校验：HTTP 状态、JSON、业务码（bizCodeError），返回 data
     func api(_ s: Session, _ urlString: String, query: [URLQueryItem] = []) async -> Result<[String: Any], ProviderError> {
         var comps = URLComponents(string: urlString)!
         if !query.isEmpty { comps.queryItems = query }
@@ -183,7 +187,11 @@ struct SiliconFlowProvider: UsageProvider {
             return .failure(.schemaChanged("硅基流动响应不是 JSON"))
         }
         let code = (obj["code"] as? NSNumber)?.intValue
-        if code != 20000 { return code == nil ? .failure(.schemaChanged("硅基流动响应没有 code")) : .failure(.auth("硅基流动 code=\(code!)")) }
+        if let e = Self.bizCodeError(code) {
+            // 没见过的业务码先按网络问题重试，记一行日志，以后据此补登录失效的码
+            if case .network = e { AppLogger.shared.log("硅基流动返回业务码 \(code ?? -1)，按网络问题下一轮再试") }
+            return .failure(e)
+        }
         guard let d = obj["data"] as? [String: Any] else { return .failure(.schemaChanged("硅基流动响应没有 data")) }
         return .success(d)
     }

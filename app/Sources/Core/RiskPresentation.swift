@@ -12,8 +12,10 @@ extension Runway {
     }
 
     static func quotaChip(_ r: QuotaRunway, now: Date, timeZone: TimeZone) -> (title: String, detail: String?) {
+        // 用完时写「…后恢复」（同横幅、菜单栏），没用完写「…后重置」
         let reset = r.resetsAt.map {
-            L("runway.chipReset", r.window.resetIsEstimated ? L("quota.approxPrefix") : "", durationText(hours: $0.timeIntervalSince(now) / 3600))
+            L(r.state == .exhausted ? "runway.chipBack" : "runway.chipReset",
+              r.window.resetIsEstimated ? L("quota.approxPrefix") : "", durationText(hours: $0.timeIntervalSince(now) / 3600))
         }
         switch r.state {
         case .idle: return (L("runway.idle"), reset)
@@ -57,20 +59,28 @@ extension AppDataMapping {
                 return text
             }
             func paygText(_ p: PaygRunway) -> (title: String, detail: String?) {
-                short = L("runway.left", paygDuration(p))
+                short = L("runway.left", Runway.spanText(hours: p.hours))
                 return Runway.paygText(p, currency: currency)
             }
             switch r.kind {
             case .payg(let p): text = paygText(p)
             case .quota(let q): text = quotaText(q)
             case .belowThreshold:
-                if let q = r.quotaReading { text = quotaText(q) }
-                else if let p = r.paygReading { text = paygText(p) }
+                if let q = r.quotaReading {
+                    text = quotaText(q)
+                    // 套餐低于预警线：没在快速用完时胶囊写「低于预警线」（红），重置时间留在说明里
+                    //（11/6 用户定 round7-scout 第 2 条乙；原来写「近 1 小时没用」「够用到重置」，和侧栏对不上）
+                    if q.state != .runsOut {
+                        text = (L("runway.belowLine"), text?.detail)
+                        short = L("runway.belowLine")
+                        muted = false
+                    }
+                } else if let p = r.paygReading { text = paygText(p) }
             case .none, .noData: break
             }
             if let text {
                 d.runway = AppData.RunwayChip(title: text.title, detail: text.detail,
-                    severity: r.kind == .belowThreshold ? max(r.severity.rawValue, RunwaySeverity.danger.rawValue) : r.severity.rawValue, short: short, muted: muted)
+                    severity: r.kind == .belowThreshold ? RunwaySeverity.danger.rawValue : r.severity.rawValue, short: short, muted: muted)
             }
         }
         for i in d.sides.indices {
@@ -80,7 +90,7 @@ extension AppDataMapping {
             var text: String?
             switch r.kind {
             case .belowThreshold: text = L("runway.belowLine")
-            case .payg(let p) where r.atRisk: text = L("runway.timeLeft", paygDuration(p))
+            case .payg(let p) where r.atRisk: text = L("runway.timeLeft", Runway.spanText(hours: p.hours))
             case .quota(let q):
                 switch q.state {
                 case .runsOut where r.atRisk: text = L("runway.timeLeft", Runway.durationText(hours: q.hoursToEmpty ?? 0))
@@ -94,30 +104,23 @@ extension AppDataMapping {
             d.sides[i].riskSeverity = text == nil ? nil : r.severity.rawValue
         }
         orderSidesByRisk(&d, risks: risks)
-        guard mainRisk?.atRisk != true,
-              let r = risks.first(where: { risk in risk.id != main && risk.atRisk && d.sides.contains(where: { $0.id == risk.id.rawValue }) }) else { return }
+        // 套餐平台的提醒不再占顶部横幅（用户 2026-11-06 选乙：系统通知和卡片红字已经提醒，横幅让面板忽高忽低）；按量付费的余额预警照旧
+        // 主平台自己有风险时不再加横幅（主卡已写着）；主平台是套餐时例外：套餐不占顶部，按量付费副平台的横幅照样显示（用户 2026-11-06）
+        guard mainRisk?.atRisk != true || ProviderRegistry.meter(main) == .quota,
+              let r = risks.first(where: { risk in risk.id != main && risk.atRisk && ProviderRegistry.meter(risk.id) != .quota
+                  && d.sides.contains(where: { $0.id == risk.id.rawValue }) }) else { return }
         let message: String, kind: String
-        let resetsAt: Date?
         switch r.kind {
         case .belowThreshold:
-            kind = "below"; resetsAt = r.quotaReading?.resetsAt
-            message = ProviderRegistry.meter(r.id) == .quota ? L("banner.quotaBelow") : L("banner.balanceBelow")
+            // 金额是 Key 剩余上限（OpenRouter）：写「Key 剩余额度低于预警线」
+            let keyLimit = d.sides.first { $0.id == r.id.rawValue }?.tankIsKeyLimit == true
+            kind = "below"; message = L(keyLimit ? "banner.keyLimitBelow" : "banner.balanceBelow")
         case .payg(let p):
-            kind = "payg"; resetsAt = nil
-            message = L("runway.timeLeft", paygDuration(p))
-        case .quota(let q):
-            kind = q.state == .exhausted ? "exhausted" : "runsOut"
-            resetsAt = q.resetsAt
-            let head = q.state == .exhausted ? L("runway.exhausted") : L("runway.timeLeft", Runway.durationText(hours: q.hoursToEmpty ?? 0))
-            message = head + (Runway.resetClock(q, now: now, timeZone: timeZone).map { L("alert.runout.reset", $0) } ?? "")
+            kind = "payg"; message = L("runway.timeLeft", Runway.spanText(hours: p.hours))
         default: return
         }
-        let reset = resetsAt.map { String(Int($0.timeIntervalSince1970 / 60)) } ?? "-"
-        let key = "\(r.id.rawValue)|\(kind)|\(r.severity.rawValue)|\(reset)"
+        // 键的最后一段原来是套餐窗口的重置分钟；只剩按量付费后恒为「-」，格式不变（已存的「关掉」记录仍认得）
+        let key = "\(r.id.rawValue)|\(kind)|\(r.severity.rawValue)|-"
         d.banner = AppData.RiskBanner(id: r.id.rawValue, text: "\(ProviderRegistry.displayName(r.id))\(kind == "below" ? L("banner.colon") : L("banner.space"))\(message)", severity: r.severity.rawValue, key: key)
-    }
-
-    private static func paygDuration(_ p: PaygRunway) -> String {
-        p.hours < 1 ? L("common.underOneHour") : Runway.durationText(hours: p.hours)
     }
 }

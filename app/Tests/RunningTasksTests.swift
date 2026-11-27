@@ -62,6 +62,23 @@ func registerRunningTasksTests() {
                     startedAt: now.addingTimeInterval(-started), lastActivity: now.addingTimeInterval(-last), tokens: tokens)
     }
 
+    test("RunningTasks knownOnlyCachesAndDropsCompleted") {
+        let r = try roots()
+        let f = claudeFile(r), other = claudeFile(r, "undiscovered")
+        try write(f, [prompt(120), reply(60)])
+        try write(other, [prompt(100)])
+        let cache = RunningTasksCache()
+        let files: [ProviderID: [URL]] = [.claudePlan: [f]]
+        let first = RunningTasks.scanKnown(files, now: now, cache: cache)
+        try checkEqual(first.tasks.map(\.sessionKey), [f.path])
+        _ = RunningTasks.scanKnown(files, now: now, cache: cache)
+        try checkEqual(cache.parsedFileCount, 1)
+        try write(f, [prompt(120), reply(60), reply(0, stop: "end_turn")])
+        try checkEqual(RunningTasks.scanKnown(files, now: now, cache: cache).tasks, [])
+        try checkEqual(cache.parsedFileCount, 2)
+        try checkEqual(RunningTasks.scanKnown(files, now: now.addingTimeInterval(1801), cache: cache).tasks, [])
+    }
+
     // 每 10 秒扫一次：文件修改时间和大小都没变就用上次的结果，不再读文件；变了才重读，没再列到的从缓存里清掉
     test("RunningTasks cacheSkipsUnchangedFiles") {
         let r = try roots()
@@ -271,6 +288,15 @@ func registerRunningTasksTests() {
         try checkEqual(RunningTaskText.clock(task(started: 724, last: 1), now: now), "12:04")
         try checkEqual(RunningTaskText.clock(task(started: 3724, last: 1), now: now), "1:02:04")
         try checkEqual(RunningTaskText.clock(task(started: 5, last: 1), now: now), "0:05")
+        // 停住的任务：默认长写，窄卡短写；读屏念完整单位
+        try checkEqual(RunningTaskText.clock(task(started: 900, last: 420), now: now), "停了 7 分钟")
+        try checkEqual(RunningTaskText.clock(task(started: 900, last: 420), now: now, short: true), "停 7分")
+        do {
+            let saved = L10n.lang; L10n.lang = .en; defer { L10n.lang = saved }
+            try checkEqual(RunningTaskText.clock(task(started: 900, last: 420), now: now), "stopped 7m")
+            try checkEqual(RunningTaskText.clock(task(started: 900, last: 420), now: now, short: true), "idle 7m")
+            try check(RunningTaskText.a11y(task(started: 900, last: 420), now: now).contains("stopped 7 min"))
+        }
         try checkEqual(RunningTaskText.tokens(0), "0")
         try checkEqual(RunningTaskText.tokens(999), "999")
         try checkEqual(RunningTaskText.tokens(1000), "1k")

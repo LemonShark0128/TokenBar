@@ -4,7 +4,9 @@ import Foundation
 enum AppDataMapping {
     static func appData(main: PlatformState, others: [PlatformState], now: Date, timeZone: TimeZone,
                         usdToCny: Decimal = Decimal(string: "7.1")!,
-                        localUsage: [ProviderID: DailyModelTokens] = [:]) -> AppData {
+                        localUsage: [ProviderID: DailyModelTokens] = [:],
+                        localBreakdowns: [ProviderID: DailyModelBreakdown] = [:],
+                        spendHistory: [ProviderID: [Sample]] = [:]) -> AppData {
         let s = main.snapshot
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
@@ -16,12 +18,12 @@ enum AppDataMapping {
         let seenAt = s?.fetchedAt ?? main.lastSample?.t
         let balance = AppData.Balance(cny: balanceValue.map(double), source: "平台",
                                       status: s == nil || main.snapshotFromDisk ? "离线" : "可用",
-                                      ageS: seenAt.map { Int(now.timeIntervalSince($0)) },
+                                      ageS: seenAt.map { max(0, Int(now.timeIntervalSince($0))) },
                                       currency: currencyCode(of: main))
 
         let isBill = s?.source == .bill
         // 没有快照（冷启动断网）时显示的是最后一次采样：标「离线」，不能当成「只有余额」去提示登录控制台
-        let source = s == nil ? "离线" : (isBill ? "平台账单" : "只有余额")
+        let source = s == nil ? "离线" : (isBill ? "平台账单" : s?.source == .balanceEstimate ? "余额估算" : "只有余额")
         let todayTokens = (s?.byModel ?? []).reduce(0) { $0 + $1.cacheHit + $1.cacheMiss + $1.output }
         // 本月：按本月日桶的按模型汇总（旧快照没有这项时为 0，不再拿近 7 天顶替）
         let monthModels = s?.monthByModel ?? []
@@ -61,22 +63,44 @@ enum AppDataMapping {
                         today: AppData.CostTok(costCny: double(s?.today?.amount ?? 0), tokens: todayTokens, source: source),
                         month: AppData.CostTok(costCny: double(s?.month?.amount ?? 0), tokens: monthTokens, source: source),
                         models: models, trend7: trend, burn: burn)
+        d.mainProvider = main.id
+        d.mainCardSide = side(main, now: now, timeZone: timeZone)
+        d.cardExchangeRate = double(usdToCny)
         d.trendIncomplete = s?.detailTruncated == true
         d.monthModelsIncomplete = s?.monthByModelPartial == true
-        d.sides = others.filter { $0.status != .notAdded }.map { side($0, now: now, timeZone: timeZone) }
+        d.sides = others.filter { $0.status.isShown }.map { side($0, now: now, timeZone: timeZone) }
         if ProviderRegistry.meter(main.id) == .quota { applyQuota(&d, main: main, now: now, timeZone: timeZone) }
         d.tokenSources = tokenSources(main: main, others: others, localUsage: localUsage)
 
-        // 今日合计：主平台 + 各辅助平台，美元按设置汇率换成人民币
-        var total: Decimal = 0, any = false, usd = false
-        for st in [main] + others {
-            guard st.status != .notAdded, let t = st.snapshot?.today else { continue }
-            total += t.converted(to: .cny, usdToCny: usdToCny).amount
-            any = true
-            if t.currency == .usd { usd = true }
+        let enabled = Set(([main] + others).filter { $0.status.isShown }.map(\.id))
+        let values = LocalAgentUsage.apiValues(localBreakdowns.filter { enabled.contains($0.key) }, now: now, timeZone: timeZone)
+        if !values.isEmpty {
+            d.apiValue = ApiValue(todayUSD: values.values.reduce(0) { $0 + $1.todayUSD },
+                                  weekUSD: values.values.reduce(0) { $0 + $1.weekUSD },
+                                  perProvider: Dictionary(uniqueKeysWithValues: values.map { ($0.key.rawValue, $0.value.todayUSD) }),
+                                  partial: values.values.contains { $0.partial })
         }
-        d.totalTodayCny = any ? double(total) : nil
+
+        // 今日合计：主平台 + 各辅助平台，美元按设置汇率换成人民币
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        var total: Decimal = 0, usd = false
+        var paying: [ProviderID: Currency] = [:]
+        var allFromToday = true
+        for st in [main] + others {
+            guard st.status.isShown, ProviderRegistry.meter(st.id) != .quota,
+                  let snapshot = st.snapshot, let t = snapshot.today else { continue }
+            total += t.converted(to: .cny, usdToCny: usdToCny).amount
+            paying[st.id] = t.currency
+            if !calendar.isDate(snapshot.fetchedAt, inSameDayAs: now) { allFromToday = false }
+            if t.currency == .usd || snapshot.source == .balanceEstimate { usd = true }
+        }
+        d.totalTodayCny = paying.isEmpty ? nil : double(total)
         d.totalIsApprox = usd
+        if allFromToday {
+            d.yesterdaySameTimeCny = SpendComparison.total(in: spendHistory, paying: paying, now: now,
+                                                           calendar: calendar, usdToCny: usdToCny).map(double)
+        }
         return d
     }
 
@@ -84,7 +108,12 @@ enum AppDataMapping {
     private static func applyQuota(_ d: inout AppData, main: PlatformState, now: Date, timeZone: TimeZone) {
         defer {
             if case .stale = main.status { d.quota?.staleNote = statusText(main, now: now) }
-            d.quota?.stale = main.quotaTooOld(now: now)
+            d.quota?.stale = main.quotaTooOld(now: now) || main.status == .credentialInvalid
+            if main.status == .credentialInvalid {
+                let hint = main.errorDetail ?? StatusPresenter.errorText(main.status, name: ProviderRegistry.displayName(main.id), id: main.id)
+                d.quota?.note = hint
+                d.quota?.staleNote = hint
+            }
         }
         let s = main.snapshot
         let q = s?.quota
@@ -96,43 +125,41 @@ enum AppDataMapping {
         d.models = []; d.trend7 = []; d.burn = nil
         d.trendIncomplete = false; d.monthModelsIncomplete = false
         guard let q else {
-            d.quota = AppData.QuotaView(remainingPercent: nil, headline: nil, secondLine: nil, rows: [],
+            d.quota = AppData.QuotaView(remainingPercent: nil, headline: nil, rows: [],
                                         lastUsed: nil, note: s?.quotaNote ?? main.errorDetail)
             return
         }
-        let display = q.displayWindow
-        func resetLine(_ w: QuotaWindow) -> String? {
-            w.isReset(at: now) ? nil : QuotaText.resetText(w, now: now, timeZone: timeZone)
-        }
+        let display = q.displayWindow(at: now)
+        let blocking = q.blockingWindow(at: now)
         var headline: String?, headlineCompact: String?
         if let t = display {
-            let r = QuotaText.resetText(t, now: now, timeZone: timeZone)
+            let r = QuotaText.resetText(t, now: now, timeZone: timeZone, restore: t == blocking)
             headline = [QuotaText.windowName(t.kind), r].compactMap { $0 }.joined(separator: " · ")
             if t.resetIsEstimated {
-                headlineCompact = [QuotaText.windowName(t.kind), QuotaText.resetText(t, now: now, timeZone: timeZone, marker: false)]
+                headlineCompact = [QuotaText.windowName(t.kind), QuotaText.resetText(t, now: now, timeZone: timeZone, marker: false, restore: t == blocking)]
                     .compactMap { $0 }.joined(separator: " · ")
             }
         }
-        var second: String?
-        if let other = q.windows.first(where: { $0 != display }) {
-            let name = QuotaText.windowName(other.kind)
-            if other.isReset(at: now) { second = L("quota.windowReset", name) }
-            else {
-                second = [L("quota.windowUsed", name, Int(other.effectiveUsed(at: now).rounded())), resetLine(other)]
-                    .compactMap { $0 }.joined(separator: " · ")
-            }
-        }
-        let rows = q.windows.map { w in
-            AppData.QuotaRow(id: QuotaText.windowName(w.kind), name: QuotaText.windowName(w.kind),
-                             usedPercent: w.effectiveUsed(at: now), isReset: w.isReset(at: now),
-                             reset: w.isReset(at: now) ? nil : QuotaText.resetText(w, now: now, timeZone: timeZone, marker: false),
-                             resetShort: w.isReset(at: now) ? nil
-                                : QuotaText.resetCompact(w, now: now, timeZone: timeZone))
-        }
-        d.quota = AppData.QuotaView(remainingPercent: q.displayRemainingPercent(at: now), headline: headline, secondLine: second,
+        let rows = quotaRows(q.windows, now: now, timeZone: timeZone)
+        d.quota = AppData.QuotaView(resetCredits: q.resetCredits?.text(timeZone: timeZone), resetCreditsCount: q.resetCredits?.available, remainingPercent: q.displayRemainingPercent(at: now), headline: headline,
                                     rows: rows, lastUsed: QuotaText.lastUsed(q.observedAt, now: now) + (q.estimated ? L("quota.estimatedSuffix") : ""), note: nil,
                                     plan: QuotaText.planName(q.plan), headlineCompact: headlineCompact,
                                     exhausted: QuotaText.exhaustion(q, now: now, timeZone: timeZone))
+    }
+
+    static func quotaRows(_ windows: [QuotaWindow], now: Date, timeZone: TimeZone) -> [AppData.QuotaRow] {
+        // 只有卡住整个套餐的窗口写「恢复」，别的（含先重置的那个）照旧写「重置」
+        let blocking = Quota(plan: nil, windows: windows, observedAt: now).blockingWindow(at: now)
+        return windows.map { w in
+            AppData.QuotaRow(id: QuotaText.windowName(w.kind), name: QuotaText.windowName(w.kind),
+                             usedPercent: w.effectiveUsed(at: now), isReset: w.isReset(at: now),
+                             reset: w.isReset(at: now) ? nil : QuotaText.resetText(w, now: now, timeZone: timeZone, marker: false, restore: w == blocking),
+                             resetShort: w.isReset(at: now) ? nil
+                                : QuotaText.resetCompact(w, now: now, timeZone: timeZone, restore: w == blocking),
+                             paceRemainingPercent: QuotaPace.expectedRemainingPercent(w, now: now),
+                             countdown: w.resetsAt.flatMap { QuotaText.countdown(to: $0, now: now) },
+                             windowKind: w.kind.sampleKey, resetsAt: w.resetsAt)
+        }
     }
 
     /// 合并图的其他来源：已添加的按量付费平台取有账单的 trend7（主平台的 trend7 已在 AppData.trend7 里），
@@ -140,7 +167,7 @@ enum AppDataMapping {
     static func tokenSources(main: PlatformState, others: [PlatformState],
                              localUsage: [ProviderID: DailyModelTokens]) -> [TokenSource] {
         var out: [TokenSource] = []
-        for st in [main] + others where st.status != .notAdded {
+        for st in [main] + others where st.status.isShown {
             var byDay: DailyModelTokens = [:]
             // 按量付费平台：账单里明确给了金额的模型才记花费（图例写「¥x」）；金额为 nil 的不记，免得写成 ¥0
             var costByDay: [String: [String: Double]] = [:]
@@ -201,46 +228,72 @@ enum AppDataMapping {
     /// 一个平台的「一行」数据；金额保持该平台的币种
     static func side(_ st: PlatformState, now: Date, timeZone: TimeZone = .current) -> AppData.Side {
         let s = st.snapshot
+        let lastUpdated = s?.fetchedAt ?? st.lastSample?.t
         if ProviderRegistry.meter(st.id) == .quota {
             let q = s?.quota
             return AppData.Side(id: st.id.rawValue, name: ProviderRegistry.displayName(st.id),
                                 tank: nil, currency: "PCT", todayCost: nil,
                                 status: statusText(st, now: now),
                                 quotaRemaining: q?.displayRemainingPercent(at: now),
-                                quotaReset: q?.displayWindow.flatMap { QuotaText.resetCompact($0, now: now, timeZone: timeZone) },
+                                quotaReset: q?.displayWindow(at: now).flatMap { QuotaText.resetCompact($0, now: now, timeZone: timeZone, restore: $0 == q?.blockingWindow(at: now)) },
                                 quotaExhausted: QuotaText.exhaustion(q, now: now, timeZone: timeZone),
                                 menuQuota: MenuBarText.quotaReading(q, now: now, timeZone: timeZone),
-                                quotaNote: q == nil ? (s?.quotaNote ?? st.errorDetail) : nil,
-                                quotaStale: st.quotaTooOld(now: now))
+                                quotaNote: st.status == .credentialInvalid ? (st.errorDetail ?? StatusPresenter.errorText(st.status, name: ProviderRegistry.displayName(st.id), id: st.id)) : (q == nil ? (s?.quotaNote ?? st.errorDetail) : nil),
+                                quotaStale: st.quotaTooOld(now: now) || st.status == .credentialInvalid,
+                                quotaRows: quotaRows(q?.windows ?? [], now: now, timeZone: timeZone),
+                                resetCredits: q?.resetCredits.flatMap { $0.available > 0 ? $0.text(timeZone: timeZone) : nil },
+                                resetCreditsCount: q?.resetCredits?.available,
+                                plan: q?.plan,
+                                dataStale: MenuBarCells.isStale(st, now: now), lastUpdated: lastUpdated)
         }
         let tank = s?.balance?.amount ?? st.lastSample?.balance
-        let today = s?.source == .bill ? s?.today?.amount : nil
+        let hasSpend = s?.source == .bill || s?.source == .balanceEstimate
+        let today = hasSpend ? s?.today?.amount : nil
         return AppData.Side(id: st.id.rawValue, name: ProviderRegistry.displayName(st.id),
                             tank: tank.map(double), currency: currencyCode(of: st),
-                            todayCost: today.map(double), status: statusText(st, now: now))
+                            todayCost: today.map(double), status: statusText(st, now: now),
+                            monthCost: hasSpend ? s?.month.map { double($0.amount) } : nil,
+                            runwayDays: st.burn?.runwayDays.map(double),
+                            avgCnyPerDayWeek: st.burn.map { double($0.avgPerDayWeek) },
+                            avgDays: st.burn?.avgDays, tankIsKeyLimit: s?.balanceIsKeyLimit == true,
+                            dataStale: MenuBarCells.isStale(st, now: now), lastUpdated: lastUpdated)
+    }
+
+    /// 这几种状态文字表示「凭据要处理」：今天页卡片变灰（TodayCards 只拿得到文字）
+    static func isCredentialProblem(_ status: String) -> Bool {
+        ["side.credentialInvalid", "side.keyInvalid", "side.tokenInvalid", "side.loginExpired",
+         "side.consoleLoginExpired", "side.keychainUnreadable"].contains { L($0) == status }
     }
 
     /// 平台状态 → 一行里的短文字
     static func statusText(_ st: PlatformState, now: Date) -> String {
         switch st.status {
         case .loading: return L("side.connecting")
-        case .credentialInvalid: return L("side.credentialInvalid")
+        case .credentialInvalid:
+            switch ProviderRegistry.credentialKind(st.id) {
+            case .apiKey: return L("side.keyInvalid")
+            case .accessToken: return L("side.tokenInvalid")
+            case .webLogin: return L("side.loginExpired")
+            case .none: return L("side.credentialInvalid")
+            }
+        case .keychainUnreadable: return L("side.keychainUnreadable")
         case .consoleLoginNeeded: return L("side.consoleLoginExpired")
         case .schemaChanged: return L("side.apiChanged")
         case .rateLimited: return L("side.rateLimited")
         case .offline: return ProviderRegistry.meter(st.id) == .quota ? L("side.noRecords") : L("side.cantReach")
         case .notAdded: return L("side.notAdded")
+        case .hidden: return L("side.hidden")
         case .stale(let m):
             if ProviderRegistry.meter(st.id) == .quota {
                 let mins = st.quotaAge(now: now).map { Int($0 / 60) } ?? m
-                return L("status.minAgoNotUpdated", mins)
+                return L("status.agoNotUpdated", QuotaText.ago(minutes: mins))   // 不到 1 分钟写「1 分钟前」；超过 60 分钟写小时、超过 24 小时写天
             }
-            return L("status.minAgo", m)
+            return QuotaText.ago(minutes: m)
         case .ok:
             if case .expiring(let d)? = st.snapshot?.credential { return d <= 0 ? L("side.loginExpiresToday") : L("side.loginExpiresInDays", d) }
             // 套餐平台数据来自本机日志/钩子，fetchedAt 旧不代表过时
             if ProviderRegistry.meter(st.id) != .quota, let t = st.snapshot?.fetchedAt, now.timeIntervalSince(t) > 600 {
-                return L("status.minAgo", Int(now.timeIntervalSince(t) / 60))
+                return QuotaText.ago(minutes: Int(now.timeIntervalSince(t) / 60))
             }
             return L("side.ok")
         }
